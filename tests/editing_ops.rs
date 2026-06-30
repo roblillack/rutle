@@ -1,20 +1,20 @@
 //! Behavior tests for the shared editor's mutation operations.
 //!
 //! Ported in spirit from Pure's editor test coverage: each test drives a public
-//! `StructuredEditor` operation and asserts the result via either the
+//! `Editor` operation and asserts the result via either the
 //! marker-agnostic `current_block_type()` query or a markdown round-trip. This
 //! hardens the shared core that both Piki (FLTK) and Pure (Ratatui) depend on.
 
 use rutle::richtext::markdown_converter::document_to_markdown;
-use rutle::{BlockType, DocumentPosition, StructuredEditor};
+use rutle::{BlockType, DocumentPosition, Editor};
 
-fn editor_with(markdown: &str) -> StructuredEditor {
-    let mut e = StructuredEditor::default();
+fn editor_with(markdown: &str) -> Editor {
+    let mut e = Editor::default();
     e.load_markdown(markdown);
     e
 }
 
-fn md(e: &StructuredEditor) -> String {
+fn md(e: &Editor) -> String {
     document_to_markdown(e.tdoc())
 }
 

@@ -1,6 +1,6 @@
 //! Layout snapshot tests — proportional (NotoSans) backend.
 //!
-//! Ported from Piki's `structured_rich_display_snapshots.rs`. The scenarios
+//! Ported from Piki's `renderer_snapshots.rs`. The scenarios
 //! live in [`common`] and are shared with the monospace suite
 //! (`layout_snapshots_mono.rs`); this file just binds each to insta under the
 //! proportional font mode. Review changes with `cargo insta review`; the

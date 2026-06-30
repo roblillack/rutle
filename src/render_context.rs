@@ -14,7 +14,7 @@ pub enum FontStyle {
 }
 
 // Drawing backend trait - abstracts over FLTK's drawing primitives
-pub trait DrawContext {
+pub trait RenderContext {
     fn set_color(&mut self, color: u32);
     fn set_font(&mut self, font: FontType, style: FontStyle, size: u8);
     fn draw_text(&mut self, text: &str, x: i32, y: i32);
@@ -31,7 +31,7 @@ pub trait DrawContext {
     fn has_focus(&self) -> bool;
     fn is_active(&self) -> bool;
 
-    /// Pen state for text decorations, consulted by the next [`draw_text`]. The
+    /// Pen state for text decorations, consulted by the next [`Self::draw_text`]. The
     /// default ignores them — pixel backends draw underline/strikethrough as
     /// separate lines. A cell backend overrides these to fold the decoration
     /// into the glyph's attributes (see [`crate::theme::Theme::text_decoration_lines`]).

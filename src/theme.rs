@@ -1,4 +1,4 @@
-use crate::draw_context::{FontStyle, FontType};
+use crate::render_context::{FontStyle, FontType};
 
 #[derive(Clone, Copy, Debug)]
 pub struct FontSettings {
@@ -136,7 +136,7 @@ pub struct Theme {
 
     /// Comfort margin, in `line_height` units, kept between the cursor and the
     /// top/bottom edge of the viewport when auto-scrolling to follow the cursor
-    /// (see [`StructuredRichDisplay::ensure_cursor_visible`]). The GUI uses a
+    /// (see [`crate::Renderer::ensure_cursor_visible`]). The GUI uses a
     /// small pixel value; a cell backend sets this to 1 line so the document
     /// scrolls only once the cursor reaches the very edge, the way classic Pure
     /// did.

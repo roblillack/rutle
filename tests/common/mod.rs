@@ -1,7 +1,7 @@
-//! Shared SVG `DrawContext` test backend for layout snapshot tests.
+//! Shared SVG `RenderContext` test backend for layout snapshot tests.
 //!
-//! The rendering-agnostic layout engine ([`StructuredRichDisplay`]) is driven
-//! through the abstract [`DrawContext`] trait, so a snapshot test only needs an
+//! The rendering-agnostic layout engine ([`Renderer`]) is driven
+//! through the abstract [`RenderContext`] trait, so a snapshot test only needs an
 //! implementation of that trait that records what was drawn. This one renders
 //! to deterministic SVG (no rasterization) under two font modes:
 //!
@@ -36,9 +36,9 @@ use std::fs;
 use rusttype::{Font, Scale, point};
 use unicode_segmentation::UnicodeSegmentation;
 
-use rutle::draw_context::{DrawContext, FontStyle, FontType};
+use rutle::render_context::{FontStyle, FontType, RenderContext};
 use rutle::richtext::markdown_converter::markdown_to_document;
-use rutle::richtext::structured_rich_display::StructuredRichDisplay;
+use rutle::richtext::renderer::Renderer;
 use rutle::richtext::tree_path::DocumentPosition;
 
 /// Browser SVG text renders larger than rusttype's raw advances; the original
@@ -72,7 +72,7 @@ fn mono_descent(size: u8) -> i32 {
 }
 
 /// SVG-based drawing context that records the engine's draw calls as SVG markup.
-pub struct SvgDrawContext {
+pub struct SvgRenderContext {
     svg_content: String,
     current_color: u32,
     current_font: FontType,
@@ -87,7 +87,7 @@ pub struct SvgDrawContext {
     fonts: Option<FontSet>,
 }
 
-impl SvgDrawContext {
+impl SvgRenderContext {
     /// Create a new SVG drawing context for the given font mode and canvas size.
     pub fn new(mode: FontMode, width: i32, height: i32) -> Self {
         let fonts = match mode {
@@ -95,7 +95,7 @@ impl SvgDrawContext {
             FontMode::Monospace => None,
         };
 
-        let mut ctx = SvgDrawContext {
+        let mut ctx = SvgRenderContext {
             svg_content: String::new(),
             current_color: 0x000000FF,
             current_font: FontType::Content,
@@ -209,7 +209,7 @@ impl SvgDrawContext {
     }
 }
 
-impl DrawContext for SvgDrawContext {
+impl RenderContext for SvgRenderContext {
     fn set_color(&mut self, color: u32) {
         self.current_color = color;
     }
@@ -474,14 +474,14 @@ impl FontSet {
 // suites differ only by the `FontMode` they pass in.
 // ---------------------------------------------------------------------------
 
-fn display_for(md: &str, w: i32, h: i32) -> StructuredRichDisplay {
-    let mut display = StructuredRichDisplay::new(0, 0, w, h);
+fn display_for(md: &str, w: i32, h: i32) -> Renderer {
+    let mut display = Renderer::new(0, 0, w, h);
     display.editor_mut().set_tdoc(markdown_to_document(md));
     display
 }
 
-fn render(mut display: StructuredRichDisplay, mode: FontMode, w: i32, h: i32) -> Vec<u8> {
-    let mut ctx = SvgDrawContext::new(mode, w, h);
+fn render(mut display: Renderer, mode: FontMode, w: i32, h: i32) -> Vec<u8> {
+    let mut ctx = SvgRenderContext::new(mode, w, h);
     display.draw(&mut ctx);
     ctx.finish().into_bytes()
 }

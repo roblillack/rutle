@@ -2,7 +2,7 @@
 //!
 //! Ported in spirit from Pure's `benches/performance.rs`: it measures the cost of
 //! a full layout pass and a full edit cycle across document sizes. Layout is
-//! driven through a cheap char-cell [`DrawContext`] stub so the numbers reflect
+//! driven through a cheap char-cell [`RenderContext`] stub so the numbers reflect
 //! the engine's *algorithm* cost (leaf enumeration, span flattening, wrapping,
 //! run building) rather than any real font system.
 //!
@@ -13,14 +13,14 @@
 
 use std::time::Instant;
 
-use rutle::StructuredRichDisplay;
-use rutle::draw_context::{DrawContext, FontStyle, FontType};
+use rutle::Renderer;
+use rutle::render_context::{FontStyle, FontType, RenderContext};
 use rutle::richtext::markdown_converter::markdown_to_document;
 
 /// Char-cell stub: width = char count, height = 1. No real font system.
 struct StubCtx;
 
-impl DrawContext for StubCtx {
+impl RenderContext for StubCtx {
     fn set_color(&mut self, _c: u32) {}
     fn set_font(&mut self, _f: FontType, _s: FontStyle, _sz: u8) {}
     fn draw_text(&mut self, _t: &str, _x: i32, _y: i32) {}
@@ -79,9 +79,9 @@ fn time_ms<F: FnMut()>(iters: usize, mut f: F) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0 / iters as f64
 }
 
-fn new_display(markdown: &str) -> StructuredRichDisplay {
+fn new_display(markdown: &str) -> Renderer {
     let doc = markdown_to_document(markdown);
-    let mut d = StructuredRichDisplay::new(0, 0, 800, 600);
+    let mut d = Renderer::new(0, 0, 800, 600);
     d.editor_mut().set_tdoc(doc);
     d
 }

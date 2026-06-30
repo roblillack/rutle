@@ -1,15 +1,18 @@
-// Structured Rich Text Display
-// A rendering and interaction widget for StructuredDocument
-// Completely decoupled from markdown syntax
+// Renderer — rutle's layout + paint layer (layers 2 & 3).
+//
+// Lays a `tdoc::Document` out against a backend-agnostic `RenderContext` (the
+// layout phase, `layout_*`) and paints the result (`draw_*`). Also owns the
+// view state a host needs: viewport/scroll, cursor blink, link hover, search,
+// and hit-testing. Completely decoupled from markdown syntax.
 
+use super::editor::*;
 use super::reveal::{RevealReconciler, RevealStyle, item_reveal_styles, reveal_styles};
 use super::structured_document::*;
-use super::structured_editor::*;
 use super::tree_path::{DocumentPosition, PathSegment, TreePath};
 use super::tree_walk::{self, LeafInfo};
-use crate::draw_context::DrawContext;
-use crate::draw_context::FontStyle;
-use crate::draw_context::FontType;
+use crate::render_context::FontStyle;
+use crate::render_context::FontType;
+use crate::render_context::RenderContext;
 use crate::theme::{FontSettings, Theme};
 
 /// A search match in the document
@@ -120,7 +123,7 @@ fn run_from_style(
 /// is identical to the original word wrapper (wrap once, then place whole).
 #[allow(clippy::too_many_arguments)]
 fn push_token_wrapped(
-    ctx: &mut dyn DrawContext,
+    ctx: &mut dyn RenderContext,
     lines: &mut Vec<Vec<VisualRun>>,
     line_ranges: &mut Vec<(usize, usize)>,
     line_wraps: &mut Vec<bool>,
@@ -274,7 +277,7 @@ fn push_token_wrapped(
 /// leaf; `inline_index` is the owning inline element's index in the block.
 #[allow(clippy::too_many_arguments)]
 fn layout_styled_text(
-    ctx: &mut dyn DrawContext,
+    ctx: &mut dyn RenderContext,
     lines: &mut Vec<Vec<VisualRun>>,
     line_ranges: &mut Vec<(usize, usize)>,
     line_wraps: &mut Vec<bool>,
@@ -395,7 +398,7 @@ fn layout_styled_text(
 /// exactly the shape the cursor/column logic skips.
 #[allow(clippy::too_many_arguments)]
 fn push_reveal_tag(
-    ctx: &mut dyn DrawContext,
+    ctx: &mut dyn RenderContext,
     lines: &mut Vec<Vec<VisualRun>>,
     line_ranges: &mut Vec<(usize, usize)>,
     line_wraps: &mut Vec<bool>,
@@ -448,7 +451,7 @@ fn push_reveal_tag(
 /// then start tags (`[Name>`, outermost first), all at `char_offset`.
 #[allow(clippy::too_many_arguments)]
 fn emit_reveal_tags(
-    ctx: &mut dyn DrawContext,
+    ctx: &mut dyn RenderContext,
     lines: &mut Vec<Vec<VisualRun>>,
     line_ranges: &mut Vec<(usize, usize)>,
     line_wraps: &mut Vec<bool>,
@@ -522,7 +525,7 @@ fn bolden_inline(content: &[InlineContent]) -> Vec<InlineContent> {
         .collect()
 }
 
-/// Result of [`StructuredRichDisplay::content_line_metrics`]: the data a cell
+/// Result of [`Renderer::content_line_metrics`]: the data a cell
 /// backend needs to report a classic-Pure "content line" number in its status
 /// bar without baking layout internals into the app.
 pub struct ContentLineMetrics {
@@ -605,8 +608,9 @@ struct ResolvedRunStyle {
     // Highlight not necessary, as we'll have a non-None background_color for that
 }
 
-/// Rich Text Display for Structured Documents
-pub struct StructuredRichDisplay {
+/// Lays out and paints a [`tdoc::Document`], and owns the interaction/view
+/// state (viewport, scroll, cursor, hover, search) a host frontend drives.
+pub struct Renderer {
     // Position and size
     x: i32,
     y: i32,
@@ -614,7 +618,7 @@ pub struct StructuredRichDisplay {
     h: i32,
 
     // Editor (contains document and cursor)
-    editor: StructuredEditor,
+    editor: Editor,
 
     // Layout cache
     layout_lines: Vec<LayoutLine>,
@@ -663,14 +667,14 @@ pub struct StructuredRichDisplay {
     theme: Theme,
 }
 
-impl StructuredRichDisplay {
+impl Renderer {
     pub fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
-        StructuredRichDisplay {
+        Renderer {
             x,
             y,
             w,
             h,
-            editor: StructuredEditor::new(),
+            editor: Editor::new(),
             layout_lines: Vec::new(),
             table_layouts: Vec::new(),
             layout_leaves: Vec::new(),
@@ -693,7 +697,7 @@ impl StructuredRichDisplay {
     }
 
     /// Get the editor
-    pub fn editor(&self) -> &StructuredEditor {
+    pub fn editor(&self) -> &Editor {
         &self.editor
     }
 
@@ -715,7 +719,7 @@ impl StructuredRichDisplay {
     /// Get mutable editor. Invalidates the cached layout and bumps the edit
     /// revision, since the caller may mutate the document through the returned
     /// reference.
-    pub fn editor_mut(&mut self) -> &mut StructuredEditor {
+    pub fn editor_mut(&mut self) -> &mut Editor {
         self.layout_valid = false;
         self.edit_revision += 1;
         &mut self.editor
@@ -752,7 +756,7 @@ impl StructuredRichDisplay {
 
     /// Ensure the cursor's line is visible by adjusting scroll offset
     /// Minimally scrolls to bring the cursor line within the viewport with small margins
-    pub fn ensure_cursor_visible(&mut self, ctx: &mut dyn DrawContext) {
+    pub fn ensure_cursor_visible(&mut self, ctx: &mut dyn RenderContext) {
         // Ensure layout is up to date
         self.layout(ctx);
 
@@ -843,7 +847,7 @@ impl StructuredRichDisplay {
     }
 
     /// Perform layout
-    fn layout(&mut self, ctx: &mut dyn DrawContext) {
+    fn layout(&mut self, ctx: &mut dyn RenderContext) {
         if self.layout_valid {
             return;
         }
@@ -925,7 +929,7 @@ impl StructuredRichDisplay {
         &self,
         line: &LayoutLine,
         x: i32,
-        ctx: &mut dyn DrawContext,
+        ctx: &mut dyn RenderContext,
     ) -> usize {
         let mut offset = line.char_start;
         for run in &line.runs {
@@ -1103,7 +1107,7 @@ impl StructuredRichDisplay {
 
     /// Move cursor one visual line up, using wrapped lines when applicable.
     /// When `extend` is true, extends the selection (Shift+Up behavior).
-    pub fn move_cursor_visual_up(&mut self, extend: bool, ctx: &mut dyn DrawContext) {
+    pub fn move_cursor_visual_up(&mut self, extend: bool, ctx: &mut dyn RenderContext) {
         // Ensure layout is current for measurement
         self.layout(ctx);
         if self.layout_lines.is_empty() {
@@ -1157,7 +1161,7 @@ impl StructuredRichDisplay {
 
     /// Move cursor one visual line down, using wrapped lines when applicable.
     /// When `extend` is true, extends the selection (Shift+Down behavior).
-    pub fn move_cursor_visual_down(&mut self, extend: bool, ctx: &mut dyn DrawContext) {
+    pub fn move_cursor_visual_down(&mut self, extend: bool, ctx: &mut dyn RenderContext) {
         self.layout(ctx);
         if self.layout_lines.is_empty() {
             if extend {
@@ -1220,7 +1224,7 @@ impl StructuredRichDisplay {
     }
 
     /// Move cursor to the beginning of the current visual line.
-    pub fn move_cursor_visual_line_start(&mut self, extend: bool, ctx: &mut dyn DrawContext) {
+    pub fn move_cursor_visual_line_start(&mut self, extend: bool, ctx: &mut dyn RenderContext) {
         self.layout(ctx);
         if self.layout_lines.is_empty() {
             if extend {
@@ -1263,7 +1267,11 @@ impl StructuredRichDisplay {
     }
 
     /// Move cursor to the end of the current visual line.
-    pub fn move_cursor_visual_line_end_precise(&mut self, extend: bool, ctx: &mut dyn DrawContext) {
+    pub fn move_cursor_visual_line_end_precise(
+        &mut self,
+        extend: bool,
+        ctx: &mut dyn RenderContext,
+    ) {
         self.layout(ctx);
         if self.layout_lines.is_empty() {
             if extend {
@@ -1326,7 +1334,7 @@ impl StructuredRichDisplay {
         list_levels: usize,
         y: i32,
         width: i32,
-        ctx: &mut dyn DrawContext,
+        ctx: &mut dyn RenderContext,
     ) -> i32 {
         // Indentation is driven by the leaf's tree depths, not its (flat) block type: a
         // continuation paragraph, code block, or list item nested inside a quote keeps both
@@ -1798,7 +1806,7 @@ impl StructuredRichDisplay {
         y: i32,
         start_x: i32,
         width: i32,
-        ctx: &mut dyn DrawContext,
+        ctx: &mut dyn RenderContext,
     ) -> i32 {
         const BORDER: i32 = 1;
         let pad_h = self.theme.table_cell_padding_h; // horizontal padding inside each cell
@@ -1941,7 +1949,7 @@ impl StructuredRichDisplay {
         start_x: i32,
         width: i32,
         line_height: i32,
-        ctx: &mut dyn DrawContext,
+        ctx: &mut dyn RenderContext,
     ) -> i32 {
         let layout = self.layout_inline_content(
             &block.content,
@@ -2119,7 +2127,7 @@ impl StructuredRichDisplay {
         line_height: i32,
         break_long_words: bool,
         allow_reveal: bool,
-        ctx: &mut dyn DrawContext,
+        ctx: &mut dyn RenderContext,
     ) -> InlineContentLayout {
         let mut lines: Vec<Vec<VisualRun>> = Vec::new();
         let mut line_wraps: Vec<bool> = Vec::new();
@@ -2419,7 +2427,7 @@ impl StructuredRichDisplay {
     /// Draw a rule under each level-2/3 heading (`=` for H2, `-` for H3) when
     /// `theme.heading_underline` is set. The rule lands in the blank row directly
     /// below the heading — purely decorative, so it never enters the cursor model.
-    fn draw_heading_underlines(&self, ctx: &mut dyn DrawContext) {
+    fn draw_heading_underlines(&self, ctx: &mut dyn RenderContext) {
         if !self.theme.heading_underline {
             return;
         }
@@ -2469,7 +2477,7 @@ impl StructuredRichDisplay {
     /// and below the last line of every code block. The rule rows live in the
     /// block's `code_block_padding`, so they neither count as content lines nor
     /// collide with the code text.
-    fn draw_code_fences(&self, ctx: &mut dyn DrawContext) {
+    fn draw_code_fences(&self, ctx: &mut dyn RenderContext) {
         if !self.theme.code_block_fence {
             return;
         }
@@ -2486,7 +2494,7 @@ impl StructuredRichDisplay {
         let mut block = usize::MAX;
         let mut first_y = 0;
         let mut last_y = 0;
-        let flush = |display: &Self, top: i32, bottom: i32, ctx: &mut dyn DrawContext| {
+        let flush = |display: &Self, top: i32, bottom: i32, ctx: &mut dyn RenderContext| {
             for rule_y in [top, bottom] {
                 if rule_y < viewport_top || rule_y > viewport_bottom {
                     continue;
@@ -2534,7 +2542,7 @@ impl StructuredRichDisplay {
         }
     }
 
-    fn draw_tables(&self, ctx: &mut dyn DrawContext) {
+    fn draw_tables(&self, ctx: &mut dyn RenderContext) {
         let viewport_top = self.scroll_offset;
         let viewport_bottom = self.scroll_offset + self.h;
         let blocks = &self.layout_blocks;
@@ -2587,7 +2595,7 @@ impl StructuredRichDisplay {
     }
 
     /// Draw the widget
-    pub fn draw(&mut self, ctx: &mut dyn DrawContext) {
+    pub fn draw(&mut self, ctx: &mut dyn RenderContext) {
         self.layout(ctx);
 
         // Draw background
@@ -2821,7 +2829,7 @@ impl StructuredRichDisplay {
     /// don't both render. Call after [`draw`](Self::draw) (or
     /// [`ensure_cursor_visible`](Self::ensure_cursor_visible)) so the layout is
     /// current.
-    pub fn cursor_screen_position(&self, ctx: &mut dyn DrawContext) -> Option<(i32, i32)> {
+    pub fn cursor_screen_position(&self, ctx: &mut dyn RenderContext) -> Option<(i32, i32)> {
         let (cx, cy, _h) = self.get_cursor_visual_position(ctx)?;
         let screen_x = self.x + cx;
         let screen_y = self.y + cy - self.scroll_offset;
@@ -2837,7 +2845,7 @@ impl StructuredRichDisplay {
     /// this is defined even when the cursor is scrolled out of view, so callers
     /// can measure how far the cursor moves across visual rows (e.g. paging by a
     /// fixed number of rows, counting the blank gaps between blocks).
-    pub fn cursor_content_y(&self, ctx: &mut dyn DrawContext) -> Option<(i32, i32)> {
+    pub fn cursor_content_y(&self, ctx: &mut dyn RenderContext) -> Option<(i32, i32)> {
         let (_cx, cy, ch) = self.get_cursor_visual_position(ctx)?;
         Some((cy, ch))
     }
@@ -2846,7 +2854,7 @@ impl StructuredRichDisplay {
     /// line's text. Unlike a column derived from the raw screen x, this stays
     /// natural when the line is centered or indented (the offset is relative to
     /// the line's leftmost content run, not the page origin).
-    pub fn cursor_column(&self, ctx: &mut dyn DrawContext) -> Option<usize> {
+    pub fn cursor_column(&self, ctx: &mut dyn RenderContext) -> Option<usize> {
         let (cx, _cy, _h) = self.get_cursor_visual_position(ctx)?;
         let cursor = self.editor.cursor();
         let cur_idx = self.index_for_path(&cursor.path);
@@ -2939,7 +2947,7 @@ impl StructuredRichDisplay {
     }
 
     /// Get visual position of cursor (x, y, height) relative to widget
-    fn get_cursor_visual_position(&self, ctx: &mut dyn DrawContext) -> Option<(i32, i32, i32)> {
+    fn get_cursor_visual_position(&self, ctx: &mut dyn RenderContext) -> Option<(i32, i32, i32)> {
         let cursor = self.editor.cursor();
         let cur_idx = self.index_for_path(&cursor.path);
 
@@ -3383,7 +3391,7 @@ impl StructuredRichDisplay {
 
     /// Scroll to make the current search match visible.
     /// Should be called after search() or next_match()/prev_match().
-    pub fn scroll_to_current_match(&mut self, ctx: &mut dyn DrawContext) {
+    pub fn scroll_to_current_match(&mut self, ctx: &mut dyn RenderContext) {
         let Some(current_match) = self.current_search_match().cloned() else {
             return;
         };
@@ -3455,7 +3463,7 @@ impl StructuredRichDisplay {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::draw_context::{FontStyle, FontType};
+    use crate::render_context::{FontStyle, FontType};
     use crate::richtext::inline_convert::inline_to_spans;
     use crate::richtext::structured_document::{
         Block, BlockType, InlineContent, TableCell, TableRow, TextRun,
@@ -3513,17 +3521,17 @@ mod tests {
     }
 
     /// Byte length of the first leaf's plain text.
-    fn leaf0_len(display: &StructuredRichDisplay) -> usize {
+    fn leaf0_len(display: &Renderer) -> usize {
         tree_walk::leaf_text_len(display.editor().tdoc(), &TreePath::root(0))
     }
 
     #[derive(Default)]
-    struct TestDrawContext {
+    struct TestRenderContext {
         focus: bool,
         active: bool,
     }
 
-    impl TestDrawContext {
+    impl TestRenderContext {
         fn new_with_focus() -> Self {
             Self {
                 focus: true,
@@ -3532,7 +3540,7 @@ mod tests {
         }
     }
 
-    impl DrawContext for TestDrawContext {
+    impl RenderContext for TestRenderContext {
         fn set_color(&mut self, _color: u32) {}
 
         fn set_font(&mut self, _font: FontType, _style: FontStyle, _size: u8) {}
@@ -3581,12 +3589,12 @@ mod tests {
         }
     }
 
-    fn make_display_with_block(block: Block) -> StructuredRichDisplay {
+    fn make_display_with_block(block: Block) -> Renderer {
         make_display_with_blocks(vec![block])
     }
 
-    fn make_display_with_blocks(blocks: Vec<Block>) -> StructuredRichDisplay {
-        let mut display = StructuredRichDisplay::new(0, 0, 400, 300);
+    fn make_display_with_blocks(blocks: Vec<Block>) -> Renderer {
+        let mut display = Renderer::new(0, 0, 400, 300);
         let doc = Document::new().with_paragraphs(blocks.iter().map(block_to_paragraph).collect());
         {
             let editor = display.editor_mut();
@@ -3614,9 +3622,9 @@ mod tests {
         // paragraph: every line must carry the quote indent/bar *and* its list indent.
         let md = "> Plain in quote\n>\n> 1. Numbered in quote\n>\n>    - Bullet in quote\n>\n>      Continuation in bullet";
         let doc = crate::richtext::markdown_converter::markdown_to_document(md);
-        let mut display = StructuredRichDisplay::new(0, 0, 600, 400);
+        let mut display = Renderer::new(0, 0, 600, 400);
         display.editor_mut().set_tdoc(doc);
-        let mut ctx = TestDrawContext::new_with_focus();
+        let mut ctx = TestRenderContext::new_with_focus();
         display.layout(&mut ctx);
 
         // Text is split into word runs; match each line by a unique first word.
@@ -3661,9 +3669,9 @@ mod tests {
             inner,
         ]]);
         let doc = Document::new().with_paragraphs(vec![outer]);
-        let mut display = StructuredRichDisplay::new(0, 0, 400, 300);
+        let mut display = Renderer::new(0, 0, 400, 300);
         display.editor_mut().set_tdoc(doc);
-        let mut ctx = TestDrawContext::new_with_focus();
+        let mut ctx = TestRenderContext::new_with_focus();
         display.layout(&mut ctx);
 
         let x_of = |needle: &str| -> i32 {
@@ -3687,7 +3695,7 @@ mod tests {
     fn vertical_nav_treats_table_as_single_stop() {
         // A multi-row table produces several layout lines; Up/Down must treat
         // the whole table as one stop instead of stepping through each line.
-        let mut ctx = TestDrawContext::new_with_focus();
+        let mut ctx = TestRenderContext::new_with_focus();
         let mut display = make_display_with_blocks(vec![
             Block::paragraph().with_plain_text("one"),
             table_block(3),
@@ -3729,7 +3737,7 @@ mod tests {
         // The wrap window is only a few pixels wide and depends on font metrics,
         // so search narrow→wide for a width at which the trailing reveal tag wraps
         // onto its own zero-width line (the phantom) rather than hardcoding it.
-        let is_phantom = |d: &StructuredRichDisplay| {
+        let is_phantom = |d: &Renderer| {
             d.layout_lines.iter().any(|l| {
                 l.char_start == l.char_end
                     && !l.runs.is_empty()
@@ -3737,20 +3745,20 @@ mod tests {
             })
         };
         let phantom_width = (60..=400).step_by(2).find(|&w| {
-            let mut d = StructuredRichDisplay::new(0, 0, w, 300);
+            let mut d = Renderer::new(0, 0, w, 300);
             d.editor_mut().set_tdoc(doc.clone());
             d.set_reveal_codes(true);
-            let mut ctx = TestDrawContext::new_with_focus();
+            let mut ctx = TestRenderContext::new_with_focus();
             d.layout(&mut ctx);
             is_phantom(&d)
         });
         let w = phantom_width.expect("no width wrapped a reveal tag onto its own line");
 
-        let mut display = StructuredRichDisplay::new(0, 0, w, 300);
+        let mut display = Renderer::new(0, 0, w, 300);
         display.editor_mut().set_tdoc(doc.clone());
         display.set_reveal_codes(true);
         display.editor_mut().set_cursor(DocumentPosition::new(0, 0));
-        let mut ctx = TestDrawContext::new_with_focus();
+        let mut ctx = TestRenderContext::new_with_focus();
 
         // Press Down repeatedly: the caret must reach the trailing "AFTER"
         // paragraph (the last leaf), not freeze on the bold list item.
@@ -3778,7 +3786,7 @@ mod tests {
 
     #[test]
     fn test_display_creation() {
-        let display = StructuredRichDisplay::new(0, 0, 800, 600);
+        let display = Renderer::new(0, 0, 800, 600);
         assert_eq!(display.w(), 800);
         assert_eq!(display.h(), 600);
     }
@@ -3787,7 +3795,7 @@ mod tests {
     fn cursor_in_empty_blockquote_respects_indent() {
         let block = Block::new(BlockType::BlockQuote);
         let mut display = make_display_with_block(block);
-        let mut ctx = TestDrawContext::new_with_focus();
+        let mut ctx = TestRenderContext::new_with_focus();
 
         display.layout(&mut ctx);
         let (x, _, _) = display.get_cursor_visual_position(&mut ctx).unwrap();
@@ -3803,7 +3811,7 @@ mod tests {
             depth: 0,
         });
         let mut display = make_display_with_block(block);
-        let mut ctx = TestDrawContext::new_with_focus();
+        let mut ctx = TestRenderContext::new_with_focus();
 
         let bullet_width = ctx.text_width(
             "• ",
@@ -3830,7 +3838,7 @@ mod tests {
             depth: 0,
         });
         let mut display = make_display_with_block(block);
-        let mut ctx = TestDrawContext::new_with_focus();
+        let mut ctx = TestRenderContext::new_with_focus();
 
         let label_width = ctx.text_width(
             "1. ",
@@ -3856,7 +3864,7 @@ mod tests {
             depth: 0,
         });
         let mut display = make_display_with_block(block);
-        let mut ctx = TestDrawContext::new_with_focus();
+        let mut ctx = TestRenderContext::new_with_focus();
 
         let mut checkbox_size = (display.theme.plain_text.font_size as i32).saturating_sub(4);
         if checkbox_size < 8 {
@@ -3890,7 +3898,7 @@ mod tests {
     fn cursor_in_empty_code_block_respects_indent() {
         let block = Block::new(BlockType::CodeBlock { language: None });
         let mut display = make_display_with_block(block);
-        let mut ctx = TestDrawContext::new_with_focus();
+        let mut ctx = TestRenderContext::new_with_focus();
 
         display.layout(&mut ctx);
         let (x, _, _) = display.get_cursor_visual_position(&mut ctx).unwrap();
@@ -3907,7 +3915,7 @@ mod tests {
 
         let mut display = make_display_with_block(block);
 
-        let mut layout_ctx = TestDrawContext::new_with_focus();
+        let mut layout_ctx = TestRenderContext::new_with_focus();
         display.layout(&mut layout_ctx);
 
         assert_eq!(
@@ -3929,7 +3937,7 @@ mod tests {
         assert_eq!(trailing_line.char_start, end_offset);
         assert_eq!(trailing_line.char_end, end_offset);
 
-        let mut ctx = TestDrawContext::new_with_focus();
+        let mut ctx = TestRenderContext::new_with_focus();
         let (cursor_x, cursor_y, _) = display
             .get_cursor_visual_position(&mut ctx)
             .expect("Cursor position should resolve with trailing hard break");
@@ -3945,7 +3953,7 @@ mod tests {
         let mut display = make_display_with_block(block);
         display.resize(0, 0, 160, 200);
 
-        let mut layout_ctx = TestDrawContext::new_with_focus();
+        let mut layout_ctx = TestRenderContext::new_with_focus();
         display.layout(&mut layout_ctx);
 
         assert!(
@@ -3966,7 +3974,7 @@ mod tests {
             editor.set_cursor(DocumentPosition::new(0, first_line_start));
         }
 
-        let mut ctx = TestDrawContext::new_with_focus();
+        let mut ctx = TestRenderContext::new_with_focus();
         let mut expected_end_offset = first_line_end;
         while expected_end_offset > first_line_start
             && !display.offset_belongs_to_line(0, expected_end_offset)
@@ -4016,7 +4024,7 @@ mod tests {
             .push(InlineContent::Text(TextRun::plain("World")));
         let mut display = make_display_with_block(block);
 
-        let mut ctx = TestDrawContext::new_with_focus();
+        let mut ctx = TestRenderContext::new_with_focus();
         display.layout_valid = false;
         display.layout(&mut ctx);
 

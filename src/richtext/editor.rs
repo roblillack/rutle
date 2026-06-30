@@ -1,4 +1,4 @@
-// Structured Editor
+// Editor — rutle's editing engine (layer 1).
 //
 // Editing operations over a `tdoc::Document` (the authoritative document tree). Cursor
 // and selection are tree-path positions (`DocumentPosition { path, offset }`). Intra-leaf
@@ -119,7 +119,7 @@ struct EditorSnapshot {
 }
 
 /// The structured editor with cursor state.
-pub struct StructuredEditor {
+pub struct Editor {
     tdoc: Document,
     cursor: DocumentPosition,
     selection: Option<(DocumentPosition, DocumentPosition)>,
@@ -142,7 +142,7 @@ pub struct StructuredEditor {
     cursor_reveal_stop: usize,
 }
 
-impl StructuredEditor {
+impl Editor {
     /// Create a new editor with an empty document.
     pub fn new() -> Self {
         Self::with_tdoc(Document::new())
@@ -155,7 +155,7 @@ impl StructuredEditor {
             cursor: DocumentPosition::start(),
             selection: None,
         };
-        let mut editor = StructuredEditor {
+        let mut editor = Editor {
             tdoc,
             cursor: DocumentPosition::start(),
             selection: None,
@@ -178,7 +178,7 @@ impl StructuredEditor {
     }
 
     /// Mutable access to the authoritative document tree. Callers that mutate it should
-    /// follow up with [`StructuredEditor::after_external_change`].
+    /// follow up with [`Editor::after_external_change`].
     pub fn tdoc_mut(&mut self) -> &mut Document {
         &mut self.tdoc
     }
@@ -2100,7 +2100,7 @@ fn top_index(path: &TreePath) -> Option<usize> {
     }
 }
 
-impl Default for StructuredEditor {
+impl Default for Editor {
     fn default() -> Self {
         Self::new()
     }
@@ -2304,7 +2304,7 @@ mod tests {
 
     #[test]
     fn insert_text_into_empty_document() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.insert_text("Hello").unwrap();
         assert_eq!(editor.leaf_plain_text(&TreePath::root(0)), "Hello");
         assert_eq!(editor.cursor().offset, 5);
@@ -2313,7 +2313,7 @@ mod tests {
     #[test]
     fn typing_continues_run_style() {
         // Loading bold markdown then typing inside keeps it one styled leaf.
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.load_markdown("**bold**");
         editor.set_cursor(DocumentPosition::at(TreePath::root(0), 2));
         editor.insert_text("X").unwrap();
@@ -2322,7 +2322,7 @@ mod tests {
 
     #[test]
     fn intra_leaf_delete_backward() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.insert_text("Hello").unwrap();
         editor.delete_backward().unwrap();
         assert_eq!(editor.leaf_plain_text(&TreePath::root(0)), "Hell");
@@ -2331,7 +2331,7 @@ mod tests {
 
     #[test]
     fn word_navigation_within_leaf() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.load_markdown("alpha beta gamma");
         editor.set_cursor(DocumentPosition::at(TreePath::root(0), 0));
         editor.move_word_right();
@@ -2340,7 +2340,7 @@ mod tests {
 
     #[test]
     fn undo_redo_round_trips_typing() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.insert_text("Hello").unwrap();
         editor.commit_undo_step(UndoKind::Typing, Instant::now());
         assert!(editor.undo());
@@ -2351,7 +2351,7 @@ mod tests {
 
     #[test]
     fn top_level_newline_splits_paragraph() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.insert_text("HelloWorld").unwrap();
         editor.set_cursor(DocumentPosition::at(TreePath::root(0), 5));
         editor.insert_newline().unwrap();
@@ -2360,7 +2360,7 @@ mod tests {
         assert_eq!(editor.leaf_plain_text(&TreePath::root(1)), "World");
     }
 
-    fn md(editor: &StructuredEditor) -> String {
+    fn md(editor: &Editor) -> String {
         super::super::markdown_converter::document_to_markdown(editor.tdoc())
             .trim()
             .to_string()
@@ -2368,7 +2368,7 @@ mod tests {
 
     #[test]
     fn toggle_bold_over_selection() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.load_markdown("hello world");
         editor.set_selection(
             DocumentPosition::at(TreePath::root(0), 0),
@@ -2383,7 +2383,7 @@ mod tests {
 
     #[test]
     fn insert_and_remove_link() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.insert_text("see ").unwrap();
         editor
             .insert_link_at_cursor("https://example.test", "here")
@@ -2395,7 +2395,7 @@ mod tests {
 
     #[test]
     fn heading_and_paragraph_conversion() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.insert_text("Title").unwrap();
         editor
             .set_block_type(BlockType::Heading { level: 2 })
@@ -2407,7 +2407,7 @@ mod tests {
 
     #[test]
     fn toggle_list_wraps_and_unwraps() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.insert_text("item").unwrap();
         editor.toggle_list().unwrap();
         assert_eq!(md(&editor), "- item");
@@ -2421,7 +2421,7 @@ mod tests {
 
     #[test]
     fn enter_at_end_of_heading_starts_plain_paragraph() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.load_markdown("# Title");
         editor.set_cursor(DocumentPosition::at(TreePath::root(0), 5));
         editor.insert_newline().unwrap();
@@ -2440,7 +2440,7 @@ mod tests {
 
     #[test]
     fn enter_at_start_of_heading_keeps_heading_style() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.load_markdown("# Title");
         editor.set_cursor(DocumentPosition::at(TreePath::root(0), 0));
         editor.insert_newline().unwrap();
@@ -2463,7 +2463,7 @@ mod tests {
 
     #[test]
     fn same_kind_toggle_on_nested_item_is_noop() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.load_markdown("1. one\n2. two");
         editor.set_cursor(DocumentPosition::at(list_item_path(1), 0));
         editor.indent_list_item().unwrap(); // "two" nested under "one" (ordered)
@@ -2477,7 +2477,7 @@ mod tests {
 
     #[test]
     fn changing_nested_list_kind_preserves_nesting() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.load_markdown("1. one\n2. two");
         editor.set_cursor(DocumentPosition::at(list_item_path(1), 0));
         editor.indent_list_item().unwrap(); // "two" nested under "one" (ordered)
@@ -2501,7 +2501,7 @@ mod tests {
 
     #[test]
     fn enter_in_list_creates_new_item() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.load_markdown("- one");
         let item = TreePath::root(0).child(PathSegment::ListEntry { entry: 0, para: 0 });
         editor.set_cursor(DocumentPosition::at(item, 3));
@@ -2512,7 +2512,7 @@ mod tests {
 
     #[test]
     fn backspace_merges_list_item_into_previous() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.load_markdown("- one\n- two");
         let second = TreePath::root(0).child(PathSegment::ListEntry { entry: 1, para: 0 });
         editor.set_cursor(DocumentPosition::at(second, 0));
@@ -2522,7 +2522,7 @@ mod tests {
 
     #[test]
     fn ordered_list_renumbers_automatically() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.load_markdown("1. one\n2. two\n3. three");
         // Delete the middle item by merging it into the first.
         let second = TreePath::root(0).child(PathSegment::ListEntry { entry: 1, para: 0 });
@@ -2534,7 +2534,7 @@ mod tests {
 
     #[test]
     fn toggle_quote_wraps_and_unwraps() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.insert_text("quoted").unwrap();
         editor.toggle_quote().unwrap();
         assert_eq!(md(&editor), "> quoted");
@@ -2544,7 +2544,7 @@ mod tests {
 
     #[test]
     fn toggle_checkmark_round_trips() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.load_markdown("- [ ] task");
         let item = TreePath::root(0).child(PathSegment::ChecklistItem(0));
         editor.set_cursor(DocumentPosition::at(item, 0));
@@ -2554,7 +2554,7 @@ mod tests {
 
     #[test]
     fn move_block_down_swaps_with_next() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.load_markdown("first\n\nsecond");
         editor.set_cursor(DocumentPosition::at(TreePath::root(0), 0));
         assert_eq!(editor.move_blocks_down(), Ok(true));
@@ -2563,7 +2563,7 @@ mod tests {
 
     #[test]
     fn multi_paragraph_paste_splits_blocks() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.insert_text("AB").unwrap();
         editor.set_cursor(DocumentPosition::at(TreePath::root(0), 1));
         editor.paste("X\nY").unwrap();
@@ -2573,7 +2573,7 @@ mod tests {
 
     #[test]
     fn cross_leaf_delete_selection_merges() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.load_markdown("hello\n\nworld");
         editor.set_selection(
             DocumentPosition::at(TreePath::root(0), 3),
@@ -2583,7 +2583,7 @@ mod tests {
         assert_eq!(md(&editor), "helrld");
     }
 
-    fn leaf_depths(editor: &StructuredEditor) -> Vec<usize> {
+    fn leaf_depths(editor: &Editor) -> Vec<usize> {
         tree_walk::enumerate_leaves(editor.tdoc())
             .iter()
             .map(|l| l.depth)
@@ -2596,7 +2596,7 @@ mod tests {
 
     #[test]
     fn indent_nests_under_previous_sibling() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.load_markdown("- a\n- b");
         editor.set_cursor(DocumentPosition::at(list_item_path(1), 0));
         editor.indent_list_item().unwrap();
@@ -2608,7 +2608,7 @@ mod tests {
 
     #[test]
     fn indent_then_outdent_restores_flat_list() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.load_markdown("- a\n- b");
         editor.set_cursor(DocumentPosition::at(list_item_path(1), 0));
         editor.indent_list_item().unwrap();
@@ -2620,7 +2620,7 @@ mod tests {
 
     #[test]
     fn outdent_nested_item_adopts_following_siblings() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.load_markdown("- a\n  - x\n  - y\n  - z");
         assert_eq!(leaf_depths(&editor), vec![0, 1, 1, 1]);
         // Outdent the first nested item (x).
@@ -2643,7 +2643,7 @@ mod tests {
         assert_eq!(*editor.tdoc(), reparsed);
     }
 
-    fn leaf_texts(editor: &StructuredEditor) -> Vec<String> {
+    fn leaf_texts(editor: &Editor) -> Vec<String> {
         tree_walk::leaf_paths(editor.tdoc())
             .iter()
             .map(|p| editor.leaf_plain_text(p))
@@ -2652,7 +2652,7 @@ mod tests {
 
     #[test]
     fn indent_selection_nests_every_selected_item_together() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.load_markdown("- a\n- x\n- y\n- z");
         // Select x, y, z (leave a, the first item, out).
         editor.set_selection(
@@ -2674,7 +2674,7 @@ mod tests {
 
     #[test]
     fn indent_selection_cannot_indent_first_item() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.load_markdown("- a\n- b");
         // Select both; "a" is the first item and has no previous sibling to nest under.
         editor.set_selection(
@@ -2689,7 +2689,7 @@ mod tests {
 
     #[test]
     fn indent_then_outdent_selection_round_trips() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.load_markdown("- a\n- x\n- y");
         let before = editor.tdoc().clone();
         editor.set_selection(
@@ -2706,7 +2706,7 @@ mod tests {
 
     #[test]
     fn outdent_selection_outdents_every_selected_item() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.load_markdown("- a\n  - x\n  - y\n  - z");
         let inner = |entry| {
             TreePath::root(0)
@@ -2736,7 +2736,7 @@ mod tests {
 
     #[test]
     fn outdent_selection_of_all_nested_items_flattens_them() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.load_markdown("- a\n  - x\n  - y\n  - z");
         let inner = |entry| {
             TreePath::root(0)
@@ -2757,7 +2757,7 @@ mod tests {
 
     #[test]
     fn outdent_top_level_item_exits_list() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.load_markdown("- only");
         editor.set_cursor(DocumentPosition::at(list_item_path(0), 2));
         editor.outdent_list_item().unwrap();
@@ -2767,7 +2767,7 @@ mod tests {
 
     #[test]
     fn backspace_at_nested_item_start_outdents() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.load_markdown("- a\n- b");
         editor.set_cursor(DocumentPosition::at(list_item_path(1), 0));
         editor.indent_list_item().unwrap(); // b nested under a
@@ -2779,7 +2779,7 @@ mod tests {
 
     #[test]
     fn enter_on_empty_top_item_exits_list() {
-        let mut editor = StructuredEditor::new();
+        let mut editor = Editor::new();
         editor.load_markdown("- a");
         editor.set_cursor(DocumentPosition::at(list_item_path(0), 1));
         editor.delete_backward().unwrap(); // delete "a" → empty item
@@ -2789,7 +2789,7 @@ mod tests {
 
     #[test]
     fn bold_inside_link_styles_link_content() {
-        let mut e = StructuredEditor::new();
+        let mut e = Editor::new();
         e.load_markdown("a [manual](u) b");
         // select "anu" inside the link ("a " = 0..2, "manual" = 2..8)
         e.set_selection(
@@ -2802,7 +2802,7 @@ mod tests {
 
     #[test]
     fn wrap_selection_in_link_preserves_styles() {
-        let mut e = StructuredEditor::new();
+        let mut e = Editor::new();
         e.load_markdown("hello world");
         e.set_selection(
             DocumentPosition::at(TreePath::root(0), 0),
@@ -2819,7 +2819,7 @@ mod tests {
 
     #[test]
     fn wrap_selection_in_link_flattens_inner_links() {
-        let mut e = StructuredEditor::new();
+        let mut e = Editor::new();
         e.load_markdown("a [b](v) c");
         // select the whole paragraph and wrap in a new link
         e.set_selection(
@@ -2843,7 +2843,7 @@ mod tests {
 
     #[test]
     fn image_in_link_flattens_and_is_stylable() {
-        let mut e = StructuredEditor::new();
+        let mut e = Editor::new();
         e.load_markdown("[![Build Status](https://x/badge.svg)](https://x/actions)");
         let runs = super::super::tree_walk::leaf_inline(e.tdoc(), &TreePath::root(0));
         assert_eq!(runs.len(), 1, "one flat link: {:?}", runs);
