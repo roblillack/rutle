@@ -1,10 +1,10 @@
 [package]
-name = "tdoc-editor"
-description = "Rendering-agnostic structured editor for tdoc::Document (shared by Piki's GUI and Pure's TUI)"
+name = "rutle"
+description = "Rob's Universal Text Layout Engine: a rendering-agnostic structured editor and layout core for tdoc::Document"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/roblillack/piki"
+repository = "https://github.com/roblillack/rutle"
 
 [dependencies]
 tdoc = { version = "0.11.0", default-features = false }

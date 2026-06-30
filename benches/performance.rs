@@ -1,4 +1,4 @@
-//! Performance benchmarks for the shared `tdoc-editor` core.
+//! Performance benchmarks for the `rutle` core.
 //!
 //! Ported in spirit from Pure's `benches/performance.rs`: it measures the cost of
 //! a full layout pass and a full edit cycle across document sizes. Layout is
@@ -6,16 +6,16 @@
 //! the engine's *algorithm* cost (leaf enumeration, span flattening, wrapping,
 //! run building) rather than any real font system.
 //!
-//! Run with: `cargo bench -p tdoc-editor`
+//! Run with: `cargo bench`
 //!
 //! NOTE: a real FLTK backend pays additional per-token font-measurement cost that
 //! this stub does not, so the layout numbers here are an algorithmic lower bound.
 
 use std::time::Instant;
 
-use tdoc_editor::StructuredRichDisplay;
-use tdoc_editor::draw_context::{DrawContext, FontStyle, FontType};
-use tdoc_editor::richtext::markdown_converter::markdown_to_document;
+use rutle::StructuredRichDisplay;
+use rutle::draw_context::{DrawContext, FontStyle, FontType};
+use rutle::richtext::markdown_converter::markdown_to_document;
 
 /// Char-cell stub: width = char count, height = 1. No real font system.
 struct StubCtx;
@@ -88,7 +88,7 @@ fn new_display(markdown: &str) -> StructuredRichDisplay {
 
 fn main() {
     println!("\n╔══════════════════════════════════════════════════════════════╗");
-    println!("║        tdoc-editor performance (char-cell stub ctx)          ║");
+    println!("║          rutle performance (char-cell stub ctx)             ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!(
         "{:>7} │ {:>12} │ {:>12} │ {:>12} │ {:>12}",

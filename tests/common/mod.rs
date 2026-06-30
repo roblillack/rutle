@@ -36,10 +36,10 @@ use std::fs;
 use rusttype::{Font, Scale, point};
 use unicode_segmentation::UnicodeSegmentation;
 
-use tdoc_editor::draw_context::{DrawContext, FontStyle, FontType};
-use tdoc_editor::richtext::markdown_converter::markdown_to_document;
-use tdoc_editor::richtext::structured_rich_display::StructuredRichDisplay;
-use tdoc_editor::richtext::tree_path::DocumentPosition;
+use rutle::draw_context::{DrawContext, FontStyle, FontType};
+use rutle::richtext::markdown_converter::markdown_to_document;
+use rutle::richtext::structured_rich_display::StructuredRichDisplay;
+use rutle::richtext::tree_path::DocumentPosition;
 
 /// Browser SVG text renders larger than rusttype's raw advances; the original
 /// Piki backend scaled proportional widths by this factor so manual snapshot

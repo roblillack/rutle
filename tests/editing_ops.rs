@@ -5,8 +5,8 @@
 //! marker-agnostic `current_block_type()` query or a markdown round-trip. This
 //! hardens the shared core that both Piki (FLTK) and Pure (Ratatui) depend on.
 
-use tdoc_editor::richtext::markdown_converter::document_to_markdown;
-use tdoc_editor::{BlockType, DocumentPosition, StructuredEditor};
+use rutle::richtext::markdown_converter::document_to_markdown;
+use rutle::{BlockType, DocumentPosition, StructuredEditor};
 
 fn editor_with(markdown: &str) -> StructuredEditor {
     let mut e = StructuredEditor::default();

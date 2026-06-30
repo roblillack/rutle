@@ -1,4 +1,5 @@
-//! `tdoc-editor` — a rendering-agnostic structured editor for [`tdoc::Document`].
+//! `rutle` — Rob's Universal Text Layout Engine: a rendering-agnostic structured
+//! editor and layout core for [`tdoc::Document`].
 //!
 //! This crate is the shared editing/layout core extracted from Piki's GUI. The
 //! authoritative document is always a [`tdoc::Document`]; [`StructuredEditor`]
