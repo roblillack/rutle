@@ -23,16 +23,29 @@
 //! This crate is the shared editing/layout core carved out of the
 //! [Piki](https://github.com/roblillack/piki) editor.
 
+pub mod editor;
+pub mod inline_convert;
 pub mod render_context;
-pub mod richtext;
+pub mod renderer;
+pub mod reveal;
+pub mod structured_document;
 pub mod theme;
+pub mod tree_edit;
+pub mod tree_path;
+pub mod tree_walk;
+
+// Markdown/HTML (de)serialization lives in `tdoc`; rutle works on `tdoc::Document`
+// directly. These thin `tdoc` wrappers exist only to support the test suite, so
+// the module is compiled for tests only and is not part of the public API.
+#[cfg(test)]
+mod markdown_converter;
 
 // Convenience re-exports for the most common entry points.
+pub use editor::{EditError, Editor, UndoKind};
 pub use render_context::{FontStyle, FontType, RenderContext};
-pub use richtext::editor::{EditError, Editor, UndoKind};
-pub use richtext::renderer::Renderer;
-pub use richtext::structured_document::{
+pub use renderer::Renderer;
+pub use structured_document::{
     Block, BlockType, InlineContent, Link, TableCell, TableRow, TextRun, TextStyle,
 };
-pub use richtext::tree_path::{DocumentPosition, PathSegment, TreePath};
 pub use theme::{FontSettings, Theme};
+pub use tree_path::{DocumentPosition, PathSegment, TreePath};

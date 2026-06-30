@@ -5,12 +5,24 @@
 //! marker-agnostic `current_block_type()` query or a markdown round-trip. This
 //! hardens the shared core that both Piki (FLTK) and Pure (Ratatui) depend on.
 
-use rutle::richtext::markdown_converter::document_to_markdown;
 use rutle::{BlockType, DocumentPosition, Editor};
+
+// rutle is tdoc::Document-centric; build/serialize Markdown via `tdoc` directly.
+fn markdown_to_document(md: &str) -> tdoc::Document {
+    tdoc::markdown::parse(std::io::Cursor::new(md.as_bytes()))
+        .unwrap_or_else(|_| tdoc::Document::new())
+}
+
+fn document_to_markdown(doc: &tdoc::Document) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    tdoc::markdown::write(&mut buf, doc).expect("serialize markdown");
+    String::from_utf8(buf).unwrap_or_default()
+}
 
 fn editor_with(markdown: &str) -> Editor {
     let mut e = Editor::default();
-    e.load_markdown(markdown);
+    e.set_tdoc(markdown_to_document(markdown));
+    e.reset_undo_history(); // establish the loaded doc as the undo baseline
     e
 }
 

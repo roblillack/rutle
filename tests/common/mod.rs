@@ -37,9 +37,14 @@ use rusttype::{Font, Scale, point};
 use unicode_segmentation::UnicodeSegmentation;
 
 use rutle::render_context::{FontStyle, FontType, RenderContext};
-use rutle::richtext::markdown_converter::markdown_to_document;
-use rutle::richtext::renderer::Renderer;
-use rutle::richtext::tree_path::DocumentPosition;
+use rutle::renderer::Renderer;
+use rutle::tree_path::DocumentPosition;
+
+/// Build a document from Markdown via `tdoc` (rutle is tdoc::Document-centric).
+fn markdown_to_document(md: &str) -> tdoc::Document {
+    tdoc::markdown::parse(std::io::Cursor::new(md.as_bytes()))
+        .unwrap_or_else(|_| tdoc::Document::new())
+}
 
 /// Browser SVG text renders larger than rusttype's raw advances; the original
 /// Piki backend scaled proportional widths by this factor so manual snapshot

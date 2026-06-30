@@ -11,7 +11,6 @@
 // the `// TODO(phase2)` markers.
 
 use super::inline_convert::{inline_to_spans, spans_to_inline};
-use super::markdown_converter::markdown_to_document;
 use super::reveal::{
     RevealStyle, clear_reveal_style, next_tag_boundary, prev_tag_boundary, reveal_tag_count_at,
     reveal_tag_to_remove, unwrap_links,
@@ -190,12 +189,6 @@ impl Editor {
         self.selection = None;
         self.normalize_cursor();
         self.trigger_paragraph_change();
-    }
-
-    /// Load markdown as the document, clearing undo history.
-    pub fn load_markdown(&mut self, markdown: &str) {
-        self.set_tdoc(markdown_to_document(markdown));
-        self.reset_undo_history();
     }
 
     /// Re-clamp the caret after the document was mutated through `tdoc_mut`.
@@ -2301,6 +2294,7 @@ fn extract_inline_range(content: &[InlineContent], start: usize, end: usize) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::markdown_converter::{document_to_markdown, markdown_to_document};
 
     #[test]
     fn insert_text_into_empty_document() {
@@ -2314,7 +2308,7 @@ mod tests {
     fn typing_continues_run_style() {
         // Loading bold markdown then typing inside keeps it one styled leaf.
         let mut editor = Editor::new();
-        editor.load_markdown("**bold**");
+        editor.set_tdoc(markdown_to_document("**bold**"));
         editor.set_cursor(DocumentPosition::at(TreePath::root(0), 2));
         editor.insert_text("X").unwrap();
         assert_eq!(editor.leaf_plain_text(&TreePath::root(0)), "boXld");
@@ -2332,7 +2326,7 @@ mod tests {
     #[test]
     fn word_navigation_within_leaf() {
         let mut editor = Editor::new();
-        editor.load_markdown("alpha beta gamma");
+        editor.set_tdoc(markdown_to_document("alpha beta gamma"));
         editor.set_cursor(DocumentPosition::at(TreePath::root(0), 0));
         editor.move_word_right();
         assert_eq!(editor.cursor().offset, 5); // end of "alpha" (word-right stops after the word)
@@ -2361,15 +2355,13 @@ mod tests {
     }
 
     fn md(editor: &Editor) -> String {
-        super::super::markdown_converter::document_to_markdown(editor.tdoc())
-            .trim()
-            .to_string()
+        document_to_markdown(editor.tdoc()).trim().to_string()
     }
 
     #[test]
     fn toggle_bold_over_selection() {
         let mut editor = Editor::new();
-        editor.load_markdown("hello world");
+        editor.set_tdoc(markdown_to_document("hello world"));
         editor.set_selection(
             DocumentPosition::at(TreePath::root(0), 0),
             DocumentPosition::at(TreePath::root(0), 5),
@@ -2422,7 +2414,7 @@ mod tests {
     #[test]
     fn enter_at_end_of_heading_starts_plain_paragraph() {
         let mut editor = Editor::new();
-        editor.load_markdown("# Title");
+        editor.set_tdoc(markdown_to_document("# Title"));
         editor.set_cursor(DocumentPosition::at(TreePath::root(0), 5));
         editor.insert_newline().unwrap();
         // The heading stays; Enter at its end opens a normal paragraph below.
@@ -2441,7 +2433,7 @@ mod tests {
     #[test]
     fn enter_at_start_of_heading_keeps_heading_style() {
         let mut editor = Editor::new();
-        editor.load_markdown("# Title");
+        editor.set_tdoc(markdown_to_document("# Title"));
         editor.set_cursor(DocumentPosition::at(TreePath::root(0), 0));
         editor.insert_newline().unwrap();
         assert_eq!(editor.leaf_count(), 2);
@@ -2464,7 +2456,7 @@ mod tests {
     #[test]
     fn same_kind_toggle_on_nested_item_is_noop() {
         let mut editor = Editor::new();
-        editor.load_markdown("1. one\n2. two");
+        editor.set_tdoc(markdown_to_document("1. one\n2. two"));
         editor.set_cursor(DocumentPosition::at(list_item_path(1), 0));
         editor.indent_list_item().unwrap(); // "two" nested under "one" (ordered)
         let doc_before = editor.tdoc().clone();
@@ -2478,7 +2470,7 @@ mod tests {
     #[test]
     fn changing_nested_list_kind_preserves_nesting() {
         let mut editor = Editor::new();
-        editor.load_markdown("1. one\n2. two");
+        editor.set_tdoc(markdown_to_document("1. one\n2. two"));
         editor.set_cursor(DocumentPosition::at(list_item_path(1), 0));
         editor.indent_list_item().unwrap(); // "two" nested under "one" (ordered)
         assert_eq!(leaf_depths(&editor), vec![0, 1]);
@@ -2502,7 +2494,7 @@ mod tests {
     #[test]
     fn enter_in_list_creates_new_item() {
         let mut editor = Editor::new();
-        editor.load_markdown("- one");
+        editor.set_tdoc(markdown_to_document("- one"));
         let item = TreePath::root(0).child(PathSegment::ListEntry { entry: 0, para: 0 });
         editor.set_cursor(DocumentPosition::at(item, 3));
         editor.insert_newline().unwrap();
@@ -2513,7 +2505,7 @@ mod tests {
     #[test]
     fn backspace_merges_list_item_into_previous() {
         let mut editor = Editor::new();
-        editor.load_markdown("- one\n- two");
+        editor.set_tdoc(markdown_to_document("- one\n- two"));
         let second = TreePath::root(0).child(PathSegment::ListEntry { entry: 1, para: 0 });
         editor.set_cursor(DocumentPosition::at(second, 0));
         editor.delete_backward().unwrap();
@@ -2523,7 +2515,7 @@ mod tests {
     #[test]
     fn ordered_list_renumbers_automatically() {
         let mut editor = Editor::new();
-        editor.load_markdown("1. one\n2. two\n3. three");
+        editor.set_tdoc(markdown_to_document("1. one\n2. two\n3. three"));
         // Delete the middle item by merging it into the first.
         let second = TreePath::root(0).child(PathSegment::ListEntry { entry: 1, para: 0 });
         editor.set_cursor(DocumentPosition::at(second, 0));
@@ -2545,7 +2537,7 @@ mod tests {
     #[test]
     fn toggle_checkmark_round_trips() {
         let mut editor = Editor::new();
-        editor.load_markdown("- [ ] task");
+        editor.set_tdoc(markdown_to_document("- [ ] task"));
         let item = TreePath::root(0).child(PathSegment::ChecklistItem(0));
         editor.set_cursor(DocumentPosition::at(item, 0));
         assert_eq!(editor.toggle_current_checkmark(), Ok(true));
@@ -2555,7 +2547,7 @@ mod tests {
     #[test]
     fn move_block_down_swaps_with_next() {
         let mut editor = Editor::new();
-        editor.load_markdown("first\n\nsecond");
+        editor.set_tdoc(markdown_to_document("first\n\nsecond"));
         editor.set_cursor(DocumentPosition::at(TreePath::root(0), 0));
         assert_eq!(editor.move_blocks_down(), Ok(true));
         assert_eq!(md(&editor), "second\n\nfirst");
@@ -2574,7 +2566,7 @@ mod tests {
     #[test]
     fn cross_leaf_delete_selection_merges() {
         let mut editor = Editor::new();
-        editor.load_markdown("hello\n\nworld");
+        editor.set_tdoc(markdown_to_document("hello\n\nworld"));
         editor.set_selection(
             DocumentPosition::at(TreePath::root(0), 3),
             DocumentPosition::at(TreePath::root(1), 2),
@@ -2597,7 +2589,7 @@ mod tests {
     #[test]
     fn indent_nests_under_previous_sibling() {
         let mut editor = Editor::new();
-        editor.load_markdown("- a\n- b");
+        editor.set_tdoc(markdown_to_document("- a\n- b"));
         editor.set_cursor(DocumentPosition::at(list_item_path(1), 0));
         editor.indent_list_item().unwrap();
         assert_eq!(leaf_depths(&editor), vec![0, 1]);
@@ -2609,7 +2601,7 @@ mod tests {
     #[test]
     fn indent_then_outdent_restores_flat_list() {
         let mut editor = Editor::new();
-        editor.load_markdown("- a\n- b");
+        editor.set_tdoc(markdown_to_document("- a\n- b"));
         editor.set_cursor(DocumentPosition::at(list_item_path(1), 0));
         editor.indent_list_item().unwrap();
         assert_eq!(leaf_depths(&editor), vec![0, 1]);
@@ -2621,7 +2613,7 @@ mod tests {
     #[test]
     fn outdent_nested_item_adopts_following_siblings() {
         let mut editor = Editor::new();
-        editor.load_markdown("- a\n  - x\n  - y\n  - z");
+        editor.set_tdoc(markdown_to_document("- a\n  - x\n  - y\n  - z"));
         assert_eq!(leaf_depths(&editor), vec![0, 1, 1, 1]);
         // Outdent the first nested item (x).
         let x = TreePath::root(0)
@@ -2653,7 +2645,7 @@ mod tests {
     #[test]
     fn indent_selection_nests_every_selected_item_together() {
         let mut editor = Editor::new();
-        editor.load_markdown("- a\n- x\n- y\n- z");
+        editor.set_tdoc(markdown_to_document("- a\n- x\n- y\n- z"));
         // Select x, y, z (leave a, the first item, out).
         editor.set_selection(
             DocumentPosition::at(list_item_path(1), 0),
@@ -2675,7 +2667,7 @@ mod tests {
     #[test]
     fn indent_selection_cannot_indent_first_item() {
         let mut editor = Editor::new();
-        editor.load_markdown("- a\n- b");
+        editor.set_tdoc(markdown_to_document("- a\n- b"));
         // Select both; "a" is the first item and has no previous sibling to nest under.
         editor.set_selection(
             DocumentPosition::at(list_item_path(0), 0),
@@ -2690,7 +2682,7 @@ mod tests {
     #[test]
     fn indent_then_outdent_selection_round_trips() {
         let mut editor = Editor::new();
-        editor.load_markdown("- a\n- x\n- y");
+        editor.set_tdoc(markdown_to_document("- a\n- x\n- y"));
         let before = editor.tdoc().clone();
         editor.set_selection(
             DocumentPosition::at(list_item_path(1), 0),
@@ -2707,7 +2699,7 @@ mod tests {
     #[test]
     fn outdent_selection_outdents_every_selected_item() {
         let mut editor = Editor::new();
-        editor.load_markdown("- a\n  - x\n  - y\n  - z");
+        editor.set_tdoc(markdown_to_document("- a\n  - x\n  - y\n  - z"));
         let inner = |entry| {
             TreePath::root(0)
                 .child(PathSegment::ListEntry { entry: 0, para: 1 })
@@ -2737,7 +2729,7 @@ mod tests {
     #[test]
     fn outdent_selection_of_all_nested_items_flattens_them() {
         let mut editor = Editor::new();
-        editor.load_markdown("- a\n  - x\n  - y\n  - z");
+        editor.set_tdoc(markdown_to_document("- a\n  - x\n  - y\n  - z"));
         let inner = |entry| {
             TreePath::root(0)
                 .child(PathSegment::ListEntry { entry: 0, para: 1 })
@@ -2758,7 +2750,7 @@ mod tests {
     #[test]
     fn outdent_top_level_item_exits_list() {
         let mut editor = Editor::new();
-        editor.load_markdown("- only");
+        editor.set_tdoc(markdown_to_document("- only"));
         editor.set_cursor(DocumentPosition::at(list_item_path(0), 2));
         editor.outdent_list_item().unwrap();
         assert_eq!(md(&editor), "only");
@@ -2768,7 +2760,7 @@ mod tests {
     #[test]
     fn backspace_at_nested_item_start_outdents() {
         let mut editor = Editor::new();
-        editor.load_markdown("- a\n- b");
+        editor.set_tdoc(markdown_to_document("- a\n- b"));
         editor.set_cursor(DocumentPosition::at(list_item_path(1), 0));
         editor.indent_list_item().unwrap(); // b nested under a
         assert_eq!(leaf_depths(&editor), vec![0, 1]);
@@ -2780,7 +2772,7 @@ mod tests {
     #[test]
     fn enter_on_empty_top_item_exits_list() {
         let mut editor = Editor::new();
-        editor.load_markdown("- a");
+        editor.set_tdoc(markdown_to_document("- a"));
         editor.set_cursor(DocumentPosition::at(list_item_path(0), 1));
         editor.delete_backward().unwrap(); // delete "a" → empty item
         editor.insert_newline().unwrap(); // empty item + Enter → exit to paragraph
@@ -2790,7 +2782,7 @@ mod tests {
     #[test]
     fn bold_inside_link_styles_link_content() {
         let mut e = Editor::new();
-        e.load_markdown("a [manual](u) b");
+        e.set_tdoc(markdown_to_document("a [manual](u) b"));
         // select "anu" inside the link ("a " = 0..2, "manual" = 2..8)
         e.set_selection(
             DocumentPosition::at(TreePath::root(0), 3),
@@ -2803,7 +2795,7 @@ mod tests {
     #[test]
     fn wrap_selection_in_link_preserves_styles() {
         let mut e = Editor::new();
-        e.load_markdown("hello world");
+        e.set_tdoc(markdown_to_document("hello world"));
         e.set_selection(
             DocumentPosition::at(TreePath::root(0), 0),
             DocumentPosition::at(TreePath::root(0), 5),
@@ -2820,7 +2812,7 @@ mod tests {
     #[test]
     fn wrap_selection_in_link_flattens_inner_links() {
         let mut e = Editor::new();
-        e.load_markdown("a [b](v) c");
+        e.set_tdoc(markdown_to_document("a [b](v) c"));
         // select the whole paragraph and wrap in a new link
         e.set_selection(
             DocumentPosition::at(TreePath::root(0), 0),
@@ -2844,7 +2836,9 @@ mod tests {
     #[test]
     fn image_in_link_flattens_and_is_stylable() {
         let mut e = Editor::new();
-        e.load_markdown("[![Build Status](https://x/badge.svg)](https://x/actions)");
+        e.set_tdoc(markdown_to_document(
+            "[![Build Status](https://x/badge.svg)](https://x/actions)",
+        ));
         let runs = super::super::tree_walk::leaf_inline(e.tdoc(), &TreePath::root(0));
         assert_eq!(runs.len(), 1, "one flat link: {:?}", runs);
         match &runs[0] {

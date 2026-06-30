@@ -3463,13 +3463,13 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inline_convert::inline_to_spans;
     use crate::render_context::{FontStyle, FontType};
-    use crate::richtext::inline_convert::inline_to_spans;
-    use crate::richtext::structured_document::{
+    use crate::structured_document::{
         Block, BlockType, InlineContent, TableCell, TableRow, TextRun,
     };
-    use crate::richtext::tree_path::{DocumentPosition, TreePath};
-    use crate::richtext::tree_walk;
+    use crate::tree_path::{DocumentPosition, TreePath};
+    use crate::tree_walk;
     use tdoc::Document;
     use tdoc::paragraph::{
         ChecklistItem, Paragraph, TableCell as TdocTableCell, TableRow as TdocTableRow,
@@ -3621,7 +3621,7 @@ mod tests {
         // A quote containing a numbered list, a nested bullet, and a continuation
         // paragraph: every line must carry the quote indent/bar *and* its list indent.
         let md = "> Plain in quote\n>\n> 1. Numbered in quote\n>\n>    - Bullet in quote\n>\n>      Continuation in bullet";
-        let doc = crate::richtext::markdown_converter::markdown_to_document(md);
+        let doc = crate::markdown_converter::markdown_to_document(md);
         let mut display = Renderer::new(0, 0, 600, 400);
         display.editor_mut().set_tdoc(doc);
         let mut ctx = TestRenderContext::new_with_focus();
@@ -3732,7 +3732,7 @@ mod tests {
         // via the ARCHITECTURE.md reveal-mode cursor-down benchmark, which stalled
         // at a bold list item ~94 paragraphs before the end.)
         let md = "- **bold words that should wrap across several lines in this one list item**\n\nAFTER\n";
-        let doc = crate::richtext::markdown_converter::markdown_to_document(md);
+        let doc = crate::markdown_converter::markdown_to_document(md);
 
         // The wrap window is only a few pixels wide and depends on font metrics,
         // so search narrow→wide for a width at which the trailing reveal tag wraps

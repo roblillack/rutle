@@ -15,7 +15,12 @@ use std::time::Instant;
 
 use rutle::Renderer;
 use rutle::render_context::{FontStyle, FontType, RenderContext};
-use rutle::richtext::markdown_converter::markdown_to_document;
+
+/// Build a document from Markdown via `tdoc` (rutle itself is tdoc::Document-centric).
+fn markdown_to_document(md: &str) -> tdoc::Document {
+    tdoc::markdown::parse(std::io::Cursor::new(md.as_bytes()))
+        .unwrap_or_else(|_| tdoc::Document::new())
+}
 
 /// Char-cell stub: width = char count, height = 1. No real font system.
 struct StubCtx;
