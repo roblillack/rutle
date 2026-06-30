@@ -172,26 +172,28 @@ impl Editor {
     }
 
     /// The authoritative document tree.
-    pub fn tdoc(&self) -> &Document {
+    pub fn document(&self) -> &Document {
         &self.tdoc
     }
 
     /// Mutable access to the authoritative document tree. Callers that mutate it should
     /// follow up with [`Editor::after_external_change`].
-    pub fn tdoc_mut(&mut self) -> &mut Document {
+    pub fn document_mut(&mut self) -> &mut Document {
         &mut self.tdoc
     }
 
-    /// Replace the whole document (e.g. when loading a page). Resets the caret.
-    pub fn set_tdoc(&mut self, tdoc: Document) {
-        self.tdoc = tdoc;
+    /// Replace the whole document (e.g. when loading a page). Resets the caret and
+    /// clears undo/redo history, making the new document the undo baseline.
+    pub fn set_document(&mut self, document: Document) {
+        self.tdoc = document;
         self.cursor = DocumentPosition::start();
         self.selection = None;
         self.normalize_cursor();
         self.trigger_paragraph_change();
+        self.reset_undo_history();
     }
 
-    /// Re-clamp the caret after the document was mutated through `tdoc_mut`.
+    /// Re-clamp the caret after the document was mutated through `document_mut`.
     pub fn after_external_change(&mut self) {
         self.normalize_cursor();
         self.trigger_paragraph_change();
@@ -2308,7 +2310,7 @@ mod tests {
     fn typing_continues_run_style() {
         // Loading bold markdown then typing inside keeps it one styled leaf.
         let mut editor = Editor::new();
-        editor.set_tdoc(markdown_to_document("**bold**"));
+        editor.set_document(markdown_to_document("**bold**"));
         editor.set_cursor(DocumentPosition::at(TreePath::root(0), 2));
         editor.insert_text("X").unwrap();
         assert_eq!(editor.leaf_plain_text(&TreePath::root(0)), "boXld");
@@ -2326,7 +2328,7 @@ mod tests {
     #[test]
     fn word_navigation_within_leaf() {
         let mut editor = Editor::new();
-        editor.set_tdoc(markdown_to_document("alpha beta gamma"));
+        editor.set_document(markdown_to_document("alpha beta gamma"));
         editor.set_cursor(DocumentPosition::at(TreePath::root(0), 0));
         editor.move_word_right();
         assert_eq!(editor.cursor().offset, 5); // end of "alpha" (word-right stops after the word)
@@ -2355,13 +2357,13 @@ mod tests {
     }
 
     fn md(editor: &Editor) -> String {
-        document_to_markdown(editor.tdoc()).trim().to_string()
+        document_to_markdown(editor.document()).trim().to_string()
     }
 
     #[test]
     fn toggle_bold_over_selection() {
         let mut editor = Editor::new();
-        editor.set_tdoc(markdown_to_document("hello world"));
+        editor.set_document(markdown_to_document("hello world"));
         editor.set_selection(
             DocumentPosition::at(TreePath::root(0), 0),
             DocumentPosition::at(TreePath::root(0), 5),
@@ -2414,16 +2416,16 @@ mod tests {
     #[test]
     fn enter_at_end_of_heading_starts_plain_paragraph() {
         let mut editor = Editor::new();
-        editor.set_tdoc(markdown_to_document("# Title"));
+        editor.set_document(markdown_to_document("# Title"));
         editor.set_cursor(DocumentPosition::at(TreePath::root(0), 5));
         editor.insert_newline().unwrap();
         // The heading stays; Enter at its end opens a normal paragraph below.
         assert!(matches!(
-            editor.tdoc().paragraphs[0],
+            editor.document().paragraphs[0],
             Paragraph::Header1 { .. }
         ));
         assert!(matches!(
-            editor.tdoc().paragraphs[1],
+            editor.document().paragraphs[1],
             Paragraph::Text { .. }
         ));
         assert_eq!(editor.cursor().path, TreePath::root(1));
@@ -2433,19 +2435,19 @@ mod tests {
     #[test]
     fn enter_at_start_of_heading_keeps_heading_style() {
         let mut editor = Editor::new();
-        editor.set_tdoc(markdown_to_document("# Title"));
+        editor.set_document(markdown_to_document("# Title"));
         editor.set_cursor(DocumentPosition::at(TreePath::root(0), 0));
         editor.insert_newline().unwrap();
         assert_eq!(editor.leaf_count(), 2);
         // Both halves keep the heading block type — the content is not demoted to a plain
         // paragraph. The cursor stays with the text below.
         assert!(matches!(
-            editor.tdoc().paragraphs[0],
+            editor.document().paragraphs[0],
             Paragraph::Header1 { .. }
         ));
         assert_eq!(editor.leaf_plain_text(&TreePath::root(0)), "");
         assert!(matches!(
-            editor.tdoc().paragraphs[1],
+            editor.document().paragraphs[1],
             Paragraph::Header1 { .. }
         ));
         assert_eq!(editor.leaf_plain_text(&TreePath::root(1)), "Title");
@@ -2456,21 +2458,21 @@ mod tests {
     #[test]
     fn same_kind_toggle_on_nested_item_is_noop() {
         let mut editor = Editor::new();
-        editor.set_tdoc(markdown_to_document("1. one\n2. two"));
+        editor.set_document(markdown_to_document("1. one\n2. two"));
         editor.set_cursor(DocumentPosition::at(list_item_path(1), 0));
         editor.indent_list_item().unwrap(); // "two" nested under "one" (ordered)
-        let doc_before = editor.tdoc().clone();
+        let doc_before = editor.document().clone();
         let cursor_before = editor.cursor();
         // Already an ordered nested item → toggling ordered list does nothing.
         editor.toggle_ordered_list().unwrap();
-        assert_eq!(*editor.tdoc(), doc_before);
+        assert_eq!(*editor.document(), doc_before);
         assert_eq!(editor.cursor(), cursor_before);
     }
 
     #[test]
     fn changing_nested_list_kind_preserves_nesting() {
         let mut editor = Editor::new();
-        editor.set_tdoc(markdown_to_document("1. one\n2. two"));
+        editor.set_document(markdown_to_document("1. one\n2. two"));
         editor.set_cursor(DocumentPosition::at(list_item_path(1), 0));
         editor.indent_list_item().unwrap(); // "two" nested under "one" (ordered)
         assert_eq!(leaf_depths(&editor), vec![0, 1]);
@@ -2479,7 +2481,7 @@ mod tests {
         // Nesting is intact and the outer level is untouched.
         assert_eq!(leaf_depths(&editor), vec![0, 1]);
         assert!(matches!(
-            editor.tdoc().paragraphs[0],
+            editor.document().paragraphs[0],
             Paragraph::OrderedList { .. }
         ));
         assert!(matches!(
@@ -2488,13 +2490,13 @@ mod tests {
         ));
         // The tree still round-trips through markdown.
         let reparsed = markdown_to_document(&md(&editor));
-        assert_eq!(*editor.tdoc(), reparsed);
+        assert_eq!(*editor.document(), reparsed);
     }
 
     #[test]
     fn enter_in_list_creates_new_item() {
         let mut editor = Editor::new();
-        editor.set_tdoc(markdown_to_document("- one"));
+        editor.set_document(markdown_to_document("- one"));
         let item = TreePath::root(0).child(PathSegment::ListEntry { entry: 0, para: 0 });
         editor.set_cursor(DocumentPosition::at(item, 3));
         editor.insert_newline().unwrap();
@@ -2505,7 +2507,7 @@ mod tests {
     #[test]
     fn backspace_merges_list_item_into_previous() {
         let mut editor = Editor::new();
-        editor.set_tdoc(markdown_to_document("- one\n- two"));
+        editor.set_document(markdown_to_document("- one\n- two"));
         let second = TreePath::root(0).child(PathSegment::ListEntry { entry: 1, para: 0 });
         editor.set_cursor(DocumentPosition::at(second, 0));
         editor.delete_backward().unwrap();
@@ -2515,7 +2517,7 @@ mod tests {
     #[test]
     fn ordered_list_renumbers_automatically() {
         let mut editor = Editor::new();
-        editor.set_tdoc(markdown_to_document("1. one\n2. two\n3. three"));
+        editor.set_document(markdown_to_document("1. one\n2. two\n3. three"));
         // Delete the middle item by merging it into the first.
         let second = TreePath::root(0).child(PathSegment::ListEntry { entry: 1, para: 0 });
         editor.set_cursor(DocumentPosition::at(second, 0));
@@ -2537,7 +2539,7 @@ mod tests {
     #[test]
     fn toggle_checkmark_round_trips() {
         let mut editor = Editor::new();
-        editor.set_tdoc(markdown_to_document("- [ ] task"));
+        editor.set_document(markdown_to_document("- [ ] task"));
         let item = TreePath::root(0).child(PathSegment::ChecklistItem(0));
         editor.set_cursor(DocumentPosition::at(item, 0));
         assert_eq!(editor.toggle_current_checkmark(), Ok(true));
@@ -2547,7 +2549,7 @@ mod tests {
     #[test]
     fn move_block_down_swaps_with_next() {
         let mut editor = Editor::new();
-        editor.set_tdoc(markdown_to_document("first\n\nsecond"));
+        editor.set_document(markdown_to_document("first\n\nsecond"));
         editor.set_cursor(DocumentPosition::at(TreePath::root(0), 0));
         assert_eq!(editor.move_blocks_down(), Ok(true));
         assert_eq!(md(&editor), "second\n\nfirst");
@@ -2566,7 +2568,7 @@ mod tests {
     #[test]
     fn cross_leaf_delete_selection_merges() {
         let mut editor = Editor::new();
-        editor.set_tdoc(markdown_to_document("hello\n\nworld"));
+        editor.set_document(markdown_to_document("hello\n\nworld"));
         editor.set_selection(
             DocumentPosition::at(TreePath::root(0), 3),
             DocumentPosition::at(TreePath::root(1), 2),
@@ -2576,7 +2578,7 @@ mod tests {
     }
 
     fn leaf_depths(editor: &Editor) -> Vec<usize> {
-        tree_walk::enumerate_leaves(editor.tdoc())
+        tree_walk::enumerate_leaves(editor.document())
             .iter()
             .map(|l| l.depth)
             .collect()
@@ -2589,19 +2591,19 @@ mod tests {
     #[test]
     fn indent_nests_under_previous_sibling() {
         let mut editor = Editor::new();
-        editor.set_tdoc(markdown_to_document("- a\n- b"));
+        editor.set_document(markdown_to_document("- a\n- b"));
         editor.set_cursor(DocumentPosition::at(list_item_path(1), 0));
         editor.indent_list_item().unwrap();
         assert_eq!(leaf_depths(&editor), vec![0, 1]);
         // The tree still round-trips through markdown.
         let reparsed = markdown_to_document(&md(&editor));
-        assert_eq!(*editor.tdoc(), reparsed);
+        assert_eq!(*editor.document(), reparsed);
     }
 
     #[test]
     fn indent_then_outdent_restores_flat_list() {
         let mut editor = Editor::new();
-        editor.set_tdoc(markdown_to_document("- a\n- b"));
+        editor.set_document(markdown_to_document("- a\n- b"));
         editor.set_cursor(DocumentPosition::at(list_item_path(1), 0));
         editor.indent_list_item().unwrap();
         assert_eq!(leaf_depths(&editor), vec![0, 1]);
@@ -2613,7 +2615,7 @@ mod tests {
     #[test]
     fn outdent_nested_item_adopts_following_siblings() {
         let mut editor = Editor::new();
-        editor.set_tdoc(markdown_to_document("- a\n  - x\n  - y\n  - z"));
+        editor.set_document(markdown_to_document("- a\n  - x\n  - y\n  - z"));
         assert_eq!(leaf_depths(&editor), vec![0, 1, 1, 1]);
         // Outdent the first nested item (x).
         let x = TreePath::root(0)
@@ -2623,7 +2625,7 @@ mod tests {
         editor.outdent_list_item().unwrap();
         // x sits beside a; y and z are now nested under x.
         assert_eq!(leaf_depths(&editor), vec![0, 0, 1, 1]);
-        let texts: Vec<String> = tree_walk::leaf_paths(editor.tdoc())
+        let texts: Vec<String> = tree_walk::leaf_paths(editor.document())
             .iter()
             .map(|p| editor.leaf_plain_text(p))
             .collect();
@@ -2632,11 +2634,11 @@ mod tests {
         assert_eq!(editor.cursor().path, list_item_path(1));
         // Still round-trips through markdown.
         let reparsed = markdown_to_document(&md(&editor));
-        assert_eq!(*editor.tdoc(), reparsed);
+        assert_eq!(*editor.document(), reparsed);
     }
 
     fn leaf_texts(editor: &Editor) -> Vec<String> {
-        tree_walk::leaf_paths(editor.tdoc())
+        tree_walk::leaf_paths(editor.document())
             .iter()
             .map(|p| editor.leaf_plain_text(p))
             .collect()
@@ -2645,7 +2647,7 @@ mod tests {
     #[test]
     fn indent_selection_nests_every_selected_item_together() {
         let mut editor = Editor::new();
-        editor.set_tdoc(markdown_to_document("- a\n- x\n- y\n- z"));
+        editor.set_document(markdown_to_document("- a\n- x\n- y\n- z"));
         // Select x, y, z (leave a, the first item, out).
         editor.set_selection(
             DocumentPosition::at(list_item_path(1), 0),
@@ -2657,17 +2659,17 @@ mod tests {
         assert_eq!(leaf_texts(&editor), vec!["a", "x", "y", "z"]);
         // Selection still covers the three items so Tab can be repeated.
         let (s, e) = editor.selection().expect("selection retained");
-        assert_eq!(tree_walk::leaf_paths(editor.tdoc())[1], s.path);
-        assert_eq!(tree_walk::leaf_paths(editor.tdoc())[3], e.path);
+        assert_eq!(tree_walk::leaf_paths(editor.document())[1], s.path);
+        assert_eq!(tree_walk::leaf_paths(editor.document())[3], e.path);
         // Round-trips through markdown.
         let reparsed = markdown_to_document(&md(&editor));
-        assert_eq!(*editor.tdoc(), reparsed);
+        assert_eq!(*editor.document(), reparsed);
     }
 
     #[test]
     fn indent_selection_cannot_indent_first_item() {
         let mut editor = Editor::new();
-        editor.set_tdoc(markdown_to_document("- a\n- b"));
+        editor.set_document(markdown_to_document("- a\n- b"));
         // Select both; "a" is the first item and has no previous sibling to nest under.
         editor.set_selection(
             DocumentPosition::at(list_item_path(0), 0),
@@ -2682,8 +2684,8 @@ mod tests {
     #[test]
     fn indent_then_outdent_selection_round_trips() {
         let mut editor = Editor::new();
-        editor.set_tdoc(markdown_to_document("- a\n- x\n- y"));
-        let before = editor.tdoc().clone();
+        editor.set_document(markdown_to_document("- a\n- x\n- y"));
+        let before = editor.document().clone();
         editor.set_selection(
             DocumentPosition::at(list_item_path(1), 0),
             DocumentPosition::at(list_item_path(2), 1),
@@ -2693,13 +2695,13 @@ mod tests {
         // The retained selection lets the inverse outdent restore the flat list.
         editor.outdent_list_item().unwrap();
         assert_eq!(leaf_depths(&editor), vec![0, 0, 0]);
-        assert_eq!(*editor.tdoc(), before);
+        assert_eq!(*editor.document(), before);
     }
 
     #[test]
     fn outdent_selection_outdents_every_selected_item() {
         let mut editor = Editor::new();
-        editor.set_tdoc(markdown_to_document("- a\n  - x\n  - y\n  - z"));
+        editor.set_document(markdown_to_document("- a\n  - x\n  - y\n  - z"));
         let inner = |entry| {
             TreePath::root(0)
                 .child(PathSegment::ListEntry { entry: 0, para: 1 })
@@ -2729,7 +2731,7 @@ mod tests {
     #[test]
     fn outdent_selection_of_all_nested_items_flattens_them() {
         let mut editor = Editor::new();
-        editor.set_tdoc(markdown_to_document("- a\n  - x\n  - y\n  - z"));
+        editor.set_document(markdown_to_document("- a\n  - x\n  - y\n  - z"));
         let inner = |entry| {
             TreePath::root(0)
                 .child(PathSegment::ListEntry { entry: 0, para: 1 })
@@ -2744,13 +2746,13 @@ mod tests {
         assert_eq!(leaf_depths(&editor), vec![0, 0, 0, 0]);
         assert_eq!(leaf_texts(&editor), vec!["a", "x", "y", "z"]);
         let reparsed = markdown_to_document(&md(&editor));
-        assert_eq!(*editor.tdoc(), reparsed);
+        assert_eq!(*editor.document(), reparsed);
     }
 
     #[test]
     fn outdent_top_level_item_exits_list() {
         let mut editor = Editor::new();
-        editor.set_tdoc(markdown_to_document("- only"));
+        editor.set_document(markdown_to_document("- only"));
         editor.set_cursor(DocumentPosition::at(list_item_path(0), 2));
         editor.outdent_list_item().unwrap();
         assert_eq!(md(&editor), "only");
@@ -2760,7 +2762,7 @@ mod tests {
     #[test]
     fn backspace_at_nested_item_start_outdents() {
         let mut editor = Editor::new();
-        editor.set_tdoc(markdown_to_document("- a\n- b"));
+        editor.set_document(markdown_to_document("- a\n- b"));
         editor.set_cursor(DocumentPosition::at(list_item_path(1), 0));
         editor.indent_list_item().unwrap(); // b nested under a
         assert_eq!(leaf_depths(&editor), vec![0, 1]);
@@ -2772,7 +2774,7 @@ mod tests {
     #[test]
     fn enter_on_empty_top_item_exits_list() {
         let mut editor = Editor::new();
-        editor.set_tdoc(markdown_to_document("- a"));
+        editor.set_document(markdown_to_document("- a"));
         editor.set_cursor(DocumentPosition::at(list_item_path(0), 1));
         editor.delete_backward().unwrap(); // delete "a" → empty item
         editor.insert_newline().unwrap(); // empty item + Enter → exit to paragraph
@@ -2782,7 +2784,7 @@ mod tests {
     #[test]
     fn bold_inside_link_styles_link_content() {
         let mut e = Editor::new();
-        e.set_tdoc(markdown_to_document("a [manual](u) b"));
+        e.set_document(markdown_to_document("a [manual](u) b"));
         // select "anu" inside the link ("a " = 0..2, "manual" = 2..8)
         e.set_selection(
             DocumentPosition::at(TreePath::root(0), 3),
@@ -2795,7 +2797,7 @@ mod tests {
     #[test]
     fn wrap_selection_in_link_preserves_styles() {
         let mut e = Editor::new();
-        e.set_tdoc(markdown_to_document("hello world"));
+        e.set_document(markdown_to_document("hello world"));
         e.set_selection(
             DocumentPosition::at(TreePath::root(0), 0),
             DocumentPosition::at(TreePath::root(0), 5),
@@ -2812,7 +2814,7 @@ mod tests {
     #[test]
     fn wrap_selection_in_link_flattens_inner_links() {
         let mut e = Editor::new();
-        e.set_tdoc(markdown_to_document("a [b](v) c"));
+        e.set_document(markdown_to_document("a [b](v) c"));
         // select the whole paragraph and wrap in a new link
         e.set_selection(
             DocumentPosition::at(TreePath::root(0), 0),
@@ -2820,7 +2822,7 @@ mod tests {
         );
         e.wrap_selection_in_link("u").unwrap();
         // No nested links: the inner link is flattened, one outer link.
-        let runs = super::super::tree_walk::leaf_inline(e.tdoc(), &TreePath::root(0));
+        let runs = super::super::tree_walk::leaf_inline(e.document(), &TreePath::root(0));
         fn has_nested(items: &[InlineContent]) -> bool {
             items.iter().any(|it| match it {
                 InlineContent::Link { content, .. } => content
@@ -2836,10 +2838,10 @@ mod tests {
     #[test]
     fn image_in_link_flattens_and_is_stylable() {
         let mut e = Editor::new();
-        e.set_tdoc(markdown_to_document(
+        e.set_document(markdown_to_document(
             "[![Build Status](https://x/badge.svg)](https://x/actions)",
         ));
-        let runs = super::super::tree_walk::leaf_inline(e.tdoc(), &TreePath::root(0));
+        let runs = super::super::tree_walk::leaf_inline(e.document(), &TreePath::root(0));
         assert_eq!(runs.len(), 1, "one flat link: {:?}", runs);
         match &runs[0] {
             InlineContent::Link { link, content } => {

@@ -863,7 +863,7 @@ impl Renderer {
         // order) and a parallel list of renderable blocks. `block_index` on layout lines
         // is an index into these vecs.
         let (leaves, blocks) = {
-            let tdoc = self.editor.tdoc();
+            let tdoc = self.editor.document();
             let leaves = tree_walk::enumerate_leaves(tdoc);
             let blocks: Vec<Block> = leaves
                 .iter()
@@ -3296,10 +3296,10 @@ impl Renderer {
 
         let term_lower = term.to_lowercase();
         // `block_index` is the leaf's index in document order, matching layout frames.
-        let leaves = tree_walk::enumerate_leaves(self.editor.tdoc());
+        let leaves = tree_walk::enumerate_leaves(self.editor.document());
         let mut matches = Vec::new();
         for (block_idx, info) in leaves.iter().enumerate() {
-            let text = tree_walk::leaf_plain_text(self.editor.tdoc(), &info.path);
+            let text = tree_walk::leaf_plain_text(self.editor.document(), &info.path);
             let text_lower = text.to_lowercase();
 
             // Find all occurrences in this block
@@ -3522,7 +3522,7 @@ mod tests {
 
     /// Byte length of the first leaf's plain text.
     fn leaf0_len(display: &Renderer) -> usize {
-        tree_walk::leaf_text_len(display.editor().tdoc(), &TreePath::root(0))
+        tree_walk::leaf_text_len(display.editor().document(), &TreePath::root(0))
     }
 
     #[derive(Default)]
@@ -3598,7 +3598,7 @@ mod tests {
         let doc = Document::new().with_paragraphs(blocks.iter().map(block_to_paragraph).collect());
         {
             let editor = display.editor_mut();
-            editor.set_tdoc(doc);
+            editor.set_document(doc);
             editor.set_cursor(DocumentPosition::new(0, 0));
         }
         display
@@ -3623,7 +3623,7 @@ mod tests {
         let md = "> Plain in quote\n>\n> 1. Numbered in quote\n>\n>    - Bullet in quote\n>\n>      Continuation in bullet";
         let doc = crate::markdown_converter::markdown_to_document(md);
         let mut display = Renderer::new(0, 0, 600, 400);
-        display.editor_mut().set_tdoc(doc);
+        display.editor_mut().set_document(doc);
         let mut ctx = TestRenderContext::new_with_focus();
         display.layout(&mut ctx);
 
@@ -3670,7 +3670,7 @@ mod tests {
         ]]);
         let doc = Document::new().with_paragraphs(vec![outer]);
         let mut display = Renderer::new(0, 0, 400, 300);
-        display.editor_mut().set_tdoc(doc);
+        display.editor_mut().set_document(doc);
         let mut ctx = TestRenderContext::new_with_focus();
         display.layout(&mut ctx);
 
@@ -3746,7 +3746,7 @@ mod tests {
         };
         let phantom_width = (60..=400).step_by(2).find(|&w| {
             let mut d = Renderer::new(0, 0, w, 300);
-            d.editor_mut().set_tdoc(doc.clone());
+            d.editor_mut().set_document(doc.clone());
             d.set_reveal_codes(true);
             let mut ctx = TestRenderContext::new_with_focus();
             d.layout(&mut ctx);
@@ -3755,7 +3755,7 @@ mod tests {
         let w = phantom_width.expect("no width wrapped a reveal tag onto its own line");
 
         let mut display = Renderer::new(0, 0, w, 300);
-        display.editor_mut().set_tdoc(doc.clone());
+        display.editor_mut().set_document(doc.clone());
         display.set_reveal_codes(true);
         display.editor_mut().set_cursor(DocumentPosition::new(0, 0));
         let mut ctx = TestRenderContext::new_with_focus();

@@ -50,10 +50,10 @@ hand it to the editor, which owns it and applies every mutation:
 use rutle::Editor;
 
 let mut editor = Editor::default();
-editor.set_tdoc(document); // document: tdoc::Document
+editor.set_document(document); // document: tdoc::Document
 editor.toggle_heading().unwrap();
 
-let edited: &tdoc::Document = editor.tdoc();
+let edited: &tdoc::Document = editor.document();
 ```
 
 To display a document, hand it to a `Renderer` and drive it against your own
@@ -64,7 +64,7 @@ use rutle::Renderer;
 
 // `MyBackend: RenderContext` supplies font metrics + drawing for your toolkit.
 let mut renderer = Renderer::new(0, 0, 800, 600);
-renderer.editor_mut().set_tdoc(document); // document: tdoc::Document
+renderer.editor_mut().set_document(document); // document: tdoc::Document
 renderer.draw(&mut backend);              // backend: &mut impl RenderContext
 ```
 

@@ -21,13 +21,12 @@ fn document_to_markdown(doc: &tdoc::Document) -> String {
 
 fn editor_with(markdown: &str) -> Editor {
     let mut e = Editor::default();
-    e.set_tdoc(markdown_to_document(markdown));
-    e.reset_undo_history(); // establish the loaded doc as the undo baseline
+    e.set_document(markdown_to_document(markdown));
     e
 }
 
 fn md(e: &Editor) -> String {
-    document_to_markdown(e.tdoc())
+    document_to_markdown(e.document())
 }
 
 // ----- text insertion / deletion -------------------------------------------------
@@ -45,17 +44,17 @@ fn insert_newline_splits_paragraph() {
     let mut e = editor_with("ab\n");
     e.set_cursor(DocumentPosition::new(0, 1));
     e.insert_newline().unwrap();
-    assert_eq!(e.tdoc().paragraphs.len(), 2, "{}", md(&e));
+    assert_eq!(e.document().paragraphs.len(), 2, "{}", md(&e));
 }
 
 #[test]
 fn delete_backward_at_start_merges_paragraphs() {
     let mut e = editor_with("a\n\nb\n");
-    assert_eq!(e.tdoc().paragraphs.len(), 2);
+    assert_eq!(e.document().paragraphs.len(), 2);
     // Move to the start of the second paragraph and backspace.
     e.move_cursor_down();
     e.delete_backward().unwrap();
-    assert_eq!(e.tdoc().paragraphs.len(), 1, "{}", md(&e));
+    assert_eq!(e.document().paragraphs.len(), 1, "{}", md(&e));
     assert!(md(&e).contains("ab"), "{}", md(&e));
 }
 

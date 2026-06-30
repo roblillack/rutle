@@ -481,7 +481,7 @@ impl FontSet {
 
 fn display_for(md: &str, w: i32, h: i32) -> Renderer {
     let mut display = Renderer::new(0, 0, w, h);
-    display.editor_mut().set_tdoc(markdown_to_document(md));
+    display.editor_mut().set_document(markdown_to_document(md));
     display
 }
 

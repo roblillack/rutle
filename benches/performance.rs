@@ -87,7 +87,7 @@ fn time_ms<F: FnMut()>(iters: usize, mut f: F) -> f64 {
 fn new_display(markdown: &str) -> Renderer {
     let doc = markdown_to_document(markdown);
     let mut d = Renderer::new(0, 0, 800, 600);
-    d.editor_mut().set_tdoc(doc);
+    d.editor_mut().set_document(doc);
     d
 }
 
