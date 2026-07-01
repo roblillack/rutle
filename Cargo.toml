@@ -3,8 +3,27 @@ name = "rutle"
 description = "Rob's Universal Text Layout Engine: a rendering-agnostic structured editor and layout core for tdoc::Document"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.87"
+authors = ["Robert Lillack <rob@lillack.net>"]
 license = "MIT"
+readme = "README.md"
 repository = "https://github.com/roblillack/rutle"
+keywords = ["editor", "layout", "richtext", "wysiwyg", "text"]
+categories = ["text-editors", "gui", "text-processing", "rendering"]
+# Whitelist only what's needed to build and document the crate. This keeps the
+# published package small by leaving out the test suite's bundled fonts and
+# insta SVG snapshots (~2.5 MB of dev-only assets). `benches/` is kept because
+# `[[bench]]` is an explicitly declared target; `tests/` is auto-discovered, so
+# dropping it is harmless.
+include = [
+    "src/**/*.rs",
+    "benches/**/*.rs",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+]
 
 [dependencies]
 tdoc = { version = "0.11.0", default-features = false }
@@ -13,8 +32,21 @@ unicode-segmentation = "1.10"
 [dev-dependencies]
 insta = "1.34"
 rusttype = "0.9"
-unicode-segmentation = "1.10"
 
 [[bench]]
 name = "performance"
 harness = false
+
+[package.metadata.release]
+pre-release-replacements = [
+    # Roll CHANGELOG's [Unreleased] over to the new version and re-seed a fresh
+    # [Unreleased] above it (the Keep a Changelog + cargo-release marker idiom).
+    # Order matters: the version/date/compare substitutions run first, *then*
+    # the markers re-insert the literal "Unreleased"/"ReleaseDate" tokens so the
+    # next release finds them again.
+    { file = "CHANGELOG.md", search = "Unreleased", replace = "{{version}}" },
+    { file = "CHANGELOG.md", search = '\.\.\.HEAD', replace = "...{{tag_name}}", exactly = 1 },
+    { file = "CHANGELOG.md", search = "ReleaseDate", replace = "{{date}}" },
+    { file = "CHANGELOG.md", search = "<!-- next-header -->", replace = "<!-- next-header -->\n\n## [Unreleased] - ReleaseDate", exactly = 1 },
+    { file = "CHANGELOG.md", search = "<!-- next-url -->", replace = "<!-- next-url -->\n[Unreleased]: https://github.com/roblillack/rutle/compare/{{tag_name}}...HEAD", exactly = 1 },
+]
