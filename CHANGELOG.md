@@ -10,6 +10,80 @@ While pre-1.0, the minor version is bumped for breaking changes.
 
 ## [Unreleased] - ReleaseDate
 
+A general "block model" for containers (quotes and lists), plus list-rendering
+fixes. Additive to the public API.
+
+### Added
+
+- Pseudo-leaf / breadcrumb queries in `tree_walk`: `effective_block_type` (the
+  effective block type at a path — a container holding a single text paragraph
+  collapses to a leaf of the container's kind), `block_breadcrumb` (the
+  outermost-to-innermost block-type chain), `container_block_at`, and
+  `cursor_in_collapsed_container`. `Editor` exposes `cursor_effective_block_type`
+  and `cursor_block_breadcrumb`.
+- Container operations in `tree_edit`: `ContainerKind`, `convert_container`
+  (quote ↔ list ↔ checklist, in place, at any depth), `dissolve_container` (lift
+  a container's children up one level), `merge_adjacent_lists`, `delist_item`
+  (lift a list item out into its enclosing container), `convert_list_item_range`
+  (carve a contiguous run of items out of a list into a new list of another kind,
+  splitting the original into up to three siblings), and `split_leaf_continuation`
+  (split a list item into a continuation paragraph within the same item).
+  `convert_container` / `dissolve_container` / `delist_item` also handle containers
+  nested inside a list item, not just at the top level or in a quote.
+- `Editor` block-model methods: `wrap_selection(ContainerKind)` (wrap the
+  selection in a new container, preserving inner types), `indent` /
+  `insert_continuation`, the "select parent" helpers `cursor_depth`,
+  `container_block_at_depth`, `convert_container_at_depth`,
+  `dissolve_container_at_depth`, `container_dissolvable_at_depth`, and the menu
+  gating helpers `cursor_can_unnest`, `cursor_can_indent`,
+  `cursor_can_nest_into_preceding`.
+- `Theme::list_indent`: minimum horizontal indent per list nesting level, so a
+  cell backend (whose fonts report `font_size == 0`) can still indent nested
+  list items. Defaults to `0`, preserving the GUI's one-em-per-level metric.
+
+### Changed
+
+- `set_block_type` / `toggle_quote` now operate on the **pseudo-leaf**: converting
+  to a quote (or list) flattens the block instead of nesting it (a heading becomes
+  a plain quote), and a single-text container behaves like a leaf so block-type
+  changes round-trip. Converting a list *item* to a quote/leaf affects only that
+  item (splitting the list); converting between list kinds applies to the whole
+  list for a plain cursor, but a selection spanning **several items of one list**
+  carves just those items out into a new list of the target kind (splitting the
+  original around them). Converting to a list merges with adjacent same-kind lists.
+- `outdent_list_item` (`[` / Shift-Tab) also lifts a quote child out of its quote,
+  and lifts an item of a checklist nested inside an ordered/unordered list entry
+  back out to the outer list's level as a checklist (keeping its checkbox) — the
+  inverse of nesting a checklist under a bullet item, instead of delisting it into
+  a plain text paragraph. And `indent` nests the selected top-level paragraph(s)
+  into an adjacent
+  container — appended to a container immediately before them, or prepended to one
+  immediately after — each paragraph becoming a new list item / checklist item /
+  quote child. (`nest_into_preceding_container` → `nest_selection_into_adjacent`;
+  `cursor_can_nest_into_preceding` → `can_nest_selection_into_adjacent`; new
+  `tree_edit::add_paragraphs_to_container`.)
+- `indent_list_item` merges the indented item into whatever ordered/unordered
+  sublist already ends the previous item, regardless of kind (a bullet indented
+  under an item ending in a numbered sublist joins that numbered sublist, and vice
+  versa), instead of starting a second sublist beside it. New
+  `indent_list_item_or_merge` additionally lets the *first* item of a top-level
+  list that follows another list indent straight into that preceding list (merging
+  under its last item), which the editor's `indent` now uses. This also covers a
+  *checklist* following an ordered/unordered list: its first item nests under the
+  preceding list's last item as a checklist sublist (checkboxes preserved),
+  reusing a trailing checklist so a whole selected run collects into one sublist
+  rather than staircasing.
+
+### Fixed
+
+- Nested list items now indent per level in a cell backend (the renderer used the
+  font `font_size` as the per-level step, which cell backends force to `0`, so
+  nesting collapsed flat). See `Theme::list_indent`.
+- Content inside a list (continuation paragraphs, code blocks) aligns with the
+  item's text rather than a fixed bullet width, and ordered-list number padding is
+  computed across the whole list — fixing misaligned continuations and
+  inconsistent padding in numbered lists with two-digit numbers.
+
 ## [0.1.0] - 2026-07-01
 
 Initial release — the rendering-agnostic editing and layout core carved out of

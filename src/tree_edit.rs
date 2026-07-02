@@ -186,6 +186,43 @@ pub fn split_leaf(doc: &mut Document, path: &TreePath, offset: usize) -> Option<
     }
 }
 
+/// Like [`split_leaf`], but inside a list item the right half becomes a *continuation
+/// paragraph* within the same entry (a new plain paragraph after the current one) rather
+/// than starting a new list item. Elsewhere — top level, quotes, checklists — it behaves
+/// exactly like `split_leaf` (a quote already splits into a sibling paragraph).
+pub fn split_leaf_continuation(
+    doc: &mut Document,
+    path: &TreePath,
+    offset: usize,
+) -> Option<TreePath> {
+    let PathSegment::ListEntry { entry, para } = path.0.last()?.clone() else {
+        return split_leaf(doc, path, offset);
+    };
+    // Reject tables / invalid leaves, then split the inline runs.
+    tree_walk::leaf_spans(doc, path)?;
+    let runs = tree_walk::leaf_inline(doc, path);
+    let (left, right) = split_runs(&runs, offset);
+    tree_walk::set_leaf_inline(doc, path, &left);
+
+    let pp = parent_path(path);
+    if let NodeMut::Para(
+        Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
+    ) = node_at_mut(doc, &pp)?
+    {
+        let e = entries.get_mut(entry)?;
+        e.insert(
+            para + 1,
+            Paragraph::new_text().with_content(inline_to_spans(&right)),
+        );
+        Some(pp.child(PathSegment::ListEntry {
+            entry,
+            para: para + 1,
+        }))
+    } else {
+        None
+    }
+}
+
 /// Merge the leaf at `path` into the previous leaf in document order (appending its text).
 /// Returns the resulting cursor position (the join point), or `None` when there is no
 /// previous leaf or either leaf is a table.
@@ -450,6 +487,102 @@ pub fn change_list_kind(doc: &mut Document, path: &TreePath, target: ListKind) -
     }
 }
 
+/// Carve items `[start, end]` out of the list/checklist at `list_path` into a sub-list of
+/// kind `target`, splitting the original list into up to three siblings in its container
+/// (before / converted / after); the unselected halves keep the original kind. The item
+/// representation is remapped as needed (entries ↔ checklist items). Preserves leaf order and
+/// count, so a caller can restore cursor/selection by flat leaf index. Returns the path of
+/// the first converted item, or `None` if `list_path` is not a list `Paragraph` node, the
+/// range is degenerate or covers the whole list, or `target` already matches the list's kind.
+pub fn convert_list_item_range(
+    doc: &mut Document,
+    list_path: &TreePath,
+    start: usize,
+    end: usize,
+    target: ListKind,
+) -> Option<TreePath> {
+    let current = match node_at_mut(doc, list_path)? {
+        NodeMut::Para(p) => list_like_kind(p)?,
+        _ => return None,
+    };
+    if current == target {
+        return None;
+    }
+    let len = match node_at_mut(doc, list_path)? {
+        NodeMut::Para(
+            Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
+        ) => entries.len(),
+        NodeMut::Para(Paragraph::Checklist { items }) => items.len(),
+        _ => return None,
+    };
+    // Only a *partial* range splits the list; a whole-list selection is a plain conversion,
+    // left to the caller's normal path.
+    if start > end || end >= len || (start == 0 && end + 1 == len) {
+        return None;
+    }
+
+    let mut replacement: Vec<Paragraph> = Vec::new();
+    match current {
+        ListKind::Ordered | ListKind::Unordered => {
+            let src_ordered = current == ListKind::Ordered;
+            let mut all = match node_at_mut(doc, list_path)? {
+                NodeMut::Para(
+                    Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
+                ) => std::mem::take(entries),
+                _ => return None,
+            };
+            let after = all.split_off(end + 1);
+            let middle = all.split_off(start);
+            let before = all;
+            if !before.is_empty() {
+                replacement.push(new_list(src_ordered, before));
+            }
+            replacement.push(match target {
+                ListKind::Ordered => new_list(true, middle),
+                ListKind::Unordered => new_list(false, middle),
+                ListKind::Checklist => Paragraph::new_checklist().with_checklist_items(
+                    middle.into_iter().map(entry_to_checklist_item).collect(),
+                ),
+            });
+            if !after.is_empty() {
+                replacement.push(new_list(src_ordered, after));
+            }
+        }
+        ListKind::Checklist => {
+            let mut all = match node_at_mut(doc, list_path)? {
+                NodeMut::Para(Paragraph::Checklist { items }) => std::mem::take(items),
+                _ => return None,
+            };
+            let after = all.split_off(end + 1);
+            let middle = all.split_off(start);
+            let before = all;
+            if !before.is_empty() {
+                replacement.push(Paragraph::new_checklist().with_checklist_items(before));
+            }
+            // current is a checklist and differs from target, so target is ordered/unordered.
+            let want_ordered = target == ListKind::Ordered;
+            replacement.push(new_list(
+                want_ordered,
+                middle
+                    .into_iter()
+                    .map(|it| checklist_item_to_entry(it, want_ordered))
+                    .collect(),
+            ));
+            if !after.is_empty() {
+                replacement.push(Paragraph::new_checklist().with_checklist_items(after));
+            }
+        }
+    }
+
+    let base = container_splice(doc, list_path, replacement)?;
+    let middle_idx = base + usize::from(start > 0);
+    let first_item = match target {
+        ListKind::Checklist => PathSegment::ChecklistItem(0),
+        _ => PathSegment::ListEntry { entry: 0, para: 0 },
+    };
+    Some(container_child_path(list_path, middle_idx).child(first_item))
+}
+
 /// Take (leaving empty) the entries of the ordered/unordered list at `path`.
 fn take_list_entries(doc: &mut Document, path: &TreePath) -> Option<Vec<Vec<Paragraph>>> {
     match node_at_mut(doc, path)? {
@@ -477,12 +610,19 @@ fn container_child_path(node_path: &TreePath, idx: usize) -> TreePath {
         Some(PathSegment::QuoteChild(_)) => {
             parent_path(node_path).child(PathSegment::QuoteChild(idx))
         }
+        Some(PathSegment::ListEntry { entry, .. }) => {
+            parent_path(node_path).child(PathSegment::ListEntry {
+                entry: *entry,
+                para: idx,
+            })
+        }
         _ => TreePath::root(idx),
     }
 }
 
-/// Replace the single node at `node_path` with `replacement` in its container (top-level
-/// paragraphs or a quote's children). Returns the base index of the replacement.
+/// Replace the single node at `node_path` with `replacement` in its container: top-level
+/// paragraphs, a quote's children, or a list entry's paragraph vec (so a container nested
+/// inside a list item can be spliced too). Returns the base index of the replacement.
 fn container_splice(
     doc: &mut Document,
     node_path: &TreePath,
@@ -507,13 +647,408 @@ fn container_splice(
             }
             _ => None,
         },
+        PathSegment::ListEntry { entry, para } => {
+            match node_at_mut(doc, &parent_path(node_path))? {
+                NodeMut::Para(
+                    Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
+                ) => {
+                    let e = entries.get_mut(entry)?;
+                    if para >= e.len() {
+                        return None;
+                    }
+                    e.splice(para..=para, replacement);
+                    Some(para)
+                }
+                _ => None,
+            }
+        }
         _ => None,
     }
+}
+
+// ---- Container conversion / dissolve / merge --------------------------------------
+
+/// The four convertible container kinds (a superset of [`ListKind`] that adds quotes).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ContainerKind {
+    Quote,
+    Ordered,
+    Unordered,
+    Checklist,
+}
+
+fn container_kind_of(p: &Paragraph) -> Option<ContainerKind> {
+    match p {
+        Paragraph::Quote { .. } => Some(ContainerKind::Quote),
+        Paragraph::OrderedList { .. } => Some(ContainerKind::Ordered),
+        Paragraph::UnorderedList { .. } => Some(ContainerKind::Unordered),
+        Paragraph::Checklist { .. } => Some(ContainerKind::Checklist),
+        _ => None,
+    }
+}
+
+/// Convert the container node at `container_path` to `target` in place, remapping its
+/// children (quote children ↔ one list entry / checklist item each; list/checklist ↔ quote
+/// children). Preserves leaf order and count, so a caller can restore the cursor by flat
+/// leaf index. Returns `None` for a non-container node or a same-kind no-op. Works at any
+/// nesting depth (uses `node_at_mut`/`set_node`, which descend everywhere).
+pub fn convert_container(
+    doc: &mut Document,
+    container_path: &TreePath,
+    target: ContainerKind,
+) -> Option<()> {
+    let want_ordered = matches!(target, ContainerKind::Ordered);
+    // Normalize the container's contents into a list of items (each a paragraph vec).
+    let items: Vec<Vec<Paragraph>> = match node_at_mut(doc, container_path)? {
+        NodeMut::Para(node) => {
+            if container_kind_of(node) == Some(target) {
+                return None; // already the target kind
+            }
+            match node {
+                Paragraph::Quote { children } => std::mem::take(children)
+                    .into_iter()
+                    .map(|c| vec![c])
+                    .collect(),
+                Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries } => {
+                    std::mem::take(entries)
+                }
+                Paragraph::Checklist { items } => std::mem::take(items)
+                    .into_iter()
+                    .map(|it| checklist_item_to_entry(it, want_ordered))
+                    .collect(),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    let new_node = match target {
+        ContainerKind::Quote => {
+            Paragraph::new_quote().with_children(items.into_iter().flatten().collect())
+        }
+        ContainerKind::Ordered => new_list(true, items),
+        ContainerKind::Unordered => new_list(false, items),
+        ContainerKind::Checklist => Paragraph::new_checklist()
+            .with_checklist_items(items.into_iter().map(entry_to_checklist_item).collect()),
+    };
+    set_node(doc, container_path, new_node)?;
+    Some(())
+}
+
+/// Dissolve the container node at `container_path`, lifting its children up one level into
+/// its own parent (document top level or an enclosing quote — the containers
+/// `container_splice` understands). Quote children lift verbatim; list entries lift as
+/// paragraphs (first para as plain text, continuation paras and sublists alongside);
+/// checklist items lift as text + a nested checklist for their children. Returns the base
+/// index of the lifted run, or `None` for a non-container node or an unsupported parent
+/// (a list entry / checklist item). Preserves leaf order and count.
+pub fn dissolve_container(doc: &mut Document, container_path: &TreePath) -> Option<usize> {
+    let paras: Vec<Paragraph> = match node_at_mut(doc, container_path)? {
+        NodeMut::Para(Paragraph::Quote { children }) => std::mem::take(children),
+        NodeMut::Para(
+            Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
+        ) => {
+            let mut out = Vec::new();
+            for entry in std::mem::take(entries) {
+                let mut paras = entry.into_iter();
+                if let Some(first) = paras.next() {
+                    out.push(Paragraph::new_text().with_content(first.content().to_vec()));
+                }
+                out.extend(paras);
+            }
+            out
+        }
+        NodeMut::Para(Paragraph::Checklist { items }) => {
+            let mut out = Vec::new();
+            for item in std::mem::take(items) {
+                out.push(Paragraph::new_text().with_content(item.content));
+                if !item.children.is_empty() {
+                    out.push(Paragraph::new_checklist().with_checklist_items(item.children));
+                }
+            }
+            out
+        }
+        _ => return None,
+    };
+    container_splice(doc, container_path, paras)
+}
+
+/// Lift quote child `c` out of the quote at `quote_path`, splitting the quote into
+/// before/moved/after (the moved child keeps its type). Mirrors `exit_list_to_container`.
+fn exit_quote_to_container(
+    doc: &mut Document,
+    quote_path: &TreePath,
+    c: usize,
+) -> Option<TreePath> {
+    let children = match node_at_mut(doc, quote_path)? {
+        NodeMut::Para(Paragraph::Quote { children }) => {
+            if c >= children.len() {
+                return None;
+            }
+            std::mem::take(children)
+        }
+        _ => return None,
+    };
+    let mut before = children;
+    let after = before.split_off(c + 1);
+    let moved = before.pop()?; // the child at index c, preserved verbatim
+
+    let mut replacement: Vec<Paragraph> = Vec::new();
+    if !before.is_empty() {
+        replacement.push(Paragraph::new_quote().with_children(before));
+    }
+    let moved_start = replacement.len();
+    replacement.push(moved);
+    if !after.is_empty() {
+        replacement.push(Paragraph::new_quote().with_children(after));
+    }
+
+    let base = container_splice(doc, quote_path, replacement)?;
+    Some(container_child_path(quote_path, base + moved_start))
+}
+
+/// Add `paras` to `container` as new items — each paragraph becoming its own list entry /
+/// checklist item, or a quote child — at the start (`at_start`) or the end. Used to nest a
+/// selection of top-level paragraphs into an adjacent list/quote/checklist.
+pub fn add_paragraphs_to_container(
+    container: &mut Paragraph,
+    paras: Vec<Paragraph>,
+    at_start: bool,
+) {
+    match container {
+        Paragraph::Quote { children } => {
+            if at_start {
+                children.splice(0..0, paras);
+            } else {
+                children.extend(paras);
+            }
+        }
+        Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries } => {
+            let new_entries = paras.into_iter().map(|p| vec![p]);
+            if at_start {
+                entries.splice(0..0, new_entries);
+            } else {
+                entries.extend(new_entries);
+            }
+        }
+        Paragraph::Checklist { items } => {
+            let new_items = paras
+                .into_iter()
+                .map(|p| ChecklistItem::new(false).with_content(p.content().to_vec()));
+            if at_start {
+                items.splice(0..0, new_items);
+            } else {
+                items.extend(new_items);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The list kind of a paragraph node, or `None` if it is not a list/checklist.
+fn list_like_kind(p: &Paragraph) -> Option<ListKind> {
+    match p {
+        Paragraph::OrderedList { .. } => Some(ListKind::Ordered),
+        Paragraph::UnorderedList { .. } => Some(ListKind::Unordered),
+        Paragraph::Checklist { .. } => Some(ListKind::Checklist),
+        _ => None,
+    }
+}
+
+/// Append `src`'s entries/items into the same-kind list `dst`.
+fn append_list_items(dst: &mut Paragraph, src: Paragraph) {
+    match dst {
+        Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries } => {
+            if let Paragraph::OrderedList { entries: s } | Paragraph::UnorderedList { entries: s } =
+                src
+            {
+                entries.extend(s);
+            }
+        }
+        Paragraph::Checklist { items } => {
+            if let Paragraph::Checklist { items: s } = src {
+                items.extend(s);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The `Vec<Paragraph>` (document top level or a quote's children) holding the node at
+/// `child_path`, plus that node's index within it.
+fn sibling_vec_mut<'a>(
+    doc: &'a mut Document,
+    child_path: &TreePath,
+) -> Option<(&'a mut Vec<Paragraph>, usize)> {
+    match child_path.0.last()? {
+        PathSegment::Paragraph(i) => Some((&mut doc.paragraphs, *i)),
+        PathSegment::QuoteChild(c) => {
+            let qp = parent_path(child_path);
+            match node_at_mut(doc, &qp)? {
+                NodeMut::Para(Paragraph::Quote { children }) => Some((children, *c)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn with_last_index(path: &TreePath, idx: usize) -> TreePath {
+    let mut segs = path.0.clone();
+    if let Some(last) = segs.last_mut() {
+        *last = match &*last {
+            PathSegment::Paragraph(_) => PathSegment::Paragraph(idx),
+            PathSegment::QuoteChild(_) => PathSegment::QuoteChild(idx),
+            other => other.clone(),
+        };
+    }
+    TreePath(segs)
+}
+
+/// Merge the list at `list_path` (a top-level or quote-child list) with immediately
+/// adjacent siblings of the same kind, concatenating their entries/items into one list.
+/// Returns the merged list's new path. Preserves leaf order and count.
+pub fn merge_adjacent_lists(doc: &mut Document, list_path: &TreePath) -> TreePath {
+    let Some((vec, idx)) = sibling_vec_mut(doc, list_path) else {
+        return list_path.clone();
+    };
+    let Some(kind) = vec.get(idx).and_then(list_like_kind) else {
+        return list_path.clone();
+    };
+    let mut cur = idx;
+    // Merge following same-kind siblings into the current list.
+    while cur + 1 < vec.len() && list_like_kind(&vec[cur + 1]) == Some(kind) {
+        let next = vec.remove(cur + 1);
+        append_list_items(&mut vec[cur], next);
+    }
+    // Merge the current list into any preceding same-kind sibling.
+    while cur > 0 && list_like_kind(&vec[cur - 1]) == Some(kind) {
+        let moved = vec.remove(cur);
+        append_list_items(&mut vec[cur - 1], moved);
+        cur -= 1;
+    }
+    with_last_index(list_path, cur)
 }
 
 /// Indent the list/checklist item at `path` beneath its previous sibling (nesting it in a
 /// same-kind sublist). Returns the item's new path, or `None` for the first item / a
 /// non-list-item leaf.
+/// If the item at `path` is the first item of a top-level list/checklist preceded by another
+/// ordered/unordered list, move it into that preceding list — nesting under the list's last
+/// item (into a trailing sublist when present), exactly like a normal indent. This lets a
+/// bullet/number/checkbox that *starts* a list following another list be indented straight
+/// into it. A following ordered/unordered list adopts the preceding list's kind; a following
+/// checklist keeps its checkboxes, nesting as a checklist sublist.
+fn merge_first_item_into_preceding_list(doc: &mut Document, path: &TreePath) -> Option<TreePath> {
+    let i = match path.0.as_slice() {
+        [
+            PathSegment::Paragraph(i),
+            PathSegment::ListEntry { entry: 0, para: 0 },
+        ] => *i,
+        [PathSegment::Paragraph(i), PathSegment::ChecklistItem(0)] => *i,
+        _ => return None,
+    };
+    if i == 0
+        || !matches!(
+            doc.paragraphs.get(i - 1),
+            Some(Paragraph::OrderedList { .. } | Paragraph::UnorderedList { .. })
+        )
+    {
+        return None;
+    }
+    let prev = i - 1;
+
+    // A following checklist: nest its first item under the preceding list's last entry as a
+    // checklist sublist (preserving the checkboxes), reusing a trailing checklist if present.
+    if matches!(doc.paragraphs.get(i), Some(Paragraph::Checklist { .. })) {
+        let moved = match doc.paragraphs.get_mut(i)? {
+            Paragraph::Checklist { items } => {
+                if items.is_empty() {
+                    return None;
+                }
+                items.remove(0)
+            }
+            _ => return None,
+        };
+        if matches!(doc.paragraphs.get(i), Some(Paragraph::Checklist { items }) if items.is_empty())
+        {
+            doc.paragraphs.remove(i);
+        }
+        let last_entry = match doc.paragraphs.get_mut(prev)? {
+            Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries } => {
+                entries.len().checked_sub(1)?
+            }
+            _ => return None,
+        };
+        let (sub_para, item_idx) = match doc.paragraphs.get_mut(prev)? {
+            Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries } => {
+                let entry = entries.get_mut(last_entry)?;
+                if matches!(entry.last(), Some(Paragraph::Checklist { .. })) {
+                    let pi = entry.len() - 1;
+                    match entry.get_mut(pi)? {
+                        Paragraph::Checklist { items } => {
+                            items.push(moved);
+                            (pi, items.len() - 1)
+                        }
+                        _ => return None,
+                    }
+                } else {
+                    entry.push(Paragraph::new_checklist().with_checklist_items(vec![moved]));
+                    (entry.len() - 1, 0)
+                }
+            }
+            _ => return None,
+        };
+        return Some(
+            TreePath::root(prev)
+                .child(PathSegment::ListEntry {
+                    entry: last_entry,
+                    para: sub_para,
+                })
+                .child(PathSegment::ChecklistItem(item_idx)),
+        );
+    }
+
+    // A following ordered/unordered list: detach the first entry, pruning its list if it
+    // becomes empty.
+    let moved = match doc.paragraphs.get_mut(i)? {
+        Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries } => {
+            if entries.is_empty() {
+                return None;
+            }
+            entries.remove(0)
+        }
+        _ => return None,
+    };
+    let emptied = matches!(
+        doc.paragraphs.get(i),
+        Some(Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries })
+            if entries.is_empty()
+    );
+    if emptied {
+        doc.paragraphs.remove(i);
+    }
+    // Append to the preceding list (still at i - 1), then indent so it nests under that
+    // list's last item exactly like a normal indent (joining a trailing sublist if any).
+    let appended = match doc.paragraphs.get_mut(prev)? {
+        Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries } => {
+            entries.push(moved);
+            entries.len() - 1
+        }
+        _ => return None,
+    };
+    let appended_path = TreePath::root(prev).child(PathSegment::ListEntry {
+        entry: appended,
+        para: 0,
+    });
+    indent_list_item(doc, &appended_path).or(Some(appended_path))
+}
+
+/// Indent the list/checklist item at `path`, or — for the first item of a top-level list
+/// that follows another list — merge it into that preceding list.
+pub fn indent_list_item_or_merge(doc: &mut Document, path: &TreePath) -> Option<TreePath> {
+    indent_list_item(doc, path).or_else(|| merge_first_item_into_preceding_list(doc, path))
+}
+
 pub fn indent_list_item(doc: &mut Document, path: &TreePath) -> Option<TreePath> {
     let last = path.0.last()?.clone();
     let pp = parent_path(path);
@@ -543,8 +1078,11 @@ pub fn indent_list_item(doc: &mut Document, path: &TreePath) -> Option<TreePath>
                     Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
                 ) => {
                     let prev_entry = entries.get_mut(prev)?;
-                    let reuse =
-                        matches!(prev_entry.last(), Some(p) if list_ordered(p) == Some(ordered));
+                    // Merge into whatever ordered/unordered list already ends the previous
+                    // item, regardless of its kind — a bullet indented under an item that
+                    // ends in a numbered sublist joins that numbered sublist, and vice
+                    // versa — rather than starting a second sublist beside it.
+                    let reuse = matches!(prev_entry.last(), Some(p) if list_ordered(p).is_some());
                     if reuse {
                         let pi = prev_entry.len() - 1;
                         match prev_entry.get_mut(pi)? {
@@ -707,8 +1245,17 @@ pub fn outdent_list_item(doc: &mut Document, path: &TreePath) -> Option<TreePath
                 }
                 Some(ppp.child(PathSegment::ChecklistItem(parent_c + 1)))
             }
+            // A checklist nested inside an ordered/unordered list entry: lift the item back
+            // out to the outer list's level, keeping it a checklist (the inverse of nesting a
+            // checklist under a bullet item), rather than delisting it into a text paragraph.
+            Some(PathSegment::ListEntry { entry, para }) => {
+                let (oe, op) = (*entry, *para);
+                exit_nested_checklist_item(doc, &pp, oe, op, c)
+            }
             _ => exit_checklist_to_container(doc, &pp, c),
         },
+        // A quote child lifts out one level, splitting the quote around it.
+        PathSegment::QuoteChild(c) => exit_quote_to_container(doc, &pp, c),
         _ => None,
     }
 }
@@ -790,6 +1337,86 @@ fn exit_checklist_to_container(
     Some(container_child_path(list_path, base + moved_start))
 }
 
+/// Lift a checklist item out of a checklist that is nested inside an ordered/unordered list
+/// entry, up to the outer list's container — as a checklist positioned right after the outer
+/// list (joining an adjacent checklist there), keeping its checkbox. Following siblings in the
+/// sub-checklist become the lifted item's children. The inverse of nesting a checklist under a
+/// bullet item. `oe`/`op` locate the checklist within the outer list entry. Returns the lifted
+/// item's new path, or `None` if the outer list is itself nested in a list entry (unsupported).
+fn exit_nested_checklist_item(
+    doc: &mut Document,
+    checklist_path: &TreePath,
+    oe: usize,
+    op: usize,
+    c: usize,
+) -> Option<TreePath> {
+    // Detach item `c` with its following siblings, which become its children.
+    let moved = match node_at_mut(doc, checklist_path)? {
+        NodeMut::Para(Paragraph::Checklist { items }) => {
+            if c >= items.len() {
+                return None;
+            }
+            let following = items.split_off(c + 1);
+            let mut moved = items.remove(c);
+            moved.children.extend(following);
+            moved
+        }
+        _ => return None,
+    };
+    // If the sub-checklist is now empty, remove it from the outer list entry.
+    let emptied = matches!(
+        node_at_mut(doc, checklist_path),
+        Some(NodeMut::Para(Paragraph::Checklist { items })) if items.is_empty()
+    );
+    let outer_list_path = parent_path(checklist_path);
+    if emptied {
+        match node_at_mut(doc, &outer_list_path)? {
+            NodeMut::Para(
+                Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
+            ) => {
+                if let Some(entry) = entries.get_mut(oe)
+                    && op < entry.len()
+                {
+                    entry.remove(op);
+                }
+            }
+            _ => return None,
+        }
+    }
+    // Place the lifted item as a checklist just after the outer list, joining an adjacent
+    // checklist there if present (so a whole selected run collects into one checklist as the
+    // items are lifted bottom-up).
+    let (vec, idx) = sibling_vec_mut(doc, &outer_list_path)?;
+    let after = idx + 1;
+    if let Some(Paragraph::Checklist { items }) = vec.get_mut(after) {
+        items.insert(0, moved);
+    } else {
+        vec.insert(
+            after,
+            Paragraph::new_checklist().with_checklist_items(vec![moved]),
+        );
+    }
+    Some(with_last_index(&outer_list_path, after).child(PathSegment::ChecklistItem(0)))
+}
+
+/// Remove the list/checklist item at `item_path` from its *immediate* list, placing its
+/// paragraph(s) into that list's enclosing container — the document, a quote, or (for a
+/// nested item) the parent list item's paragraph vec — at the list's position, splitting
+/// the list around it. Unlike `outdent_list_item`, a nested item becomes a plain paragraph
+/// *inside its parent list item* rather than an item of the outer list. Returns the lifted
+/// paragraph's new path.
+pub fn delist_item(doc: &mut Document, item_path: &TreePath) -> Option<TreePath> {
+    let last = item_path.0.last()?.clone();
+    let list_path = parent_path(item_path);
+    match last {
+        PathSegment::ListEntry { entry, para } => {
+            exit_list_to_container(doc, &list_path, entry, para)
+        }
+        PathSegment::ChecklistItem(c) => exit_checklist_to_container(doc, &list_path, c),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -803,6 +1430,159 @@ mod tests {
         let mut buf = Vec::new();
         tdoc::markdown::write(&mut buf, doc).unwrap();
         String::from_utf8(buf).unwrap()
+    }
+
+    fn text(s: &str) -> Paragraph {
+        Paragraph::Text {
+            content: vec![Span::new_text(s)],
+        }
+    }
+
+    // ----- Container conversion / dissolve / merge -----
+
+    #[test]
+    fn convert_bullet_list_to_quote_flattens_entries() {
+        let mut doc = parse("- a\n- b");
+        assert!(convert_container(&mut doc, &TreePath::root(0), ContainerKind::Quote).is_some());
+        if let Paragraph::Quote { children } = &doc.paragraphs[0] {
+            assert_eq!(children.len(), 2);
+        } else {
+            panic!("expected a quote");
+        }
+    }
+
+    #[test]
+    fn convert_quote_to_bullet_makes_one_item_per_child() {
+        let mut doc = parse("x");
+        doc.paragraphs = vec![Paragraph::new_quote().with_children(vec![text("a"), text("b")])];
+        assert!(
+            convert_container(&mut doc, &TreePath::root(0), ContainerKind::Unordered).is_some()
+        );
+        if let Paragraph::UnorderedList { entries } = &doc.paragraphs[0] {
+            assert_eq!(entries.len(), 2);
+        } else {
+            panic!("expected a list");
+        }
+    }
+
+    #[test]
+    fn convert_container_same_kind_is_noop() {
+        let mut doc = parse("- a\n- b");
+        assert!(
+            convert_container(&mut doc, &TreePath::root(0), ContainerKind::Unordered).is_none()
+        );
+    }
+
+    #[test]
+    fn dissolve_quote_lifts_children_to_top_level() {
+        let mut doc = parse("> a");
+        assert_eq!(dissolve_container(&mut doc, &TreePath::root(0)), Some(0));
+        assert_eq!(doc.paragraphs.len(), 1);
+        assert!(matches!(doc.paragraphs[0], Paragraph::Text { .. }));
+    }
+
+    #[test]
+    fn dissolve_bullet_list_lifts_entries_as_paragraphs() {
+        let mut doc = parse("- a\n- b");
+        assert_eq!(dissolve_container(&mut doc, &TreePath::root(0)), Some(0));
+        assert_eq!(doc.paragraphs.len(), 2);
+        assert!(matches!(doc.paragraphs[0], Paragraph::Text { .. }));
+        assert!(matches!(doc.paragraphs[1], Paragraph::Text { .. }));
+    }
+
+    #[test]
+    fn dissolve_inside_list_entry_lifts_into_entry() {
+        // A quote nested inside a list entry dissolves into that entry's paragraphs.
+        let mut doc = parse("x");
+        doc.paragraphs = vec![Paragraph::new_unordered_list().with_entries(vec![vec![
+            text("lead"),
+            Paragraph::new_quote().with_children(vec![text("a")]),
+        ]])];
+        let quote_path = TreePath::root(0).child(PathSegment::ListEntry { entry: 0, para: 1 });
+        assert_eq!(dissolve_container(&mut doc, &quote_path), Some(1));
+        if let Paragraph::UnorderedList { entries } = &doc.paragraphs[0] {
+            assert_eq!(entries[0].len(), 2, "quote's child lifted into the entry");
+            assert!(matches!(entries[0][1], Paragraph::Text { .. }));
+        } else {
+            panic!("expected the list to remain");
+        }
+    }
+
+    #[test]
+    fn outdent_middle_quote_child_splits_quote() {
+        let mut doc = parse("x");
+        doc.paragraphs =
+            vec![Paragraph::new_quote().with_children(vec![text("a"), text("b"), text("c")])];
+        let path = TreePath::root(0).child(PathSegment::QuoteChild(1));
+        assert!(outdent_list_item(&mut doc, &path).is_some());
+        assert_eq!(doc.paragraphs.len(), 3);
+        assert!(matches!(doc.paragraphs[0], Paragraph::Quote { .. }));
+        assert!(matches!(doc.paragraphs[1], Paragraph::Text { .. }));
+        assert!(matches!(doc.paragraphs[2], Paragraph::Quote { .. }));
+    }
+
+    #[test]
+    fn outdent_only_quote_child_dissolves_quote() {
+        let mut doc = parse("> only");
+        let path = TreePath::root(0).child(PathSegment::QuoteChild(0));
+        assert!(outdent_list_item(&mut doc, &path).is_some());
+        assert_eq!(doc.paragraphs.len(), 1);
+        assert!(matches!(doc.paragraphs[0], Paragraph::Text { .. }));
+    }
+
+    #[test]
+    fn merge_adjacent_bullet_lists_into_one() {
+        let mut doc = parse("x");
+        doc.paragraphs = vec![
+            Paragraph::new_unordered_list().with_entries(vec![vec![text("a")]]),
+            Paragraph::new_unordered_list().with_entries(vec![vec![text("b")]]),
+        ];
+        assert_eq!(
+            merge_adjacent_lists(&mut doc, &TreePath::root(0)),
+            TreePath::root(0)
+        );
+        assert_eq!(doc.paragraphs.len(), 1);
+        if let Paragraph::UnorderedList { entries } = &doc.paragraphs[0] {
+            assert_eq!(entries.len(), 2);
+        } else {
+            panic!("expected one merged list");
+        }
+    }
+
+    #[test]
+    fn indent_merges_into_existing_sublist_of_other_kind() {
+        // Outer bullet list; item "a" already ends in a nested *numbered* sublist.
+        let mut doc = parse("x");
+        doc.paragraphs = vec![Paragraph::new_unordered_list().with_entries(vec![
+            vec![
+                text("a"),
+                Paragraph::new_ordered_list().with_entries(vec![vec![text("x")]]),
+            ],
+            vec![text("b")],
+        ])];
+        // Indent "b" (entry 1) under "a".
+        let path = TreePath::root(0).child(PathSegment::ListEntry { entry: 1, para: 0 });
+        assert!(indent_list_item(&mut doc, &path).is_some());
+        let Paragraph::UnorderedList { entries } = &doc.paragraphs[0] else {
+            panic!("expected the outer list");
+        };
+        assert_eq!(entries.len(), 1, "b left the outer list");
+        assert_eq!(entries[0].len(), 2, "a still has its text + one sublist");
+        let Paragraph::OrderedList { entries: sub } = &entries[0][1] else {
+            panic!("b should join a's existing numbered sublist, not start a new one");
+        };
+        assert_eq!(sub.len(), 2, "b joined the numbered sublist");
+    }
+
+    #[test]
+    fn merge_does_not_join_different_kinds() {
+        let mut doc = parse("x");
+        doc.paragraphs = vec![
+            Paragraph::new_unordered_list().with_entries(vec![vec![text("a")]]),
+            Paragraph::new_ordered_list().with_entries(vec![vec![text("b")]]),
+        ];
+        merge_adjacent_lists(&mut doc, &TreePath::root(0));
+        assert_eq!(doc.paragraphs.len(), 2);
     }
 
     #[test]

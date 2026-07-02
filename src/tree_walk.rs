@@ -391,6 +391,187 @@ pub fn leaf_block_type(doc: &Document, info: &LeafInfo) -> BlockType {
     }
 }
 
+// ---- Pseudo-leaf / breadcrumb -----------------------------------------------------
+//
+// The "pseudo-leaf" (effective block type) is the block type the ESC+number menu acts
+// on and the status bar shows as the rightmost crumb. A *paragraph-holding level* (a
+// quote node, a list item's paragraph vec, or a checklist item) that holds a single
+// text paragraph behaves like a leaf of the level's own type — so `Quote{[Text]}` is a
+// "Quote" block, and any single-text list item is a "Bullet/Numbered List" block. This
+// is per-item for lists, independent of how many items the list has.
+
+/// One enclosing container level along a path, outermost-first.
+struct Frame {
+    /// The container-kind block type for this level (`BlockQuote` / `ListItem{..}`).
+    block: BlockType,
+    /// Number of paragraphs held by *this specific level's item* (a quote's children, a
+    /// list entry's paragraphs; 1 for a checklist item). Drives the single-text collapse.
+    para_count: usize,
+}
+
+fn list_item_block(ordered: bool, checkbox: Option<bool>) -> BlockType {
+    BlockType::ListItem {
+        ordered,
+        number: None,
+        checkbox,
+        depth: 0,
+    }
+}
+
+/// Intrinsic block type of a leaf paragraph, ignoring any container it sits in.
+fn para_intrinsic_block_type(doc: &Document, path: &TreePath, p: &Paragraph) -> BlockType {
+    match p {
+        Paragraph::Text { .. } => BlockType::Paragraph,
+        Paragraph::Header1 { .. } => BlockType::Heading { level: 1 },
+        Paragraph::Header2 { .. } => BlockType::Heading { level: 2 },
+        Paragraph::Header3 { .. } => BlockType::Heading { level: 3 },
+        Paragraph::CodeBlock { .. } => BlockType::CodeBlock { language: None },
+        Paragraph::Table { .. } => BlockType::Table {
+            rows: table_rows_at(doc, path),
+        },
+        // Container nodes are never leaves; fall back to a plain paragraph.
+        _ => BlockType::Paragraph,
+    }
+}
+
+/// Walk `path`, collecting the enclosing container levels (outermost-first) plus the
+/// leaf's intrinsic block type and whether the leaf is a plain text paragraph. Returns
+/// `None` for an invalid path.
+fn analyze_path(doc: &Document, path: &TreePath) -> Option<(Vec<Frame>, BlockType, bool)> {
+    let mut segs = path.0.iter();
+    let PathSegment::Paragraph(i) = segs.next()? else {
+        return None;
+    };
+    enum Cur<'a> {
+        Para(&'a Paragraph),
+        Check(&'a ChecklistItem),
+    }
+    let mut cur = Cur::Para(doc.paragraphs.get(*i)?);
+    let mut frames: Vec<Frame> = Vec::new();
+    for seg in segs {
+        cur = match (cur, seg) {
+            (Cur::Para(Paragraph::Quote { children }), PathSegment::QuoteChild(c)) => {
+                frames.push(Frame {
+                    block: BlockType::BlockQuote,
+                    para_count: children.len(),
+                });
+                Cur::Para(children.get(*c)?)
+            }
+            (
+                Cur::Para(Paragraph::OrderedList { entries }),
+                PathSegment::ListEntry { entry, para },
+            ) => {
+                let e = entries.get(*entry)?;
+                frames.push(Frame {
+                    block: list_item_block(true, None),
+                    para_count: e.len(),
+                });
+                Cur::Para(e.get(*para)?)
+            }
+            (
+                Cur::Para(Paragraph::UnorderedList { entries }),
+                PathSegment::ListEntry { entry, para },
+            ) => {
+                let e = entries.get(*entry)?;
+                frames.push(Frame {
+                    block: list_item_block(false, None),
+                    para_count: e.len(),
+                });
+                Cur::Para(e.get(*para)?)
+            }
+            (Cur::Para(Paragraph::Checklist { items }), PathSegment::ChecklistItem(c)) => {
+                let it = items.get(*c)?;
+                frames.push(Frame {
+                    block: list_item_block(false, Some(it.checked)),
+                    para_count: 1,
+                });
+                Cur::Check(it)
+            }
+            (Cur::Check(item), PathSegment::ChecklistItem(c)) => {
+                let it = item.children.get(*c)?;
+                frames.push(Frame {
+                    block: list_item_block(false, Some(it.checked)),
+                    para_count: 1,
+                });
+                Cur::Check(it)
+            }
+            _ => return None,
+        };
+    }
+    let (leaf, leaf_is_text) = match cur {
+        Cur::Para(p) => (
+            para_intrinsic_block_type(doc, path, p),
+            matches!(p, Paragraph::Text { .. }),
+        ),
+        // A checklist item's content is inline text; it always collapses, so this leaf
+        // block type is only a placeholder that the collapse path never uses.
+        Cur::Check(_) => (list_item_block(false, Some(false)), true),
+    };
+    Some((frames, leaf, leaf_is_text))
+}
+
+/// Whether the cursor's innermost paragraph-holding level is a single-text collapse
+/// (behaves like a leaf of the container's type).
+fn is_collapse(frames: &[Frame], leaf_is_text: bool) -> bool {
+    frames
+        .last()
+        .is_some_and(|f| f.para_count == 1 && leaf_is_text)
+}
+
+/// The effective (pseudo-leaf) block type at `path`: the type the ESC+number menu will
+/// change. A single-text container level collapses to its own kind; otherwise the leaf's
+/// own type; a top-level leaf is unchanged.
+pub fn effective_block_type(doc: &Document, path: &TreePath) -> BlockType {
+    let Some((frames, leaf, leaf_is_text)) = analyze_path(doc, path) else {
+        return BlockType::Paragraph;
+    };
+    if is_collapse(&frames, leaf_is_text) {
+        frames.last().unwrap().block.clone()
+    } else {
+        leaf
+    }
+}
+
+/// The ancestor container chain for the status-bar breadcrumb, outermost first, with the
+/// pseudo-leaf last: a collapsed single-text level yields its own crumb only; a genuine
+/// leaf yields the container crumbs followed by the leaf's own type.
+pub fn block_breadcrumb(doc: &Document, path: &TreePath) -> Vec<BlockType> {
+    let Some((frames, leaf, leaf_is_text)) = analyze_path(doc, path) else {
+        return vec![BlockType::Paragraph];
+    };
+    if frames.is_empty() {
+        return vec![leaf];
+    }
+    let collapse = is_collapse(&frames, leaf_is_text);
+    let mut crumbs: Vec<BlockType> = frames.into_iter().map(|f| f.block).collect();
+    if !collapse {
+        crumbs.push(leaf);
+    }
+    crumbs
+}
+
+/// The container-kind block type of the node at `path` (which must point at a
+/// quote/list/checklist node), for labelling the "select parent" menu. `None` if the node
+/// is not a container.
+pub fn container_block_at(doc: &Document, path: &TreePath) -> Option<BlockType> {
+    match resolve(doc, path)? {
+        LeafRef::Para(Paragraph::Quote { .. }) => Some(BlockType::BlockQuote),
+        LeafRef::Para(Paragraph::OrderedList { .. }) => Some(list_item_block(true, None)),
+        LeafRef::Para(Paragraph::UnorderedList { .. }) => Some(list_item_block(false, None)),
+        LeafRef::Para(Paragraph::Checklist { .. }) => Some(list_item_block(false, Some(false))),
+        _ => None,
+    }
+}
+
+/// Whether the cursor's innermost level is a collapsed single-text container (used to
+/// route pseudo-leaf block-type changes onto the container).
+pub fn cursor_in_collapsed_container(doc: &Document, path: &TreePath) -> bool {
+    let Some((frames, _, leaf_is_text)) = analyze_path(doc, path) else {
+        return false;
+    };
+    !frames.is_empty() && is_collapse(&frames, leaf_is_text)
+}
+
 fn table_rows_at(doc: &Document, path: &TreePath) -> Vec<TableRow> {
     let Some(LeafRef::Para(Paragraph::Table { rows })) = resolve(doc, path) else {
         return Vec::new();
@@ -568,6 +749,67 @@ mod tests {
 
     fn parse(md: &str) -> Document {
         tdoc::markdown::parse(&mut Cursor::new(md.as_bytes())).expect("parse")
+    }
+
+    // ----- Pseudo-leaf / breadcrumb -----
+
+    #[test]
+    fn effective_type_single_text_quote_collapses() {
+        let doc = parse("> quoted");
+        let path = TreePath::root(0).child(PathSegment::QuoteChild(0));
+        assert_eq!(effective_block_type(&doc, &path), BlockType::BlockQuote);
+        assert!(cursor_in_collapsed_container(&doc, &path));
+    }
+
+    #[test]
+    fn effective_type_single_text_bullet_collapses_per_item() {
+        // A single-text item in a multi-item list still behaves like a leaf.
+        let doc = parse("- a\n- b\n- c");
+        let path = TreePath::root(0).child(PathSegment::ListEntry { entry: 1, para: 0 });
+        assert!(matches!(
+            effective_block_type(&doc, &path),
+            BlockType::ListItem {
+                ordered: false,
+                checkbox: None,
+                ..
+            }
+        ));
+        assert!(cursor_in_collapsed_container(&doc, &path));
+    }
+
+    #[test]
+    fn effective_type_multi_paragraph_quote_reports_leaf() {
+        let mut doc = parse("x");
+        doc.paragraphs = vec![Paragraph::new_quote().with_children(vec![
+            Paragraph::Text {
+                content: vec![Span::new_text("a")],
+            },
+            Paragraph::Header2 {
+                content: vec![Span::new_text("b")],
+            },
+        ])];
+        let path = TreePath::root(0).child(PathSegment::QuoteChild(1));
+        assert_eq!(
+            effective_block_type(&doc, &path),
+            BlockType::Heading { level: 2 }
+        );
+        assert!(!cursor_in_collapsed_container(&doc, &path));
+        assert_eq!(
+            block_breadcrumb(&doc, &path),
+            vec![BlockType::BlockQuote, BlockType::Heading { level: 2 }]
+        );
+    }
+
+    #[test]
+    fn breadcrumb_top_level_and_collapsed_quote() {
+        let doc = parse("plain");
+        assert_eq!(
+            block_breadcrumb(&doc, &TreePath::root(0)),
+            vec![BlockType::Paragraph]
+        );
+        let doc = parse("> quoted");
+        let path = TreePath::root(0).child(PathSegment::QuoteChild(0));
+        assert_eq!(block_breadcrumb(&doc, &path), vec![BlockType::BlockQuote]);
     }
 
     #[test]

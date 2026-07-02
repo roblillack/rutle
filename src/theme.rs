@@ -58,6 +58,12 @@ pub struct Theme {
     pub quote_indent: i32,
     pub quote_bar_offset: i32,
 
+    /// Minimum horizontal indent per list nesting level. The GUI uses one font
+    /// em per level (so `0` here keeps the original pixel metrics via a `max`);
+    /// a cell backend, whose fonts report `font_size == 0`, sets a small nonzero
+    /// value so nested list items still indent.
+    pub list_indent: i32,
+
     /// Padding inside table cells (horizontal and vertical). Pixel values for
     /// the GUI; a cell backend uses tight values so rows/columns aren't huge.
     pub table_cell_padding_h: i32,
@@ -189,6 +195,7 @@ impl Default for Theme {
             code_block_padding: 5,
             quote_indent: 20,
             quote_bar_offset: 12,
+            list_indent: 0,
             table_cell_padding_h: 6,
             table_cell_padding_v: 3,
             text_decoration_lines: true,

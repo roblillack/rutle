@@ -727,6 +727,33 @@ impl Editor {
         Ok(())
     }
 
+    /// Insert a continuation paragraph. Like [`Self::insert_newline`], but inside a list
+    /// item it adds another paragraph to the *same* item rather than starting a new item —
+    /// so a list entry (or, equivalently, a quote) can hold multiple paragraphs.
+    pub fn insert_continuation(&mut self) -> EditResult {
+        if self.leaf_count() == 0 {
+            return self.insert_newline();
+        }
+        if self.selection.is_some() {
+            self.delete_selection()?;
+        }
+        let path = self.cursor.path.clone();
+        if self.is_table_leaf(&path) {
+            return Ok(());
+        }
+        // On an empty item there is nothing to continue; fall back to newline (which
+        // outdents the empty item, matching Enter).
+        if self.cursor_is_list_item() && self.leaf_text_len(&path) == 0 {
+            return self.insert_newline();
+        }
+        let offset = self.cursor.offset;
+        if let Some(new_path) = tree_edit::split_leaf_continuation(&mut self.tdoc, &path, offset) {
+            self.cursor = DocumentPosition::at(new_path, 0);
+        }
+        self.normalize_cursor();
+        Ok(())
+    }
+
     // ----- Deletion ------------------------------------------------------------------
 
     pub fn delete_backward(&mut self) -> EditResult {
@@ -1552,11 +1579,12 @@ impl Editor {
     }
 
     pub fn toggle_quote(&mut self) -> EditResult {
-        // In a quote already → unwrap; otherwise wrap the cursor's top-level block.
+        // In a quote already → unwrap; otherwise convert the cursor's top-level block(s) to
+        // a quote (flattening to plain text, mirroring how lists convert).
         if matches!(self.cursor.path.last(), Some(PathSegment::QuoteChild(_))) {
             self.unwrap_quote()
         } else {
-            self.wrap_top_level_in_quote()
+            self.convert_selection_to_quote()
         }
     }
 
@@ -1568,13 +1596,32 @@ impl Editor {
         }
     }
 
-    /// Set the paragraph style at the cursor/selection. Heading/CodeBlock/Paragraph are
-    /// in-place leaf-variant changes; BlockQuote/ListItem route to the structural toggles.
+    /// Set the block type of the cursor's *pseudo-leaf* (the effective block per the block
+    /// model). A single-text-child container behaves like a leaf of its own type, so a
+    /// block-type change there acts on the container; otherwise the change acts on the
+    /// genuine leaf. See `tree_walk::effective_block_type`.
     pub fn set_block_type(&mut self, block_type: BlockType) -> EditResult {
+        // A selection spanning several items of one list, converted to a *different* list
+        // kind, carves those items out into their own list (splitting the original around
+        // them) rather than converting the whole list.
+        if let BlockType::ListItem {
+            ordered, checkbox, ..
+        } = block_type
+            && let Some((list_path, s, e)) = self.selection_list_item_range()
+        {
+            let target = tree_edit::ListKind::from_flags(ordered, checkbox.is_some());
+            if self.convert_list_item_range_at(&list_path, s, e, target) {
+                return Ok(());
+            }
+        }
+        let path = self.cursor.path.clone();
+        if tree_walk::cursor_in_collapsed_container(&self.tdoc, &path) {
+            return self.set_collapsed_container_block_type(&path, block_type);
+        }
         match block_type {
             BlockType::Paragraph => {
                 // "Paragraph" also exits a block quote (mirrors the flat block-type model).
-                if matches!(self.cursor.path.last(), Some(PathSegment::QuoteChild(_))) {
+                if matches!(path.last(), Some(PathSegment::QuoteChild(_))) {
                     self.unwrap_quote()
                 } else {
                     self.apply_variant_over_selection(|s| Paragraph::new_text().with_content(s))
@@ -1587,12 +1634,181 @@ impl Editor {
             BlockType::CodeBlock { .. } => {
                 self.apply_variant_over_selection(|s| Paragraph::new_code_block().with_content(s))
             }
-            BlockType::BlockQuote => self.wrap_top_level_in_quote(),
+            BlockType::BlockQuote => self.toggle_quote(),
             BlockType::ListItem {
                 ordered, checkbox, ..
-            } => self.toggle_list_kind(ordered, checkbox.is_some()),
+            } => {
+                let r = self.toggle_list_kind(ordered, checkbox.is_some());
+                self.merge_lists_at_cursor();
+                r
+            }
             BlockType::Table { .. } => Ok(()),
         }
+    }
+
+    /// Apply a block-type change when the cursor sits in a collapsed single-text container
+    /// (the container behaves like a leaf). Leaf targets leave the container as a top-level
+    /// leaf; container targets convert the container's kind.
+    fn set_collapsed_container_block_type(
+        &mut self,
+        path: &TreePath,
+        block_type: BlockType,
+    ) -> EditResult {
+        // The container node is the parent of the cursor's leaf.
+        let container_path = TreePath(path.segments()[..path.len().saturating_sub(1)].to_vec());
+        let is_quote = matches!(path.last(), Some(PathSegment::QuoteChild(_)));
+        match block_type {
+            // Leaf targets: the collapsed unit leaves its container as a plain paragraph.
+            BlockType::Paragraph | BlockType::Heading { .. } | BlockType::CodeBlock { .. } => {
+                if is_quote {
+                    if !self.dissolve_container_at(&container_path) {
+                        return Ok(());
+                    }
+                } else if !self.delist_cursor_item() {
+                    // Delist the item from its immediate list into that list's container
+                    // (the document, a quote, or a parent list item's paragraphs), so a
+                    // nested item becomes a continuation paragraph of its parent item.
+                    return Ok(());
+                }
+                match block_type {
+                    BlockType::Heading { level } => {
+                        let level = level.clamp(1, 3);
+                        self.apply_variant_over_selection(move |s| make_header(level, s))
+                    }
+                    BlockType::CodeBlock { .. } => self.apply_variant_over_selection(|s| {
+                        Paragraph::new_code_block().with_content(s)
+                    }),
+                    _ => Ok(()),
+                }
+            }
+            // Quote target. A quote is a single unit, so a collapsed quote is already
+            // done. A list/checklist *item*, however, is one of several siblings — convert
+            // only that item: lift it out of the list (splitting the list around it) and
+            // wrap it in a quote, leaving its siblings as list items.
+            BlockType::BlockQuote => {
+                if is_quote {
+                    Ok(())
+                } else if self.delist_cursor_item() {
+                    // The delisted paragraph becomes a quote in the item's slot (its
+                    // siblings stay in the list; a nested item stays inside its parent).
+                    self.wrap_cursor_leaf_in_quote()
+                } else {
+                    Ok(())
+                }
+            }
+            // List-kind target: quotes and lists alike convert as a whole (a quote's single
+            // child becomes one list item; a list changes its kind across all items).
+            BlockType::ListItem {
+                ordered, checkbox, ..
+            } => {
+                let kind = if checkbox.is_some() {
+                    tree_edit::ContainerKind::Checklist
+                } else if ordered {
+                    tree_edit::ContainerKind::Ordered
+                } else {
+                    tree_edit::ContainerKind::Unordered
+                };
+                self.convert_container_at(&container_path, kind);
+                Ok(())
+            }
+            BlockType::Table { .. } => Ok(()),
+        }
+    }
+
+    /// If the selection spans two or more items of the *same* immediate list (a list
+    /// `Paragraph` node, not a checklist nested inside a checklist item), the list's path and
+    /// the covered item index range `[start, end]`. Used to carve a run of items out into
+    /// their own list on a list-kind change.
+    fn selection_list_item_range(&self) -> Option<(TreePath, usize, usize)> {
+        let (a, b) = self.selection.clone()?;
+        let (start, end) = if a <= b { (a, b) } else { (b, a) };
+        let item_of = |p: &TreePath| -> Option<(TreePath, usize)> {
+            let list_path = TreePath(p.segments()[..p.len().saturating_sub(1)].to_vec());
+            match p.last()? {
+                PathSegment::ListEntry { entry, .. } => Some((list_path, *entry)),
+                PathSegment::ChecklistItem(c) => Some((list_path, *c)),
+                _ => None,
+            }
+        };
+        let (lp_a, i_a) = item_of(&start.path)?;
+        let (lp_b, i_b) = item_of(&end.path)?;
+        if lp_a != lp_b || i_a == i_b {
+            return None;
+        }
+        Some((lp_a, i_a.min(i_b), i_a.max(i_b)))
+    }
+
+    /// Carve items `[s, e]` out of the list at `list_path` into a new list of `target`,
+    /// splitting the original around them. Preserves the cursor/selection by flat leaf index
+    /// (the split keeps document order) and merges with an adjacent same-kind list. Returns
+    /// whether the tree changed.
+    fn convert_list_item_range_at(
+        &mut self,
+        list_path: &TreePath,
+        s: usize,
+        e: usize,
+        target: tree_edit::ListKind,
+    ) -> bool {
+        let sel_idx = self.selection.clone().map(|(a, b)| {
+            (
+                self.leaf_index(&a.path),
+                a.offset,
+                self.leaf_index(&b.path),
+                b.offset,
+            )
+        });
+        let cur_idx = self.leaf_index(&self.cursor.path);
+        let cur_off = self.cursor.offset;
+        if tree_edit::convert_list_item_range(&mut self.tdoc, list_path, s, e, target).is_none() {
+            return false;
+        }
+        self.restore_cursor_by_leaf_index(cur_idx, cur_off);
+        self.merge_lists_at_cursor();
+        if let Some((sa, soff, sb, eoff)) = sel_idx {
+            let leaves = self.leaf_paths();
+            if let (Some(a), Some(b)) = (
+                sa.and_then(|i| leaves.get(i)).cloned(),
+                sb.and_then(|i| leaves.get(i)).cloned(),
+            ) {
+                self.selection =
+                    Some((DocumentPosition::at(a, soff), DocumentPosition::at(b, eoff)));
+            }
+        }
+        self.trigger_paragraph_change();
+        true
+    }
+
+    /// Delist the cursor's list/checklist item: remove it from its immediate list and drop
+    /// its paragraph into the list's enclosing container (document, quote, or a parent list
+    /// item's paragraphs), splitting the list around it. The cursor follows the paragraph.
+    /// Returns whether the tree changed.
+    fn delist_cursor_item(&mut self) -> bool {
+        let path = self.cursor.path.clone();
+        let offset = self.cursor.offset;
+        if let Some(new_path) = tree_edit::delist_item(&mut self.tdoc, &path) {
+            self.cursor = DocumentPosition::at(new_path, offset);
+            self.normalize_cursor();
+            self.trigger_paragraph_change();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Replace the cursor's leaf paragraph with a quote wrapping its text, in place, and
+    /// move the cursor into the quote's child.
+    fn wrap_cursor_leaf_in_quote(&mut self) -> EditResult {
+        let path = self.cursor.path.clone();
+        let offset = self.cursor.offset;
+        let changed = tree_edit::replace_leaf_variant(&mut self.tdoc, &path, |s| {
+            Paragraph::new_quote().with_children(vec![Paragraph::new_text().with_content(s)])
+        });
+        if changed {
+            self.cursor = DocumentPosition::at(path.child(PathSegment::QuoteChild(0)), offset);
+            self.normalize_cursor();
+            self.trigger_paragraph_change();
+        }
+        Ok(())
     }
 
     // ----- Structural helpers (top-level focus) --------------------------------------
@@ -1636,20 +1852,360 @@ impl Editor {
         }
     }
 
-    fn wrap_top_level_in_quote(&mut self) -> EditResult {
-        let Some(i) = self.cursor_top_index() else {
+    /// Convert the selected top-level paragraph(s) into one quote, flattening each to plain
+    /// text (dropping heading/code type) — mirrors how lists convert. Top-level only.
+    fn convert_selection_to_quote(&mut self) -> EditResult {
+        let (start, end) = self.selection_or_cursor_range();
+        let (Some(s), Some(e)) = (top_index(&start.path), top_index(&end.path)) else {
             return Ok(());
         };
+        if s > e || e >= self.tdoc.paragraphs.len() {
+            return Ok(());
+        }
+        let cursor_rel = self
+            .cursor_top_index()
+            .map(|ci| ci.saturating_sub(s))
+            .unwrap_or(0);
         let offset = self.cursor.offset;
-        let para = self.tdoc.paragraphs.remove(i);
+        let drained: Vec<Paragraph> = self.tdoc.paragraphs.drain(s..=e).collect();
+        let children: Vec<Paragraph> = drained
+            .into_iter()
+            .map(|p| Paragraph::new_text().with_content(p.content().to_vec()))
+            .collect();
         self.tdoc
             .paragraphs
-            .insert(i, Paragraph::new_quote().with_children(vec![para]));
-        self.cursor =
-            DocumentPosition::at(TreePath::root(i).child(PathSegment::QuoteChild(0)), offset);
+            .insert(s, Paragraph::new_quote().with_children(children));
+        self.cursor = DocumentPosition::at(
+            TreePath::root(s).child(PathSegment::QuoteChild(cursor_rel)),
+            offset,
+        );
         self.normalize_cursor();
         self.trigger_paragraph_change();
         Ok(())
+    }
+
+    /// Wrap the selected top-level range in a single new container of `kind` as one unit,
+    /// preserving inner paragraph types (the "wrap inside…" action). A multi-paragraph
+    /// selection becomes one quote / one list item / one checklist item. Top-level only.
+    pub fn wrap_selection(&mut self, kind: tree_edit::ContainerKind) -> EditResult {
+        let (start, end) = self.selection_or_cursor_range();
+        let (Some(s), Some(e)) = (top_index(&start.path), top_index(&end.path)) else {
+            return Ok(());
+        };
+        if s > e || e >= self.tdoc.paragraphs.len() {
+            return Ok(());
+        }
+        let cursor_rel = self
+            .cursor_top_index()
+            .map(|ci| ci.saturating_sub(s))
+            .unwrap_or(0);
+        let offset = self.cursor.offset;
+        let drained: Vec<Paragraph> = self.tdoc.paragraphs.drain(s..=e).collect();
+        let (node, leaf_seg) = match kind {
+            tree_edit::ContainerKind::Quote => (
+                Paragraph::new_quote().with_children(drained),
+                PathSegment::QuoteChild(cursor_rel),
+            ),
+            tree_edit::ContainerKind::Ordered => (
+                Paragraph::new_ordered_list().with_entries(vec![drained]),
+                PathSegment::ListEntry {
+                    entry: 0,
+                    para: cursor_rel,
+                },
+            ),
+            tree_edit::ContainerKind::Unordered => (
+                Paragraph::new_unordered_list().with_entries(vec![drained]),
+                PathSegment::ListEntry {
+                    entry: 0,
+                    para: cursor_rel,
+                },
+            ),
+            tree_edit::ContainerKind::Checklist => {
+                // Checklist items are span-only: concatenate the paragraphs' spans.
+                let mut content: Vec<Span> = Vec::new();
+                for p in &drained {
+                    content.extend(p.content().iter().cloned());
+                }
+                (
+                    Paragraph::new_checklist().with_checklist_items(vec![
+                        ChecklistItem::new(false).with_content(content),
+                    ]),
+                    PathSegment::ChecklistItem(0),
+                )
+            }
+        };
+        self.tdoc.paragraphs.insert(s, node);
+        self.cursor = DocumentPosition::at(TreePath::root(s).child(leaf_seg), offset);
+        self.normalize_cursor();
+        self.trigger_paragraph_change();
+        Ok(())
+    }
+
+    /// Convert the container node at `container_path` to `target`, preserving the cursor by
+    /// flat leaf index (conversion keeps text order). Merges adjacent same-kind lists when
+    /// the result is a list. Returns whether the tree changed.
+    fn convert_container_at(
+        &mut self,
+        container_path: &TreePath,
+        target: tree_edit::ContainerKind,
+    ) -> bool {
+        let idx = self.leaf_index(&self.cursor.path);
+        let offset = self.cursor.offset;
+        let changed =
+            tree_edit::convert_container(&mut self.tdoc, container_path, target).is_some();
+        if changed {
+            self.restore_cursor_by_leaf_index(idx, offset);
+            self.merge_lists_at_cursor();
+            self.trigger_paragraph_change();
+        }
+        changed
+    }
+
+    /// Dissolve the container node at `container_path`, lifting its children up one level.
+    /// Returns whether the tree changed.
+    fn dissolve_container_at(&mut self, container_path: &TreePath) -> bool {
+        let idx = self.leaf_index(&self.cursor.path);
+        let offset = self.cursor.offset;
+        let changed = tree_edit::dissolve_container(&mut self.tdoc, container_path).is_some();
+        if changed {
+            self.restore_cursor_by_leaf_index(idx, offset);
+            self.trigger_paragraph_change();
+        }
+        changed
+    }
+
+    /// Re-anchor the cursor onto the leaf at flat index `idx` (stable across structural ops
+    /// that keep text order), preserving `offset`.
+    fn restore_cursor_by_leaf_index(&mut self, idx: Option<usize>, offset: usize) {
+        if let Some(idx) = idx {
+            let leaves = self.leaf_paths();
+            if let Some(p) = leaves.get(idx) {
+                self.cursor = DocumentPosition::at(p.clone(), offset);
+            }
+        }
+        self.normalize_cursor();
+    }
+
+    /// If the cursor sits in a list/checklist item, merge its list with adjacent same-kind
+    /// sibling lists (a no-op otherwise). Preserves the cursor by flat leaf index.
+    fn merge_lists_at_cursor(&mut self) {
+        let path = self.cursor.path.clone();
+        if !matches!(
+            path.last(),
+            Some(PathSegment::ListEntry { .. } | PathSegment::ChecklistItem(_))
+        ) {
+            return;
+        }
+        let list_path = TreePath(path.segments()[..path.len().saturating_sub(1)].to_vec());
+        let idx = self.leaf_index(&self.cursor.path);
+        let offset = self.cursor.offset;
+        tree_edit::merge_adjacent_lists(&mut self.tdoc, &list_path);
+        self.restore_cursor_by_leaf_index(idx, offset);
+    }
+
+    // ----- Block-model queries / container ops (menu-facing) -------------------------
+
+    /// The effective (pseudo-leaf) block type at the cursor — the type `set_block_type`
+    /// acts on and the status bar shows as the rightmost crumb.
+    pub fn cursor_effective_block_type(&self) -> BlockType {
+        tree_walk::effective_block_type(&self.tdoc, &self.cursor.path)
+    }
+
+    /// The block-type breadcrumb from outermost container to the pseudo-leaf.
+    pub fn cursor_block_breadcrumb(&self) -> Vec<BlockType> {
+        tree_walk::block_breadcrumb(&self.tdoc, &self.cursor.path)
+    }
+
+    /// Whether the cursor's leaf can be lifted out of its container one level (`[`).
+    pub fn cursor_can_unnest(&self) -> bool {
+        matches!(
+            self.cursor.path.last(),
+            Some(
+                PathSegment::ListEntry { .. }
+                    | PathSegment::ChecklistItem(_)
+                    | PathSegment::QuoteChild(_)
+            )
+        )
+    }
+
+    /// Whether `]` / Tab can indent here: a list/checklist item (nest deeper), or a
+    /// top-level paragraph or selection adjacent to a container (nest into it).
+    pub fn cursor_can_indent(&self) -> bool {
+        self.cursor_is_list_item() || self.can_nest_selection_into_adjacent()
+    }
+
+    /// The top-level paragraph range `[s, e]` covered by the selection (or the cursor), or
+    /// `None` if either endpoint is not a top-level paragraph.
+    fn selection_top_range(&self) -> Option<(usize, usize)> {
+        let (start, end) = self.selection_or_cursor_range();
+        Some((top_index(&start.path)?, top_index(&end.path)?))
+    }
+
+    /// Whether the selected top-level paragraph(s) sit next to a container they can nest
+    /// into — a container immediately before (append) or a container immediately after
+    /// (prepend). Preceding takes priority.
+    pub fn can_nest_selection_into_adjacent(&self) -> bool {
+        let Some((s, e)) = self.selection_top_range() else {
+            return false;
+        };
+        let len = self.tdoc.paragraphs.len();
+        if e >= len {
+            return false;
+        }
+        let is_container = |p: &Paragraph| {
+            matches!(
+                p,
+                Paragraph::Quote { .. }
+                    | Paragraph::OrderedList { .. }
+                    | Paragraph::UnorderedList { .. }
+                    | Paragraph::Checklist { .. }
+            )
+        };
+        (s > 0 && self.tdoc.paragraphs.get(s - 1).is_some_and(is_container))
+            || (e + 1 < len && self.tdoc.paragraphs.get(e + 1).is_some_and(is_container))
+    }
+
+    /// Indent (`]` / Tab): nest a list/checklist item one level deeper, or nest the selected
+    /// top-level paragraph(s) into an adjacent container.
+    pub fn indent(&mut self) -> EditResult {
+        if self.cursor_is_list_item() {
+            self.indent_list_item()
+        } else if self.can_nest_selection_into_adjacent() {
+            self.nest_selection_into_adjacent()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Move the selected top-level paragraph(s) into an adjacent container: appended to a
+    /// container immediately before them (as new items / children at the end), or, failing
+    /// that, prepended to a container immediately after them (at the start). Each paragraph
+    /// becomes its own list/checklist item (or quote child). The inverse of `[`. Selection
+    /// and cursor are preserved (by flat leaf index, which the move keeps stable).
+    fn nest_selection_into_adjacent(&mut self) -> EditResult {
+        let Some((s, e)) = self.selection_top_range() else {
+            return Ok(());
+        };
+        let len = self.tdoc.paragraphs.len();
+        if e >= len {
+            return Ok(());
+        }
+        let is_container = |p: &Paragraph| {
+            matches!(
+                p,
+                Paragraph::Quote { .. }
+                    | Paragraph::OrderedList { .. }
+                    | Paragraph::UnorderedList { .. }
+                    | Paragraph::Checklist { .. }
+            )
+        };
+        let preceding = s > 0 && self.tdoc.paragraphs.get(s - 1).is_some_and(is_container);
+        let following = e + 1 < len && self.tdoc.paragraphs.get(e + 1).is_some_and(is_container);
+        if !preceding && !following {
+            return Ok(());
+        }
+
+        // Capture positions to restore by flat leaf index (the move preserves document order).
+        let sel_idx = self.selection.clone().map(|(a, b)| {
+            (
+                self.leaf_index(&a.path),
+                a.offset,
+                self.leaf_index(&b.path),
+                b.offset,
+            )
+        });
+        let cur_idx = self.leaf_index(&self.cursor.path);
+        let cur_off = self.cursor.offset;
+
+        let drained: Vec<Paragraph> = self.tdoc.paragraphs.drain(s..=e).collect();
+        if preceding {
+            tree_edit::add_paragraphs_to_container(
+                &mut self.tdoc.paragraphs[s - 1],
+                drained,
+                false,
+            );
+        } else {
+            // After draining `s..=e`, the following container sits at index `s`.
+            tree_edit::add_paragraphs_to_container(&mut self.tdoc.paragraphs[s], drained, true);
+        }
+
+        // Restore the cursor (needed for the merge), merge same-kind neighbours, then
+        // restore the selection over the now-nested items.
+        self.restore_cursor_by_leaf_index(cur_idx, cur_off);
+        self.merge_lists_at_cursor();
+        if let Some((sa, soff, sb, eoff)) = sel_idx {
+            let leaves = self.leaf_paths();
+            if let (Some(a), Some(b)) = (
+                sa.and_then(|i| leaves.get(i)).cloned(),
+                sb.and_then(|i| leaves.get(i)).cloned(),
+            ) {
+                self.selection =
+                    Some((DocumentPosition::at(a, soff), DocumentPosition::at(b, eoff)));
+            }
+        }
+        self.trigger_paragraph_change();
+        Ok(())
+    }
+
+    /// The cursor path length (number of segments); used by the "select parent" menu.
+    pub fn cursor_depth(&self) -> usize {
+        self.cursor.path.len()
+    }
+
+    /// Whether the cursor's innermost level is a collapsed single-text container.
+    pub fn cursor_in_collapsed_container(&self) -> bool {
+        tree_walk::cursor_in_collapsed_container(&self.tdoc, &self.cursor.path)
+    }
+
+    /// The container-kind block type of the ancestor container at path `depth`
+    /// (1..=len-1), for labelling the "select parent" menu.
+    pub fn container_block_at_depth(&self, depth: usize) -> Option<BlockType> {
+        let segs = self.cursor.path.segments();
+        if depth == 0 || depth >= segs.len() {
+            return None;
+        }
+        let path = TreePath(segs[..depth].to_vec());
+        tree_walk::container_block_at(&self.tdoc, &path)
+    }
+
+    /// Convert the ancestor container at path `depth` to `target` (the "select parent →
+    /// convert" action). Returns whether the tree changed.
+    pub fn convert_container_at_depth(
+        &mut self,
+        depth: usize,
+        target: tree_edit::ContainerKind,
+    ) -> bool {
+        let segs = self.cursor.path.segments();
+        if depth == 0 || depth >= segs.len() {
+            return false;
+        }
+        let path = TreePath(segs[..depth].to_vec());
+        self.convert_container_at(&path, target)
+    }
+
+    /// Dissolve the ancestor container at path `depth` (the "select parent → unwrap"
+    /// action). Returns whether the tree changed.
+    pub fn dissolve_container_at_depth(&mut self, depth: usize) -> bool {
+        let segs = self.cursor.path.segments();
+        if depth == 0 || depth >= segs.len() {
+            return false;
+        }
+        let path = TreePath(segs[..depth].to_vec());
+        self.dissolve_container_at(&path)
+    }
+
+    /// Whether the container at path `depth` can be dissolved (its parent is the document or
+    /// a quote — the containers `container_splice` supports). Used to gate the "unwrap"
+    /// item in the "select parent" menu.
+    pub fn container_dissolvable_at_depth(&self, depth: usize) -> bool {
+        let segs = self.cursor.path.segments();
+        if depth == 0 || depth >= segs.len() {
+            return false;
+        }
+        matches!(
+            segs[depth - 1],
+            PathSegment::Paragraph(_) | PathSegment::QuoteChild(_)
+        )
     }
 
     fn unwrap_quote(&mut self) -> EditResult {
@@ -1865,8 +2421,9 @@ impl Editor {
     /// previous sibling (Tab).
     pub fn indent_list_item(&mut self) -> EditResult {
         // Top-down: each selected item nests under the same previous sibling, so they stay
-        // side by side one level deeper rather than stacking into a staircase.
-        self.shift_list_items(tree_edit::indent_list_item, false)
+        // side by side one level deeper rather than stacking into a staircase. The first
+        // item of a list that follows another list merges into that preceding list.
+        self.shift_list_items(tree_edit::indent_list_item_or_merge, false)
     }
 
     /// Move the current list item — or every list item in the selection — out one nesting
@@ -1907,7 +2464,11 @@ impl Editor {
             };
             if matches!(
                 path.last(),
-                Some(PathSegment::ListEntry { .. } | PathSegment::ChecklistItem(_))
+                Some(
+                    PathSegment::ListEntry { .. }
+                        | PathSegment::ChecklistItem(_)
+                        | PathSegment::QuoteChild(_)
+                )
             ) && op(&mut self.tdoc, &path).is_some()
             {
                 changed = true;
@@ -2358,6 +2919,755 @@ mod tests {
 
     fn md(editor: &Editor) -> String {
         document_to_markdown(editor.document()).trim().to_string()
+    }
+
+    // ----- Block model: pseudo-leaf convert / wrap / unwrap -------------------------
+
+    fn cursor_at(editor: &mut Editor, path: TreePath) {
+        editor.set_cursor(DocumentPosition::at(path, 0));
+    }
+
+    #[test]
+    fn convert_heading_to_quote_flattens_not_nests() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("## Title"));
+        cursor_at(&mut editor, TreePath::root(0));
+        editor.set_block_type(BlockType::BlockQuote).unwrap();
+        // A plain quote, not a quoted heading.
+        assert_eq!(md(&editor), "> Title");
+        if let Paragraph::Quote { children } = &editor.document().paragraphs[0] {
+            assert!(matches!(children[0], Paragraph::Text { .. }));
+        } else {
+            panic!("expected a quote");
+        }
+    }
+
+    #[test]
+    fn single_text_quote_pseudo_leaf_to_text_unwraps() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("> quoted"));
+        cursor_at(
+            &mut editor,
+            TreePath::root(0).child(PathSegment::QuoteChild(0)),
+        );
+        editor.set_block_type(BlockType::Paragraph).unwrap();
+        assert_eq!(md(&editor), "quoted");
+        assert!(matches!(
+            editor.document().paragraphs[0],
+            Paragraph::Text { .. }
+        ));
+    }
+
+    #[test]
+    fn single_text_quote_pseudo_leaf_to_heading_lifts_out() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("> quoted"));
+        cursor_at(
+            &mut editor,
+            TreePath::root(0).child(PathSegment::QuoteChild(0)),
+        );
+        editor
+            .set_block_type(BlockType::Heading { level: 2 })
+            .unwrap();
+        assert_eq!(md(&editor), "## quoted");
+    }
+
+    #[test]
+    fn single_text_quote_pseudo_leaf_to_bullet_converts_container() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("> quoted"));
+        cursor_at(
+            &mut editor,
+            TreePath::root(0).child(PathSegment::QuoteChild(0)),
+        );
+        editor
+            .set_block_type(BlockType::ListItem {
+                ordered: false,
+                number: None,
+                checkbox: None,
+                depth: 0,
+            })
+            .unwrap();
+        assert!(matches!(
+            editor.document().paragraphs[0],
+            Paragraph::UnorderedList { .. }
+        ));
+        assert_eq!(md(&editor), "- quoted");
+    }
+
+    #[test]
+    fn paragraph_to_quote_and_back_round_trips_heading() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("## Title"));
+        cursor_at(&mut editor, TreePath::root(0));
+        editor.set_block_type(BlockType::BlockQuote).unwrap();
+        editor
+            .set_block_type(BlockType::Heading { level: 2 })
+            .unwrap();
+        assert_eq!(md(&editor), "## Title");
+    }
+
+    #[test]
+    fn single_text_bullet_in_multi_item_list_is_pseudo_leaf() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("- a\n- b\n- c"));
+        cursor_at(
+            &mut editor,
+            TreePath::root(0).child(PathSegment::ListEntry { entry: 1, para: 0 }),
+        );
+        assert!(matches!(
+            editor.cursor_effective_block_type(),
+            BlockType::ListItem {
+                ordered: false,
+                checkbox: None,
+                ..
+            }
+        ));
+        // ESC-7 converts the whole containing list to numbered.
+        editor
+            .set_block_type(BlockType::ListItem {
+                ordered: true,
+                number: None,
+                checkbox: None,
+                depth: 0,
+            })
+            .unwrap();
+        if let Paragraph::OrderedList { entries } = &editor.document().paragraphs[0] {
+            assert_eq!(entries.len(), 3);
+        } else {
+            panic!("expected an ordered list");
+        }
+    }
+
+    #[test]
+    fn wrap_selection_quote_preserves_heading_and_round_trips() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("## Title"));
+        cursor_at(&mut editor, TreePath::root(0));
+        editor
+            .wrap_selection(tree_edit::ContainerKind::Quote)
+            .unwrap();
+        assert_eq!(md(&editor), "> ## Title");
+        if let Paragraph::Quote { children } = &editor.document().paragraphs[0] {
+            assert!(matches!(children[0], Paragraph::Header2 { .. }));
+        } else {
+            panic!("expected a quote");
+        }
+    }
+
+    #[test]
+    fn wrap_selection_bullet_holds_whole_selection_as_one_item() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("first\n\nsecond"));
+        editor.set_selection(
+            DocumentPosition::at(TreePath::root(0), 0),
+            DocumentPosition::at(TreePath::root(1), 6),
+        );
+        editor
+            .wrap_selection(tree_edit::ContainerKind::Unordered)
+            .unwrap();
+        if let Paragraph::UnorderedList { entries } = &editor.document().paragraphs[0] {
+            assert_eq!(entries.len(), 1, "one list item");
+            assert_eq!(entries[0].len(), 2, "holding both paragraphs");
+        } else {
+            panic!("expected a list");
+        }
+    }
+
+    #[test]
+    fn outdent_lifts_quote_child_out() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("> quoted"));
+        cursor_at(
+            &mut editor,
+            TreePath::root(0).child(PathSegment::QuoteChild(0)),
+        );
+        editor.outdent_list_item().unwrap();
+        assert_eq!(md(&editor), "quoted");
+        assert!(matches!(
+            editor.document().paragraphs[0],
+            Paragraph::Text { .. }
+        ));
+    }
+
+    #[test]
+    fn indent_first_ordered_item_merges_into_preceding_bullet_sublist() {
+        // A bullet item with a nested bullet sublist, then a separate top-level ordered
+        // list; indenting the ordered item joins the nested bullet sublist.
+        let mut editor = Editor::new();
+        let mut doc = markdown_to_document("x");
+        let text = |s: &str| Paragraph::Text {
+            content: vec![Span::new_text(s)],
+        };
+        doc.paragraphs = vec![
+            Paragraph::new_unordered_list().with_entries(vec![vec![
+                text("bullet item"),
+                Paragraph::new_unordered_list()
+                    .with_entries(vec![vec![text("a")], vec![text("b")]]),
+            ]]),
+            Paragraph::new_ordered_list().with_entries(vec![vec![text("ordered item")]]),
+        ];
+        editor.set_document(doc);
+        // Cursor on "ordered item" (the ordered list's first/only item).
+        editor.set_cursor(DocumentPosition::at(
+            TreePath::root(1).child(PathSegment::ListEntry { entry: 0, para: 0 }),
+            0,
+        ));
+        editor.indent_list_item().unwrap();
+        // The whole document collapses to one bullet list; the ordered item joined the
+        // nested bullet sublist as a third item.
+        assert_eq!(
+            editor.document().paragraphs.len(),
+            1,
+            "the ordered list is gone"
+        );
+        let Paragraph::UnorderedList { entries } = &editor.document().paragraphs[0] else {
+            panic!("expected the outer bullet list");
+        };
+        assert_eq!(entries.len(), 1);
+        let Paragraph::UnorderedList { entries: sub } = &entries[0][1] else {
+            panic!("expected the nested bullet sublist");
+        };
+        assert_eq!(sub.len(), 3, "ordered item joined the sublist");
+        assert_eq!(
+            editor.leaf_plain_text(
+                &TreePath::root(0)
+                    .child(PathSegment::ListEntry { entry: 0, para: 1 })
+                    .child(PathSegment::ListEntry { entry: 2, para: 0 })
+            ),
+            "ordered item"
+        );
+    }
+
+    #[test]
+    fn convert_list_item_to_quote_leaves_siblings_alone() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("- a\n- b\n- c"));
+        cursor_at(
+            &mut editor,
+            TreePath::root(0).child(PathSegment::ListEntry { entry: 1, para: 0 }),
+        );
+        editor.set_block_type(BlockType::BlockQuote).unwrap();
+        // "b" becomes a quote; "a" and "c" stay list items (the list splits around it).
+        let paras = &editor.document().paragraphs;
+        assert_eq!(paras.len(), 3);
+        assert!(matches!(paras[0], Paragraph::UnorderedList { .. }));
+        assert!(matches!(paras[1], Paragraph::Quote { .. }));
+        assert!(matches!(paras[2], Paragraph::UnorderedList { .. }));
+        if let Paragraph::Quote { children } = &paras[1] {
+            assert!(matches!(children[0], Paragraph::Text { .. }));
+        } else {
+            panic!("expected the middle item to become a quote");
+        }
+    }
+
+    fn bt_ordered() -> BlockType {
+        BlockType::ListItem {
+            ordered: true,
+            number: None,
+            checkbox: None,
+            depth: 0,
+        }
+    }
+    fn bt_checklist() -> BlockType {
+        BlockType::ListItem {
+            ordered: false,
+            number: None,
+            checkbox: Some(false),
+            depth: 0,
+        }
+    }
+
+    #[test]
+    fn convert_selected_checklist_items_carves_them_out() {
+        // A four-item checklist; selecting the middle two and converting to a numbered list
+        // carves them out into their own ordered list, splitting the checklist into three.
+        let mut editor = Editor::new();
+        let mut doc = markdown_to_document("x");
+        let check = |s: &str| ChecklistItem::new(false).with_content(vec![Span::new_text(s)]);
+        doc.paragraphs = vec![Paragraph::new_checklist().with_checklist_items(vec![
+            check("c1"),
+            check("c2"),
+            check("c3"),
+            check("c4"),
+        ])];
+        editor.set_document(doc);
+        let item = |c| TreePath::root(0).child(PathSegment::ChecklistItem(c));
+        editor.set_cursor(DocumentPosition::at(item(2), 2));
+        editor.set_selection(
+            DocumentPosition::at(item(1), 0),
+            DocumentPosition::at(item(2), 2),
+        );
+        editor.set_block_type(bt_ordered()).unwrap();
+        let paras = &editor.document().paragraphs;
+        assert_eq!(paras.len(), 3, "checklist split into three siblings");
+        let Paragraph::Checklist { items } = &paras[0] else {
+            panic!("first stays a checklist");
+        };
+        assert_eq!(items.len(), 1, "c1");
+        let Paragraph::OrderedList { entries } = &paras[1] else {
+            panic!("middle became an ordered list");
+        };
+        assert_eq!(entries.len(), 2, "c2, c3 carved out");
+        let Paragraph::Checklist { items } = &paras[2] else {
+            panic!("last stays a checklist");
+        };
+        assert_eq!(items.len(), 1, "c4");
+        // The selection still covers the two carved-out items.
+        let (a, b) = editor.selection().expect("selection preserved");
+        assert_eq!(editor.leaf_plain_text(&a.path), "c2");
+        assert_eq!(editor.leaf_plain_text(&b.path), "c3");
+    }
+
+    #[test]
+    fn convert_leading_selected_items_splits_into_two() {
+        // Selecting from the first item leaves no "before" half — only two lists result.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("- a\n- b\n- c\n- d"));
+        let item = |e| TreePath::root(0).child(PathSegment::ListEntry { entry: e, para: 0 });
+        editor.set_cursor(DocumentPosition::at(item(1), 1));
+        editor.set_selection(
+            DocumentPosition::at(item(0), 0),
+            DocumentPosition::at(item(1), 1),
+        );
+        editor.set_block_type(bt_checklist()).unwrap();
+        let paras = &editor.document().paragraphs;
+        assert_eq!(paras.len(), 2, "no before-half, so two lists");
+        let Paragraph::Checklist { items } = &paras[0] else {
+            panic!("leading items became a checklist");
+        };
+        assert_eq!(items.len(), 2, "a, b");
+        let Paragraph::UnorderedList { entries } = &paras[1] else {
+            panic!("trailing items stay a bullet list");
+        };
+        assert_eq!(entries.len(), 2, "c, d");
+    }
+
+    #[test]
+    fn convert_whole_selection_converts_the_whole_list() {
+        // Selecting *every* item is a plain whole-list conversion, not a split.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("- a\n- b\n- c"));
+        let item = |e| TreePath::root(0).child(PathSegment::ListEntry { entry: e, para: 0 });
+        editor.set_cursor(DocumentPosition::at(item(2), 1));
+        editor.set_selection(
+            DocumentPosition::at(item(0), 0),
+            DocumentPosition::at(item(2), 1),
+        );
+        editor.set_block_type(bt_ordered()).unwrap();
+        let paras = &editor.document().paragraphs;
+        assert_eq!(paras.len(), 1, "still one list");
+        assert!(matches!(paras[0], Paragraph::OrderedList { .. }));
+    }
+
+    #[test]
+    fn convert_carved_out_items_merge_with_adjacent_same_kind_list() {
+        // A numbered list, then a bullet list; carving out the bullet's leading items to
+        // numbered lets them merge into the preceding numbered list.
+        let mut editor = Editor::new();
+        let mut doc = markdown_to_document("x");
+        let entry = |s: &str| {
+            vec![Paragraph::Text {
+                content: vec![Span::new_text(s)],
+            }]
+        };
+        doc.paragraphs = vec![
+            Paragraph::new_ordered_list().with_entries(vec![entry("n1")]),
+            Paragraph::new_unordered_list().with_entries(vec![
+                entry("b1"),
+                entry("b2"),
+                entry("b3"),
+            ]),
+        ];
+        editor.set_document(doc);
+        let bullet = |e| TreePath::root(1).child(PathSegment::ListEntry { entry: e, para: 0 });
+        editor.set_cursor(DocumentPosition::at(bullet(1), 1));
+        editor.set_selection(
+            DocumentPosition::at(bullet(0), 0),
+            DocumentPosition::at(bullet(1), 1),
+        );
+        editor.set_block_type(bt_ordered()).unwrap();
+        let paras = &editor.document().paragraphs;
+        assert_eq!(
+            paras.len(),
+            2,
+            "merged numbered list + remaining bullet list"
+        );
+        let Paragraph::OrderedList { entries } = &paras[0] else {
+            panic!("expected the merged numbered list");
+        };
+        assert_eq!(entries.len(), 3, "n1, b1, b2 merged");
+        let Paragraph::UnorderedList { entries } = &paras[1] else {
+            panic!("expected the remaining bullet list");
+        };
+        assert_eq!(entries.len(), 1, "b3");
+    }
+
+    #[test]
+    fn convert_nested_item_to_text_stays_inside_parent_item() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document(
+            "- first\n- second\n- third\n    - indented",
+        ));
+        // "indented" is nested under "third".
+        let path = TreePath::root(0)
+            .child(PathSegment::ListEntry { entry: 2, para: 1 })
+            .child(PathSegment::ListEntry { entry: 0, para: 0 });
+        editor.set_cursor(DocumentPosition::at(path, 0));
+        editor.set_block_type(BlockType::Paragraph).unwrap();
+        // "indented" becomes the second paragraph *inside* third's list item (a
+        // continuation of "third"), not a top-level paragraph or an outdented bullet.
+        let paras = &editor.document().paragraphs;
+        assert_eq!(paras.len(), 1, "still a single top-level list");
+        let Paragraph::UnorderedList { entries } = &paras[0] else {
+            panic!("expected the list to remain");
+        };
+        assert_eq!(entries.len(), 3, "first/second/third");
+        assert_eq!(entries[2].len(), 2, "third's item now holds two paragraphs");
+        assert!(matches!(entries[2][0], Paragraph::Text { .. }));
+        assert!(matches!(entries[2][1], Paragraph::Text { .. }));
+        // The pseudo-leaf breadcrumb is now "Unordered List > Text".
+        let leaf = TreePath::root(0).child(PathSegment::ListEntry { entry: 2, para: 1 });
+        editor.set_cursor(DocumentPosition::at(leaf, 0));
+        assert!(matches!(
+            editor.cursor_effective_block_type(),
+            BlockType::Paragraph
+        ));
+    }
+
+    #[test]
+    fn indent_appends_paragraph_after_list_as_new_item() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("- a\n- b\n\nfollow"));
+        // "follow" is a top-level paragraph after the list.
+        editor.set_cursor(DocumentPosition::at(TreePath::root(1), 0));
+        assert!(
+            editor.cursor_can_indent(),
+            "a paragraph after a list can indent"
+        );
+        editor.indent().unwrap();
+        // It joins the list as a new sibling item.
+        assert_eq!(
+            editor.document().paragraphs.len(),
+            1,
+            "merged into the list"
+        );
+        let Paragraph::UnorderedList { entries } = &editor.document().paragraphs[0] else {
+            panic!("expected a list");
+        };
+        assert_eq!(entries.len(), 3, "a new list item was appended");
+        let follow = TreePath::root(0).child(PathSegment::ListEntry { entry: 2, para: 0 });
+        assert_eq!(editor.leaf_plain_text(&follow), "follow");
+        // It round-trips back out via outdent (`[`).
+        editor.set_cursor(DocumentPosition::at(follow, 0));
+        editor.outdent_list_item().unwrap();
+        assert_eq!(
+            editor.document().paragraphs.len(),
+            2,
+            "lifted back out to a paragraph"
+        );
+    }
+
+    #[test]
+    fn indent_paragraph_between_two_lists_merges_all_into_one() {
+        let mut editor = Editor::new();
+        let mut doc = markdown_to_document("x");
+        let item = |s: &str| {
+            vec![Paragraph::Text {
+                content: vec![Span::new_text(s)],
+            }]
+        };
+        doc.paragraphs = vec![
+            Paragraph::new_unordered_list().with_entries(vec![item("a")]),
+            Paragraph::Text {
+                content: vec![Span::new_text("mid")],
+            },
+            Paragraph::new_unordered_list().with_entries(vec![item("b")]),
+        ];
+        editor.set_document(doc);
+        editor.set_cursor(DocumentPosition::at(TreePath::root(1), 0)); // "mid"
+        editor.indent().unwrap();
+        // The paragraph joins the preceding list, which then absorbs the following list.
+        assert_eq!(editor.document().paragraphs.len(), 1, "one merged list");
+        let Paragraph::UnorderedList { entries } = &editor.document().paragraphs[0] else {
+            panic!("expected a list");
+        };
+        assert_eq!(entries.len(), 3, "a, mid, b");
+    }
+
+    #[test]
+    fn indent_selection_of_paragraphs_after_list_appends_all() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("- a\n\np1\n\np2"));
+        // Cursor at the far end of the selection, as a shift-selection leaves it.
+        editor.set_cursor(DocumentPosition::at(TreePath::root(2), 2));
+        editor.set_selection(
+            DocumentPosition::at(TreePath::root(1), 0),
+            DocumentPosition::at(TreePath::root(2), 2),
+        );
+        editor.indent().unwrap();
+        assert_eq!(editor.document().paragraphs.len(), 1);
+        let Paragraph::UnorderedList { entries } = &editor.document().paragraphs[0] else {
+            panic!("expected one list");
+        };
+        assert_eq!(entries.len(), 3, "a, p1, p2 as items");
+    }
+
+    #[test]
+    fn indent_selection_of_paragraphs_before_list_prepends_all() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("p1\n\np2\n\n- a"));
+        editor.set_cursor(DocumentPosition::at(TreePath::root(1), 2));
+        editor.set_selection(
+            DocumentPosition::at(TreePath::root(0), 0),
+            DocumentPosition::at(TreePath::root(1), 2),
+        );
+        editor.indent().unwrap();
+        assert_eq!(editor.document().paragraphs.len(), 1);
+        let Paragraph::UnorderedList { entries } = &editor.document().paragraphs[0] else {
+            panic!("expected one list");
+        };
+        assert_eq!(entries.len(), 3, "p1, p2, a in order");
+        let item = |e| TreePath::root(0).child(PathSegment::ListEntry { entry: e, para: 0 });
+        assert_eq!(editor.leaf_plain_text(&item(0)), "p1");
+        assert_eq!(editor.leaf_plain_text(&item(2)), "a");
+    }
+
+    #[test]
+    fn indent_checklist_items_nest_under_preceding_bullet_item() {
+        // A bullet item followed by a separate checklist; selecting all the checklist items
+        // and indenting nests them under the bullet item as a sub-checklist (checkboxes kept).
+        let mut editor = Editor::new();
+        let mut doc = markdown_to_document("x");
+        let text = |s: &str| Paragraph::Text {
+            content: vec![Span::new_text(s)],
+        };
+        let check = |s: &str| ChecklistItem::new(false).with_content(vec![Span::new_text(s)]);
+        doc.paragraphs = vec![
+            Paragraph::new_unordered_list().with_entries(vec![vec![text("bullet")]]),
+            Paragraph::new_checklist().with_checklist_items(vec![
+                check("c1"),
+                check("c2"),
+                check("c3"),
+            ]),
+        ];
+        editor.set_document(doc);
+        // Select all three checklist items (cursor at the far end, as a shift-selection leaves it).
+        let item = |c| TreePath::root(1).child(PathSegment::ChecklistItem(c));
+        editor.set_cursor(DocumentPosition::at(item(2), 2));
+        editor.set_selection(
+            DocumentPosition::at(item(0), 0),
+            DocumentPosition::at(item(2), 2),
+        );
+        editor.indent().unwrap();
+        // The top-level checklist is gone; the three items are a sub-checklist under "bullet".
+        assert_eq!(editor.document().paragraphs.len(), 1, "checklist merged in");
+        let Paragraph::UnorderedList { entries } = &editor.document().paragraphs[0] else {
+            panic!("expected the bullet list");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].len(),
+            2,
+            "bullet item now holds text + sub-checklist"
+        );
+        let Paragraph::Checklist { items } = &entries[0][1] else {
+            panic!("expected a nested checklist (checkboxes preserved)");
+        };
+        assert_eq!(
+            items.len(),
+            3,
+            "all three items nested together, not staircased"
+        );
+        let nested = |c| {
+            TreePath::root(0)
+                .child(PathSegment::ListEntry { entry: 0, para: 1 })
+                .child(PathSegment::ChecklistItem(c))
+        };
+        assert_eq!(editor.leaf_plain_text(&nested(0)), "c1");
+        assert_eq!(editor.leaf_plain_text(&nested(2)), "c3");
+    }
+
+    #[test]
+    fn indent_single_checklist_item_nests_under_preceding_bullet_item() {
+        // Even a single first checklist item nests under a preceding bullet item.
+        let mut editor = Editor::new();
+        let mut doc = markdown_to_document("x");
+        let text = |s: &str| Paragraph::Text {
+            content: vec![Span::new_text(s)],
+        };
+        let check = |s: &str| ChecklistItem::new(false).with_content(vec![Span::new_text(s)]);
+        doc.paragraphs = vec![
+            Paragraph::new_unordered_list().with_entries(vec![vec![text("bullet")]]),
+            Paragraph::new_checklist().with_checklist_items(vec![check("c1"), check("c2")]),
+        ];
+        editor.set_document(doc);
+        editor.set_cursor(DocumentPosition::at(
+            TreePath::root(1).child(PathSegment::ChecklistItem(0)),
+            0,
+        ));
+        editor.indent().unwrap();
+        // "c1" nested under "bullet"; "c2" stays behind in the top-level checklist.
+        assert_eq!(editor.document().paragraphs.len(), 2);
+        let Paragraph::UnorderedList { entries } = &editor.document().paragraphs[0] else {
+            panic!("expected the bullet list");
+        };
+        assert!(matches!(entries[0][1], Paragraph::Checklist { .. }));
+        let Paragraph::Checklist { items } = &editor.document().paragraphs[1] else {
+            panic!("expected the remaining checklist");
+        };
+        assert_eq!(items.len(), 1, "c2 remains at top level");
+    }
+
+    #[test]
+    fn outdent_nested_checklist_items_lifts_back_out() {
+        // The inverse of indent: checklist items nested under a bullet item, when outdented,
+        // lift back out to a top-level checklist (keeping their checkboxes), not text.
+        let mut editor = Editor::new();
+        let mut doc = markdown_to_document("x");
+        let text = |s: &str| Paragraph::Text {
+            content: vec![Span::new_text(s)],
+        };
+        let check = |s: &str| ChecklistItem::new(false).with_content(vec![Span::new_text(s)]);
+        doc.paragraphs = vec![Paragraph::new_unordered_list().with_entries(vec![vec![
+            text("bullet"),
+            Paragraph::new_checklist().with_checklist_items(vec![
+                check("c1"),
+                check("c2"),
+                check("c3"),
+            ]),
+        ]])];
+        editor.set_document(doc);
+        let item = |c| {
+            TreePath::root(0)
+                .child(PathSegment::ListEntry { entry: 0, para: 1 })
+                .child(PathSegment::ChecklistItem(c))
+        };
+        // Select all three nested checklist items and outdent.
+        editor.set_cursor(DocumentPosition::at(item(2), 2));
+        editor.set_selection(
+            DocumentPosition::at(item(0), 0),
+            DocumentPosition::at(item(2), 2),
+        );
+        editor.outdent_list_item().unwrap();
+        // The bullet item no longer holds a sub-checklist; the items are a top-level checklist.
+        assert_eq!(
+            editor.document().paragraphs.len(),
+            2,
+            "bullet list + checklist"
+        );
+        let Paragraph::UnorderedList { entries } = &editor.document().paragraphs[0] else {
+            panic!("expected the bullet list");
+        };
+        assert_eq!(entries[0].len(), 1, "bullet item is just its text again");
+        let Paragraph::Checklist { items } = &editor.document().paragraphs[1] else {
+            panic!("expected a top-level checklist (not text paragraphs)");
+        };
+        assert_eq!(items.len(), 3, "all three lifted out together");
+        assert_eq!(items[0].content[0].text, "c1");
+        assert_eq!(items[2].content[0].text, "c3");
+    }
+
+    #[test]
+    fn indent_then_outdent_checklist_under_bullet_round_trips() {
+        let mut editor = Editor::new();
+        let mut doc = markdown_to_document("x");
+        let text = |s: &str| Paragraph::Text {
+            content: vec![Span::new_text(s)],
+        };
+        let check = |s: &str| ChecklistItem::new(false).with_content(vec![Span::new_text(s)]);
+        doc.paragraphs = vec![
+            Paragraph::new_unordered_list().with_entries(vec![vec![text("bullet")]]),
+            Paragraph::new_checklist().with_checklist_items(vec![
+                check("c1"),
+                check("c2"),
+                check("c3"),
+            ]),
+        ];
+        let before = format!("{:?}", doc.paragraphs);
+        editor.set_document(doc);
+        let top = |c| TreePath::root(1).child(PathSegment::ChecklistItem(c));
+        editor.set_cursor(DocumentPosition::at(top(2), 2));
+        editor.set_selection(
+            DocumentPosition::at(top(0), 0),
+            DocumentPosition::at(top(2), 2),
+        );
+        editor.indent().unwrap(); // nest under the bullet
+        editor.outdent_list_item().unwrap(); // lift back out
+        assert_eq!(
+            format!("{:?}", editor.document().paragraphs),
+            before,
+            "indent then outdent restores the original structure"
+        );
+    }
+
+    #[test]
+    fn indent_nests_paragraph_into_preceding_quote() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("> quoted\n\nfollow"));
+        editor.set_cursor(DocumentPosition::at(TreePath::root(1), 0));
+        editor.indent().unwrap();
+        assert_eq!(editor.document().paragraphs.len(), 1);
+        let Paragraph::Quote { children } = &editor.document().paragraphs[0] else {
+            panic!("expected a quote");
+        };
+        assert_eq!(children.len(), 2, "paragraph became a quote child");
+    }
+
+    #[test]
+    fn continuation_paragraph_stays_in_list_item() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("- item"));
+        editor.set_cursor(DocumentPosition::at(
+            TreePath::root(0).child(PathSegment::ListEntry { entry: 0, para: 0 }),
+            4,
+        ));
+        editor.insert_continuation().unwrap();
+        editor.insert_text("cont").unwrap();
+        let Paragraph::UnorderedList { entries } = &editor.document().paragraphs[0] else {
+            panic!("expected a list");
+        };
+        assert_eq!(entries.len(), 1, "still one list item");
+        assert_eq!(entries[0].len(), 2, "the item holds two paragraphs");
+        // Contrast: plain Enter (insert_newline) would make a second list item instead.
+    }
+
+    #[test]
+    fn newline_in_list_item_makes_a_new_item() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("- item"));
+        editor.set_cursor(DocumentPosition::at(
+            TreePath::root(0).child(PathSegment::ListEntry { entry: 0, para: 0 }),
+            4,
+        ));
+        editor.insert_newline().unwrap();
+        let Paragraph::UnorderedList { entries } = &editor.document().paragraphs[0] else {
+            panic!("expected a list");
+        };
+        assert_eq!(entries.len(), 2, "Enter starts a new list item");
+    }
+
+    #[test]
+    fn cursor_can_unnest_truth_table() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("plain"));
+        cursor_at(&mut editor, TreePath::root(0));
+        assert!(!editor.cursor_can_unnest());
+
+        editor.set_document(markdown_to_document("> quoted"));
+        cursor_at(
+            &mut editor,
+            TreePath::root(0).child(PathSegment::QuoteChild(0)),
+        );
+        assert!(editor.cursor_can_unnest());
+
+        editor.set_document(markdown_to_document("- item"));
+        cursor_at(
+            &mut editor,
+            TreePath::root(0).child(PathSegment::ListEntry { entry: 0, para: 0 }),
+        );
+        assert!(editor.cursor_can_unnest());
+        assert!(editor.cursor_can_indent());
     }
 
     #[test]

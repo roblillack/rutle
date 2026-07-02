@@ -890,6 +890,7 @@ impl Renderer {
             current_y = self.layout_block(
                 &blocks[block_idx],
                 &blocks,
+                &leaves,
                 block_idx,
                 leaves[block_idx].quote_depth,
                 leaves[block_idx].list_levels,
@@ -1321,14 +1322,134 @@ impl Renderer {
         self.record_preferred_pos(new_pos);
     }
 
-    /// Layout a single block. `blocks` is the full frame slice (for sibling scans such as
-    /// ordered-list run detection); `block_idx` indexes it. `quote_depth`/`list_levels` come
-    /// from the leaf and drive indentation independently of the (flat) block type.
+    /// The largest displayed number in the ordered list the item at `idx` belongs to.
+    /// Walks siblings at the same list level, skipping continuation paragraphs and nested
+    /// content (which would otherwise break a naive contiguous-block run) and stopping at
+    /// the list's boundary (a shallower level or a different list at the same level).
+    fn ordered_run_max_number(
+        &self,
+        blocks: &[Block],
+        leaves: &[tree_walk::LeafInfo],
+        idx: usize,
+    ) -> u64 {
+        let level = leaves[idx].list_levels;
+        let mut max_num = match blocks[idx].block_type {
+            BlockType::ListItem { number, .. } => number.unwrap_or(1),
+            _ => 1,
+        };
+        let visit = |j: usize, max_num: &mut u64| -> bool {
+            let lj = leaves[j].list_levels;
+            if lj < level {
+                return false; // left this list level → stop
+            }
+            if lj > level {
+                return true; // nested content → skip, keep scanning
+            }
+            match blocks[j].block_type {
+                BlockType::ListItem {
+                    ordered: true,
+                    number,
+                    ..
+                } => {
+                    *max_num = (*max_num).max(number.unwrap_or(1));
+                    true
+                }
+                BlockType::ListItem { .. } => false, // a different list at this level → stop
+                _ => true,                           // same-level continuation → skip
+            }
+        };
+        for j in (idx + 1)..blocks.len() {
+            if !visit(j, &mut max_num) {
+                break;
+            }
+        }
+        for j in (0..idx).rev() {
+            if !visit(j, &mut max_num) {
+                break;
+            }
+        }
+        max_num
+    }
+
+    /// The marker "slot" width for the list item at `idx` (a bullet, the widest `N. ` in an
+    /// ordered list, or a checkbox), used to align both the marker and the item's content.
+    fn list_marker_pad_width(
+        &self,
+        blocks: &[Block],
+        leaves: &[tree_walk::LeafInfo],
+        idx: usize,
+        ctx: &mut dyn RenderContext,
+    ) -> i32 {
+        let pf = self.theme.plain_text;
+        match blocks[idx].block_type {
+            BlockType::ListItem {
+                checkbox: Some(_), ..
+            } => {
+                if self.theme.checkbox_text {
+                    ctx.text_width("[ ] ", pf.font_type, pf.font_style, pf.font_size) as i32
+                } else {
+                    let mut box_size = (pf.font_size as i32).saturating_sub(4).max(8);
+                    if box_size > self.theme.line_height {
+                        box_size = self.theme.line_height;
+                    }
+                    let mut space =
+                        ctx.text_width(" ", pf.font_type, pf.font_style, pf.font_size) as i32;
+                    if space < 4 {
+                        space = 4;
+                    }
+                    box_size + space
+                }
+            }
+            BlockType::ListItem { ordered: true, .. } => {
+                let max_num = self.ordered_run_max_number(blocks, leaves, idx);
+                ctx.text_width(
+                    &format!("{}. ", max_num),
+                    pf.font_type,
+                    pf.font_style,
+                    pf.font_size,
+                ) as i32
+            }
+            _ => ctx.text_width("• ", pf.font_type, pf.font_style, pf.font_size) as i32,
+        }
+    }
+
+    /// The marker width of the list item that governs the content at `block_idx` (the item
+    /// whose text this continuation paragraph / nested content should align under). Falls
+    /// back to a bullet width if no governing item is found.
+    fn governing_marker_pad_width(
+        &self,
+        blocks: &[Block],
+        leaves: &[tree_walk::LeafInfo],
+        block_idx: usize,
+        ctx: &mut dyn RenderContext,
+    ) -> i32 {
+        let level = leaves[block_idx].list_levels;
+        for j in (0..=block_idx).rev() {
+            let lj = leaves[j].list_levels;
+            if lj < level {
+                break;
+            }
+            if lj > level {
+                continue; // nested content → skip past it
+            }
+            if matches!(blocks[j].block_type, BlockType::ListItem { .. }) {
+                return self.list_marker_pad_width(blocks, leaves, j, ctx);
+            }
+        }
+        let pf = self.theme.plain_text;
+        ctx.text_width("• ", pf.font_type, pf.font_style, pf.font_size) as i32
+    }
+
+    /// Layout a single block. `blocks`/`leaves` are the full frame slices (for sibling
+    /// scans such as ordered-list run detection); `block_idx` indexes them.
+    /// `quote_depth`/`list_levels` come from the leaf and drive indentation independently of
+    /// the (flat) block type.
     #[allow(clippy::too_many_arguments)]
     fn layout_block(
         &mut self,
         block: &Block,
         blocks: &[Block],
+        leaves: &[tree_walk::LeafInfo],
         block_idx: usize,
         quote_depth: usize,
         list_levels: usize,
@@ -1348,8 +1469,15 @@ impl Renderer {
         // paragraphs, code blocks, nested quote text) aligns with the list item's content.
         let interior_x = if list_levels > 0 {
             let pf = self.theme.plain_text;
-            let bullet_w = ctx.text_width("• ", pf.font_type, pf.font_style, pf.font_size) as i32;
-            start_x + pf.font_size as i32 * list_levels as i32 + bullet_w
+            // Align continuation content (paragraphs, code, nested quotes) with its list
+            // item's text — i.e. past the item's *actual* marker (a wide `10. ` number, a
+            // bullet, a checkbox), not a hardcoded bullet width. One base em plus a
+            // per-nesting-level step; the step is at least `list_indent`, so a cell backend
+            // (font_size == 0) still indents nested levels while the GUI keeps its
+            // one-em-per-level pixel metrics.
+            let step = (pf.font_size as i32).max(self.theme.list_indent);
+            let marker_w = self.governing_marker_pad_width(blocks, leaves, block_idx, ctx);
+            start_x + pf.font_size as i32 + step * (list_levels as i32 - 1) + marker_w
         } else {
             start_x
         };
@@ -1499,9 +1627,11 @@ impl Renderer {
             } => {
                 let plain_font = self.theme.plain_text;
 
-                // Base indent before the label, plus one extra step per nesting level.
-                // (depth 0 keeps the original flat-list metrics.)
-                let label_left_pad = plain_font.font_size as i32 * (*depth as i32 + 1);
+                // Base indent (one em) before the label, plus a per-nesting-level step.
+                // The step is at least `list_indent`, so a cell backend (font_size == 0)
+                // still indents nested items; depth 0 keeps the original flat-list metrics.
+                let step = (plain_font.font_size as i32).max(self.theme.list_indent);
+                let label_left_pad = plain_font.font_size as i32 + step * (*depth as i32);
 
                 let mut checklist_visual: Option<ChecklistVisual> = None;
 
@@ -1550,70 +1680,17 @@ impl Renderer {
                         (String::new(), label_pad_width, content_start_x)
                     }
                 } else if *ordered {
-                    // Find contiguous ordered list run (adjacent siblings)
-
-                    // Find run start
-                    let mut run_start = block_idx;
-                    while run_start > 0 {
-                        if let BlockType::ListItem { ordered: true, .. } =
-                            blocks[run_start - 1].block_type
-                        {
-                            run_start -= 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    // Find run end
-                    let mut run_end = block_idx;
-                    while run_end + 1 < blocks.len() {
-                        if let BlockType::ListItem { ordered: true, .. } =
-                            blocks[run_end + 1].block_type
-                        {
-                            run_end += 1;
-                        } else {
-                            break;
-                        }
-                    }
-
-                    // Determine starting number (default to 1 if None)
-                    let first_num = match blocks[run_start].block_type {
-                        BlockType::ListItem {
-                            ordered: true,
-                            number,
-                            ..
-                        } => number.unwrap_or(1),
-                        _ => 1,
-                    };
-
-                    // Compute the maximum used number across the run
-                    let mut max_num = first_num;
-                    for (i, b) in blocks[run_start..=run_end].iter().enumerate() {
-                        if let BlockType::ListItem {
-                            ordered: true,
-                            number,
-                            ..
-                        } = b.block_type
-                        {
-                            let n = number.unwrap_or(first_num + i as u64);
-                            if n > max_num {
-                                max_num = n;
-                            }
-                        }
-                    }
-
-                    // Pad width is width of the largest label text (max_num + ". ")
-                    let max_label = format!("{}. ", max_num);
+                    // Pad all items to the width of the list's largest number so their text
+                    // aligns; the run spans the whole list, skipping continuation paragraphs
+                    // and nested content that would otherwise split a naive block run.
+                    let max_num = self.ordered_run_max_number(blocks, leaves, block_idx);
                     let label_pad_width = ctx.text_width(
-                        &max_label,
+                        &format!("{}. ", max_num),
                         plain_font.font_type,
                         plain_font.font_style,
                         plain_font.font_size,
                     ) as i32;
-
-                    // Current label text
-                    let idx_in_run = block_idx - run_start;
-                    let cur_num = number.unwrap_or(first_num + idx_in_run as u64);
-                    let label_text = format!("{}. ", cur_num);
+                    let label_text = format!("{}. ", number.unwrap_or(1));
                     let content_start_x = start_x + label_left_pad + label_pad_width;
 
                     (label_text, label_pad_width, content_start_x)
