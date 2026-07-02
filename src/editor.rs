@@ -2052,35 +2052,33 @@ impl Editor {
         self.cursor_is_list_item() || self.can_nest_selection_into_adjacent()
     }
 
-    /// The top-level paragraph range `[s, e]` covered by the selection (or the cursor), or
-    /// `None` if either endpoint is not a top-level paragraph.
-    fn selection_top_range(&self) -> Option<(usize, usize)> {
+    /// The sibling paragraph range `[s, e]` covered by the selection (or the cursor) when both
+    /// endpoints are paragraphs sharing one parent container — the document top level or a
+    /// single quote's children. Returned as `(first_path, s, e)` (`first_path` locates the
+    /// sibling vec). `None` if the endpoints are in different containers or inside a list item.
+    fn selection_sibling_range(&self) -> Option<(TreePath, usize, usize)> {
         let (start, end) = self.selection_or_cursor_range();
-        Some((top_index(&start.path)?, top_index(&end.path)?))
+        // Both endpoints must live directly in the same parent container.
+        let sp = start.path.segments();
+        let ep = end.path.segments();
+        if sp.len() != ep.len() || sp[..sp.len() - 1] != ep[..ep.len() - 1] {
+            return None;
+        }
+        Some((
+            start.path.clone(),
+            sibling_index(&start.path)?,
+            sibling_index(&end.path)?,
+        ))
     }
 
-    /// Whether the selected top-level paragraph(s) sit next to a container they can nest
-    /// into — a container immediately before (append) or a container immediately after
-    /// (prepend). Preceding takes priority.
+    /// Whether the selected paragraph(s) sit next to a container they can nest into — a
+    /// container immediately before (append) or immediately after (prepend), among their
+    /// siblings. Works at the document top level and inside a quote. Preceding takes priority.
     pub fn can_nest_selection_into_adjacent(&self) -> bool {
-        let Some((s, e)) = self.selection_top_range() else {
+        let Some((path, s, e)) = self.selection_sibling_range() else {
             return false;
         };
-        let len = self.tdoc.paragraphs.len();
-        if e >= len {
-            return false;
-        }
-        let is_container = |p: &Paragraph| {
-            matches!(
-                p,
-                Paragraph::Quote { .. }
-                    | Paragraph::OrderedList { .. }
-                    | Paragraph::UnorderedList { .. }
-                    | Paragraph::Checklist { .. }
-            )
-        };
-        (s > 0 && self.tdoc.paragraphs.get(s - 1).is_some_and(is_container))
-            || (e + 1 < len && self.tdoc.paragraphs.get(e + 1).is_some_and(is_container))
+        tree_edit::has_adjacent_container(&self.tdoc, &path, s, e)
     }
 
     /// Indent (`]` / Tab): nest a list/checklist item one level deeper, or nest the selected
@@ -2095,33 +2093,16 @@ impl Editor {
         }
     }
 
-    /// Move the selected top-level paragraph(s) into an adjacent container: appended to a
-    /// container immediately before them (as new items / children at the end), or, failing
-    /// that, prepended to a container immediately after them (at the start). Each paragraph
-    /// becomes its own list/checklist item (or quote child). The inverse of `[`. Selection
-    /// and cursor are preserved (by flat leaf index, which the move keeps stable).
+    /// Move the selected paragraph(s) into an adjacent container: appended to a container
+    /// immediately before them (as new items / children at the end), or, failing that,
+    /// prepended to a container immediately after them (at the start). Each paragraph becomes
+    /// its own list/checklist item (or quote child). Works at the document top level or among
+    /// a quote's children. The inverse of `[`. Selection and cursor are preserved (by flat
+    /// leaf index, which the move keeps stable).
     fn nest_selection_into_adjacent(&mut self) -> EditResult {
-        let Some((s, e)) = self.selection_top_range() else {
+        let Some((path, s, e)) = self.selection_sibling_range() else {
             return Ok(());
         };
-        let len = self.tdoc.paragraphs.len();
-        if e >= len {
-            return Ok(());
-        }
-        let is_container = |p: &Paragraph| {
-            matches!(
-                p,
-                Paragraph::Quote { .. }
-                    | Paragraph::OrderedList { .. }
-                    | Paragraph::UnorderedList { .. }
-                    | Paragraph::Checklist { .. }
-            )
-        };
-        let preceding = s > 0 && self.tdoc.paragraphs.get(s - 1).is_some_and(is_container);
-        let following = e + 1 < len && self.tdoc.paragraphs.get(e + 1).is_some_and(is_container);
-        if !preceding && !following {
-            return Ok(());
-        }
 
         // Capture positions to restore by flat leaf index (the move preserves document order).
         let sel_idx = self.selection.clone().map(|(a, b)| {
@@ -2135,16 +2116,8 @@ impl Editor {
         let cur_idx = self.leaf_index(&self.cursor.path);
         let cur_off = self.cursor.offset;
 
-        let drained: Vec<Paragraph> = self.tdoc.paragraphs.drain(s..=e).collect();
-        if preceding {
-            tree_edit::add_paragraphs_to_container(
-                &mut self.tdoc.paragraphs[s - 1],
-                drained,
-                false,
-            );
-        } else {
-            // After draining `s..=e`, the following container sits at index `s`.
-            tree_edit::add_paragraphs_to_container(&mut self.tdoc.paragraphs[s], drained, true);
+        if !tree_edit::nest_paragraphs_into_adjacent(&mut self.tdoc, &path, s, e) {
+            return Ok(());
         }
 
         // Restore the cursor (needed for the merge), merge same-kind neighbours, then
@@ -2670,6 +2643,16 @@ fn make_header(level: u8, spans: Vec<Span>) -> Paragraph {
 fn top_index(path: &TreePath) -> Option<usize> {
     match path.segments() {
         [PathSegment::Paragraph(i)] => Some(*i),
+        _ => None,
+    }
+}
+
+/// The index a path addresses within its parent container, when that parent is a paragraph
+/// vec whose children can be nested into an adjacent sibling — the document top level
+/// (`Paragraph`) or a quote's children (`QuoteChild`). `None` for list/checklist items.
+fn sibling_index(path: &TreePath) -> Option<usize> {
+    match path.last()? {
+        PathSegment::Paragraph(i) | PathSegment::QuoteChild(i) => Some(*i),
         _ => None,
     }
 }
@@ -3630,6 +3613,48 @@ mod tests {
             panic!("expected a quote");
         };
         assert_eq!(children.len(), 2, "paragraph became a quote child");
+    }
+
+    #[test]
+    fn indent_nests_quote_child_into_preceding_list_in_quote() {
+        // A quote holding a bullet list followed by a plain paragraph (both quote children):
+        // Tab on the paragraph nests it into that preceding list, as it does at top level.
+        let mut editor = Editor::new();
+        let text = |s: &str| Paragraph::new_text().with_content(vec![Span::new_text(s)]);
+        let mut doc = markdown_to_document("x");
+        doc.paragraphs = vec![Paragraph::new_quote().with_children(vec![
+            text("quote lead"),
+            Paragraph::new_unordered_list().with_entries(vec![vec![text("item")]]),
+            text("make me an item"),
+        ])];
+        editor.set_document(doc);
+        // Cursor in the trailing paragraph (quote child 2).
+        editor.set_cursor(DocumentPosition::at(
+            TreePath::root(0).child(PathSegment::QuoteChild(2)),
+            0,
+        ));
+        assert!(editor.can_nest_selection_into_adjacent());
+
+        editor.indent().unwrap();
+        let Paragraph::Quote { children } = &editor.document().paragraphs[0] else {
+            panic!("outer quote should survive");
+        };
+        assert_eq!(
+            children.len(),
+            2,
+            "the paragraph left the quote's child list"
+        );
+        let Paragraph::UnorderedList { entries } = &children[1] else {
+            panic!("expected the bullet list to remain");
+        };
+        assert_eq!(entries.len(), 2, "the paragraph became a second list item");
+        assert_eq!(
+            editor.cursor().path,
+            TreePath::root(0)
+                .child(PathSegment::QuoteChild(1))
+                .child(PathSegment::ListEntry { entry: 1, para: 0 }),
+            "cursor follows the paragraph into the list"
+        );
     }
 
     #[test]

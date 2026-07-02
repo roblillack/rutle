@@ -50,6 +50,42 @@ fn node_at_mut<'a>(doc: &'a mut Document, path: &TreePath) -> Option<NodeMut<'a>
     Some(cur)
 }
 
+/// A shared reference to a resolved tree node (immutable counterpart of [`NodeMut`]).
+enum NodeRef<'a> {
+    Para(&'a Paragraph),
+    Check(&'a ChecklistItem),
+}
+
+/// Descend to the node at `path` (a `Paragraph` or a `ChecklistItem`), read-only.
+fn node_at<'a>(doc: &'a Document, path: &TreePath) -> Option<NodeRef<'a>> {
+    let mut segs = path.0.iter();
+    let PathSegment::Paragraph(i) = segs.next()? else {
+        return None;
+    };
+    let mut cur = NodeRef::Para(doc.paragraphs.get(*i)?);
+    for seg in segs {
+        cur = match (cur, seg) {
+            (NodeRef::Para(Paragraph::Quote { children }), PathSegment::QuoteChild(c)) => {
+                NodeRef::Para(children.get(*c)?)
+            }
+            (
+                NodeRef::Para(
+                    Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
+                ),
+                PathSegment::ListEntry { entry, para },
+            ) => NodeRef::Para(entries.get(*entry)?.get(*para)?),
+            (NodeRef::Para(Paragraph::Checklist { items }), PathSegment::ChecklistItem(c)) => {
+                NodeRef::Check(items.get(*c)?)
+            }
+            (NodeRef::Check(item), PathSegment::ChecklistItem(c)) => {
+                NodeRef::Check(item.children.get(*c)?)
+            }
+            _ => return None,
+        };
+    }
+    Some(cur)
+}
+
 fn parent_path(path: &TreePath) -> TreePath {
     TreePath(path.0[..path.0.len().saturating_sub(1)].to_vec())
 }
@@ -877,6 +913,63 @@ pub fn add_paragraphs_to_container(
     }
 }
 
+/// Whether `p` is a container paragraph (quote, list, or checklist) that paragraphs can be
+/// nested into.
+fn is_container_para(p: &Paragraph) -> bool {
+    container_kind_of(p).is_some()
+}
+
+/// Whether the sibling paragraphs `[s, e]` — in the container that holds `first_child_path`,
+/// i.e. the document top level or a single quote's children — have a sibling container
+/// immediately before them (an append target) or immediately after (a prepend target).
+pub fn has_adjacent_container(
+    doc: &Document,
+    first_child_path: &TreePath,
+    s: usize,
+    e: usize,
+) -> bool {
+    let Some((vec, _)) = sibling_slice(doc, first_child_path) else {
+        return false;
+    };
+    if e >= vec.len() {
+        return false;
+    }
+    (s > 0 && vec.get(s - 1).is_some_and(is_container_para))
+        || (e + 1 < vec.len() && vec.get(e + 1).is_some_and(is_container_para))
+}
+
+/// Move the sibling paragraphs `[s, e]` (in the container that holds `first_child_path`) into
+/// an adjacent sibling container: appended to a container immediately before them, or, failing
+/// that, prepended to one immediately after. Each paragraph becomes its own list/checklist
+/// item or quote child. Preceding takes priority. Returns whether it nested. Works at the
+/// document top level or within a quote — the inverse of lifting a child out with `[`.
+pub fn nest_paragraphs_into_adjacent(
+    doc: &mut Document,
+    first_child_path: &TreePath,
+    s: usize,
+    e: usize,
+) -> bool {
+    let Some((vec, _)) = sibling_vec_mut(doc, first_child_path) else {
+        return false;
+    };
+    if e >= vec.len() {
+        return false;
+    }
+    let preceding = s > 0 && vec.get(s - 1).is_some_and(is_container_para);
+    let following = e + 1 < vec.len() && vec.get(e + 1).is_some_and(is_container_para);
+    if !preceding && !following {
+        return false;
+    }
+    let drained: Vec<Paragraph> = vec.drain(s..=e).collect();
+    if preceding {
+        add_paragraphs_to_container(&mut vec[s - 1], drained, false);
+    } else {
+        // After draining `s..=e`, the following container now sits at index `s`.
+        add_paragraphs_to_container(&mut vec[s], drained, true);
+    }
+    true
+}
+
 /// The list kind of a paragraph node, or `None` if it is not a list/checklist.
 fn list_like_kind(p: &Paragraph) -> Option<ListKind> {
     match p {
@@ -918,6 +1011,22 @@ fn sibling_vec_mut<'a>(
             let qp = parent_path(child_path);
             match node_at_mut(doc, &qp)? {
                 NodeMut::Para(Paragraph::Quote { children }) => Some((children, *c)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Immutable counterpart of [`sibling_vec_mut`]: the slice of siblings (document top level or
+/// a quote's children) holding the node at `child_path`, plus that node's index within it.
+fn sibling_slice<'a>(doc: &'a Document, child_path: &TreePath) -> Option<(&'a [Paragraph], usize)> {
+    match child_path.0.last()? {
+        PathSegment::Paragraph(i) => Some((&doc.paragraphs, *i)),
+        PathSegment::QuoteChild(c) => {
+            let qp = parent_path(child_path);
+            match node_at(doc, &qp)? {
+                NodeRef::Para(Paragraph::Quote { children }) => Some((children, *c)),
                 _ => None,
             }
         }

@@ -57,13 +57,15 @@ fixes. Additive to the public API.
   and lifts an item of a checklist nested inside an ordered/unordered list entry
   back out to the outer list's level as a checklist (keeping its checkbox) — the
   inverse of nesting a checklist under a bullet item, instead of delisting it into
-  a plain text paragraph. And `indent` nests the selected top-level paragraph(s)
-  into an adjacent
-  container — appended to a container immediately before them, or prepended to one
-  immediately after — each paragraph becoming a new list item / checklist item /
-  quote child. (`nest_into_preceding_container` → `nest_selection_into_adjacent`;
-  `cursor_can_nest_into_preceding` → `can_nest_selection_into_adjacent`; new
-  `tree_edit::add_paragraphs_to_container`.)
+  a plain text paragraph. And `indent` nests the selected paragraph(s) into an
+  adjacent container — appended to a container immediately before them, or prepended
+  to one immediately after — each paragraph becoming a new list item / checklist item
+  / quote child. This works both at the document top level and among a quote's
+  children (a plain paragraph inside a quote nests into a list that is also inside
+  that quote), not just at the top level. (`nest_into_preceding_container` →
+  `nest_selection_into_adjacent`; `cursor_can_nest_into_preceding` →
+  `can_nest_selection_into_adjacent`; new `tree_edit::add_paragraphs_to_container`,
+  `has_adjacent_container`, and `nest_paragraphs_into_adjacent`.)
 - `indent_list_item` merges the indented item into whatever ordered/unordered
   sublist already ends the previous item, regardless of kind (a bullet indented
   under an item ending in a numbered sublist joins that numbered sublist, and vice
