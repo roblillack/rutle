@@ -631,6 +631,11 @@ pub struct Renderer {
     layout_leaves: Vec<LeafInfo>,
     // The renderable block for each leaf, parallel to `layout_leaves`.
     layout_blocks: Vec<Block>,
+    // The x-position (relative to `self.x`) of each enclosing quote bar for every
+    // leaf, outermost→innermost; empty for leaves outside a quote. Parallel to
+    // `layout_leaves`. Precomputed at layout time because a bar's column depends on
+    // the leaf's interleaved list nesting (see `quote_bar_positions`).
+    layout_leaf_bars: Vec<Vec<i32>>,
     layout_valid: bool,
     // Monotonic counter bumped every time mutable access to the editor is handed
     // out (i.e. on every potential document mutation). Consumers key derived,
@@ -679,6 +684,7 @@ impl Renderer {
             table_layouts: Vec::new(),
             layout_leaves: Vec::new(),
             layout_blocks: Vec::new(),
+            layout_leaf_bars: Vec::new(),
             layout_valid: false,
             edit_revision: 0,
             scroll_offset: 0,
@@ -900,8 +906,16 @@ impl Renderer {
             );
         }
 
+        // Precompute the quote-bar columns for every leaf now that markers (whose
+        // widths need `ctx`) are resolvable; `draw()` only reads them.
+        let mut leaf_bars = Vec::with_capacity(blocks.len());
+        for block_idx in 0..blocks.len() {
+            leaf_bars.push(self.quote_bar_positions(&blocks, &leaves, block_idx, ctx));
+        }
+
         self.layout_leaves = leaves;
         self.layout_blocks = blocks;
+        self.layout_leaf_bars = leaf_bars;
         self.layout_valid = true;
     }
 
@@ -1438,6 +1452,56 @@ impl Renderer {
         }
         let pf = self.theme.plain_text;
         ctx.text_width("• ", pf.font_type, pf.font_style, pf.font_size) as i32
+    }
+
+    /// The x-position (relative to `self.x`) of each quote bar enclosing the leaf at
+    /// `block_idx`, ordered outermost→innermost; empty when the leaf is not quoted.
+    ///
+    /// The flat `quote_depth`/`list_levels` counts drop the *order* in which quotes and
+    /// lists nest, but the tree path preserves it. Walking the path, each quote bar is
+    /// placed at the left edge of the region it opens — so a quote nested inside a list
+    /// item's content (Quote > List > Quote) gets its bar shifted right to line up with
+    /// that content, instead of hugging the outer bar. The running offset mirrors the
+    /// content indent math in `layout_block` (quote levels add `quote_indent`; list
+    /// levels add the same `font + step*(n-1) + marker` used for `interior_x`), so the
+    /// innermost bar lands exactly one `quote_indent` left of the leaf's text.
+    fn quote_bar_positions(
+        &self,
+        blocks: &[Block],
+        leaves: &[tree_walk::LeafInfo],
+        block_idx: usize,
+        ctx: &mut dyn RenderContext,
+    ) -> Vec<i32> {
+        let info = &leaves[block_idx];
+        if info.quote_depth == 0 {
+            return Vec::new();
+        }
+        let pf = self.theme.plain_text;
+        let font = pf.font_size as i32;
+        let step = font.max(self.theme.list_indent);
+        let marker_w = self.governing_marker_pad_width(blocks, leaves, block_idx, ctx);
+        // Indent contributed by `l` enclosing list levels, matching `interior_x`.
+        let list_part = |l: i32| if l <= 0 { 0 } else { font + step * (l - 1) + marker_w };
+
+        let mut quotes = 0i32;
+        let mut lists = 0i32;
+        let mut bars = Vec::with_capacity(info.quote_depth);
+        for seg in info.path.segments() {
+            match seg {
+                PathSegment::QuoteChild(_) => {
+                    bars.push(
+                        self.theme.padding_horizontal
+                            + quotes * self.theme.quote_indent
+                            + list_part(lists)
+                            + self.theme.quote_bar_offset,
+                    );
+                    quotes += 1;
+                }
+                PathSegment::ListEntry { .. } | PathSegment::ChecklistItem(_) => lists += 1,
+                PathSegment::Paragraph(_) => {}
+            }
+        }
+        bars
     }
 
     /// Layout a single block. `blocks`/`leaves` are the full frame slices (for sibling
@@ -2671,6 +2735,50 @@ impl Renderer {
         }
     }
 
+    /// Draw the vertical quote bars for every visible line.
+    ///
+    /// A bar is drawn from a line's top down to the *next* line's top whenever that
+    /// next line carries the same bar (same nesting level, same column) — bridging the
+    /// inter-paragraph / inter-block gaps so a multi-paragraph quote (or a quote broken
+    /// up by list items and nested content) renders as one unbroken rule instead of a
+    /// dashed stack of segments. When the next line drops the level, the bar stops at
+    /// the current line's bottom. Columns come from `layout_leaf_bars`, which already
+    /// shifts inner bars right to account for interleaved list nesting.
+    fn draw_quote_bars(&self, ctx: &mut dyn RenderContext, viewport_top: i32, viewport_bottom: i32) {
+        ctx.set_color(self.theme.quote_bar_color);
+        let lh = self.theme.line_height.max(1);
+        for (i, line) in self.layout_lines.iter().enumerate() {
+            let bars = match self.layout_leaf_bars.get(line.block_index) {
+                Some(b) if !b.is_empty() => b,
+                _ => continue,
+            };
+            let next = self.layout_lines.get(i + 1);
+            let next_bars = next.and_then(|nl| self.layout_leaf_bars.get(nl.block_index));
+            for (level, &bx) in bars.iter().enumerate() {
+                // Bridge the gap to the next line only when it shares this exact bar.
+                let bottom_content = match (next, next_bars) {
+                    (Some(nl), Some(nb)) if nb.get(level) == Some(&bx) => nl.y,
+                    _ => line.y + line.height,
+                };
+                if bottom_content < viewport_top || line.y > viewport_bottom {
+                    continue;
+                }
+                let x = self.x + bx;
+                let top_y = self.y + line.y - self.scroll_offset;
+                let bottom_y = self.y + bottom_content - self.scroll_offset;
+                if self.theme.quote_bar_as_text {
+                    let mut ry = top_y;
+                    while ry < bottom_y {
+                        ctx.draw_text("|", x, ry);
+                        ry += lh;
+                    }
+                } else {
+                    ctx.draw_line(x, top_y, x, bottom_y);
+                }
+            }
+        }
+    }
+
     /// Draw the widget
     pub fn draw(&mut self, ctx: &mut dyn RenderContext) {
         self.layout(ctx);
@@ -2694,29 +2802,13 @@ impl Renderer {
         self.draw_heading_underlines(ctx);
         self.draw_code_fences(ctx);
 
+        // Vertical quote bars run behind the text so a quote's paragraphs, list
+        // items and nested content read as one continuous rule.
+        self.draw_quote_bars(ctx, viewport_top, viewport_bottom);
+
         for line in &self.layout_lines {
             if line.y + line.height < viewport_top || line.y > viewport_bottom {
                 continue;
-            }
-
-            // Draw a vertical bar per enclosing quote level for any line inside a quote —
-            // including list items, code blocks, and continuation paragraphs, whose flat
-            // block type no longer records the quote. A short segment is drawn per line.
-            if let Some(info) = self.layout_leaves.get(line.block_index) {
-                ctx.set_color(self.theme.quote_bar_color);
-                let bar_y1 = self.y + line.y - self.scroll_offset;
-                let bar_y2 = bar_y1 + line.height;
-                for level in 0..info.quote_depth as i32 {
-                    let bar_x = self.x
-                        + self.theme.padding_horizontal
-                        + level * self.theme.quote_indent
-                        + self.theme.quote_bar_offset;
-                    if self.theme.quote_bar_as_text {
-                        ctx.draw_text("|", bar_x, bar_y1);
-                    } else {
-                        ctx.draw_line(bar_x, bar_y1, bar_x, bar_y2);
-                    }
-                }
             }
 
             // Resolve the hovered link (if any) to this frame's leaf index for comparison.
@@ -3733,6 +3825,59 @@ mod tests {
                 info.path
             );
         }
+    }
+
+    #[test]
+    fn nested_quote_bar_aligns_with_list_content() {
+        // Quote > unordered list > quote. The inner quote's bar must sit at the list
+        // item's content column (not hug the outer bar), and the inner quote's text
+        // must sit one quote-step past that inner bar.
+        let md = "> Outer\n>\n> - Item\n>\n>   Cont\n>\n>   > Inner";
+        let doc = crate::markdown_converter::markdown_to_document(md);
+        let mut display = Renderer::new(0, 0, 600, 400);
+        display.editor_mut().set_document(doc);
+        let mut ctx = TestRenderContext::new_with_focus();
+        display.layout(&mut ctx);
+
+        let bars_of = |needle: &str| -> Vec<i32> {
+            let idx = display
+                .layout_lines
+                .iter()
+                .find(|l| l.runs.iter().any(|r| r.text.starts_with(needle)))
+                .map(|l| l.block_index)
+                .unwrap_or_else(|| panic!("no line starting with {needle:?}"));
+            display.layout_leaf_bars[idx].clone()
+        };
+        let x_of = |needle: &str| -> i32 {
+            display
+                .layout_lines
+                .iter()
+                .flat_map(|l| &l.runs)
+                .find(|r| r.text.starts_with(needle))
+                .map(|r| r.x)
+                .unwrap_or_else(|| panic!("no run starting with {needle:?}"))
+        };
+
+        let pad = display.theme.padding_horizontal;
+        let qi = display.theme.quote_indent;
+        let off = display.theme.quote_bar_offset;
+
+        // Single-quote lines get one bar, flush at the outer quote column.
+        assert_eq!(bars_of("Outer"), vec![pad + off]);
+        assert_eq!(bars_of("Cont"), vec![pad + off]);
+
+        // The nested-quote line gets two bars: the outer flush left, the inner shifted
+        // right to sit at the list item's content column ("Cont").
+        let inner_bars = bars_of("Inner");
+        assert_eq!(inner_bars.len(), 2, "nested quote should have two bars");
+        assert_eq!(inner_bars[0], pad + off, "outer bar stays flush left");
+        assert_eq!(
+            inner_bars[1],
+            x_of("Cont") + off,
+            "inner bar aligns with the list item's content column"
+        );
+        // The inner quote's own text sits one quote-step past the list content.
+        assert_eq!(x_of("Inner"), x_of("Cont") + qi);
     }
 
     #[test]
