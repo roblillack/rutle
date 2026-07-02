@@ -875,6 +875,80 @@ fn exit_quote_to_container(
     Some(container_child_path(quote_path, base + moved_start))
 }
 
+/// Lift entry `entry` of the list that is child `c` of a quote (`list_path` points at the
+/// list) out of that quote while keeping it a list item: the quote is split around the list,
+/// the moved entry becomes a single-entry list of the same kind placed between the halves in
+/// the quote's container, and any entries before/after it — plus the quote's other children —
+/// stay in quote halves. The inverse of nesting a list item into a preceding quote with Tab
+/// (mirrors `exit_quote_to_container`, but the lifted thing stays a list). Returns the moved
+/// item's new path.
+fn exit_quote_list_item(
+    doc: &mut Document,
+    list_path: &TreePath,
+    entry: usize,
+    para: usize,
+) -> Option<TreePath> {
+    let PathSegment::QuoteChild(c) = list_path.0.last()?.clone() else {
+        return None;
+    };
+    let ordered = match node_at_mut(doc, list_path)? {
+        NodeMut::Para(p) => list_ordered(p)?,
+        _ => return None,
+    };
+    let quote_path = parent_path(list_path);
+    let children = match node_at_mut(doc, &quote_path)? {
+        NodeMut::Para(Paragraph::Quote { children }) => {
+            if c >= children.len() {
+                return None;
+            }
+            std::mem::take(children)
+        }
+        _ => return None,
+    };
+    // Split the quote's children around the list, and the list's entries around `entry`.
+    let mut before_children = children;
+    let after_children = before_children.split_off(c + 1);
+    let list_para = before_children.pop()?; // the list itself
+    let entries = match list_para {
+        Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries } => entries,
+        _ => return None,
+    };
+    if entry >= entries.len() {
+        return None;
+    }
+    let mut before_entries = entries;
+    let after_entries = before_entries.split_off(entry + 1);
+    let moved = before_entries.pop()?; // the entry's paragraphs
+
+    // The quote half kept before the lifted item: its earlier children, then any earlier
+    // entries as a list. The half after: any later entries as a list, then its later children.
+    let mut before_half = before_children;
+    if !before_entries.is_empty() {
+        before_half.push(new_list(ordered, before_entries));
+    }
+    let mut after_half: Vec<Paragraph> = Vec::new();
+    if !after_entries.is_empty() {
+        after_half.push(new_list(ordered, after_entries));
+    }
+    after_half.extend(after_children);
+
+    let mut replacement: Vec<Paragraph> = Vec::new();
+    if !before_half.is_empty() {
+        replacement.push(Paragraph::new_quote().with_children(before_half));
+    }
+    let moved_start = replacement.len();
+    replacement.push(new_list(ordered, vec![moved]));
+    if !after_half.is_empty() {
+        replacement.push(Paragraph::new_quote().with_children(after_half));
+    }
+
+    let base = container_splice(doc, &quote_path, replacement)?;
+    Some(
+        container_child_path(&quote_path, base + moved_start)
+            .child(PathSegment::ListEntry { entry: 0, para }),
+    )
+}
+
 /// Add `paras` to `container` as new items — each paragraph becoming its own list entry /
 /// checklist item, or a quote child — at the start (`at_start`) or the end. Used to nest a
 /// selection of top-level paragraphs into an adjacent list/quote/checklist.
@@ -1185,10 +1259,88 @@ fn merge_first_item_into_preceding_list(doc: &mut Document, path: &TreePath) -> 
     indent_list_item(doc, &appended_path).or(Some(appended_path))
 }
 
+/// Move the first entry of the ordered/unordered list containing `path` into the list's
+/// immediately preceding sibling when that sibling is a quote (at the document top level or
+/// within a quote) — nesting the item *into* the quote while keeping it a list item, i.e. as
+/// an entry of a list child of the quote (joining a trailing list there if present, otherwise
+/// a new list of the same kind). The item stays a bullet/number, now inside the quote. The
+/// outer list is pruned when it empties. Lists preceding are handled by
+/// [`merge_first_item_into_preceding_list`] instead (a checklist cannot hold a list). Returns
+/// the moved item's new path, or `None` if `path` is not the first entry of such a list.
+fn nest_first_item_into_preceding_quote(doc: &mut Document, path: &TreePath) -> Option<TreePath> {
+    // Only the first entry of an ordered/unordered list qualifies (cursor anywhere in it).
+    if !matches!(path.0.last()?, PathSegment::ListEntry { entry: 0, .. }) {
+        return None;
+    }
+    let list_path = parent_path(path);
+    let (vec, idx) = sibling_slice(doc, &list_path)?;
+    if idx == 0 || container_kind_of(vec.get(idx - 1)?)? != ContainerKind::Quote {
+        return None;
+    }
+    // Detach the first entry, remembering the list's kind so the item stays the same kind.
+    let ordered = match node_at_mut(doc, &list_path)? {
+        NodeMut::Para(p) => list_ordered(p)?,
+        _ => return None,
+    };
+    let moved = match node_at_mut(doc, &list_path)? {
+        NodeMut::Para(
+            Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
+        ) => {
+            if entries.is_empty() {
+                return None;
+            }
+            entries.remove(0)
+        }
+        _ => return None,
+    };
+    let emptied = matches!(
+        node_at_mut(doc, &list_path),
+        Some(NodeMut::Para(
+            Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
+        )) if entries.is_empty()
+    );
+    // Add the entry to the quote as a list child — reusing a trailing list there, else a new
+    // list of the same kind — so the item remains a list item, now inside the quote.
+    let (cvec, cidx) = sibling_vec_mut(doc, &list_path)?;
+    let prev = cidx - 1;
+    let (qchild, entry_idx) = match &mut cvec[prev] {
+        Paragraph::Quote { children } => {
+            if matches!(children.last(), Some(p) if list_ordered(p).is_some()) {
+                let qi = children.len() - 1;
+                match &mut children[qi] {
+                    Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries } => {
+                        entries.push(moved);
+                        (qi, entries.len() - 1)
+                    }
+                    _ => return None,
+                }
+            } else {
+                children.push(new_list(ordered, vec![moved]));
+                (children.len() - 1, 0)
+            }
+        }
+        _ => return None,
+    };
+    if emptied {
+        cvec.remove(cidx); // `prev < cidx`, so the quote's index is unaffected
+    }
+    Some(
+        with_last_index(&list_path, prev)
+            .child(PathSegment::QuoteChild(qchild))
+            .child(PathSegment::ListEntry {
+                entry: entry_idx,
+                para: 0,
+            }),
+    )
+}
+
 /// Indent the list/checklist item at `path`, or — for the first item of a top-level list
-/// that follows another list — merge it into that preceding list.
+/// that follows another list — merge it into that preceding list, or — for the first item of
+/// a list that follows a quote — nest it into that quote (keeping it a list item).
 pub fn indent_list_item_or_merge(doc: &mut Document, path: &TreePath) -> Option<TreePath> {
-    indent_list_item(doc, path).or_else(|| merge_first_item_into_preceding_list(doc, path))
+    indent_list_item(doc, path)
+        .or_else(|| merge_first_item_into_preceding_list(doc, path))
+        .or_else(|| nest_first_item_into_preceding_quote(doc, path))
 }
 
 pub fn indent_list_item(doc: &mut Document, path: &TreePath) -> Option<TreePath> {
@@ -1295,9 +1447,27 @@ pub fn indent_list_item(doc: &mut Document, path: &TreePath) -> Option<TreePath>
 }
 
 /// Outdent the list/checklist item at `path` one level: into the parent list/checklist if
-/// nested, otherwise out of the list into its container (as a paragraph). Returns the new
-/// path, or `None` for a non-list-item leaf.
+/// nested, out of an enclosing quote as a list item if the list sits directly in a quote,
+/// otherwise out of the list into its container (as a paragraph). Returns the new path, or
+/// `None` for a non-list-item leaf. This is the Shift-Tab / `[` behavior, which reduces
+/// nesting while preserving list-ness.
 pub fn outdent_list_item(doc: &mut Document, path: &TreePath) -> Option<TreePath> {
+    outdent_list_item_inner(doc, path, true)
+}
+
+/// Like [`outdent_list_item`], but a list item nested directly in a quote is *delisted* into
+/// the quote as a plain paragraph (losing its bullet) rather than lifted out of the quote as a
+/// list. Used where outdenting means "stop being a list item" — Enter on an empty item, and
+/// toggling a list off — instead of "reduce nesting."
+pub fn outdent_list_item_delisting(doc: &mut Document, path: &TreePath) -> Option<TreePath> {
+    outdent_list_item_inner(doc, path, false)
+}
+
+fn outdent_list_item_inner(
+    doc: &mut Document,
+    path: &TreePath,
+    keep_list_in_quote: bool,
+) -> Option<TreePath> {
     let last = path.0.last()?.clone();
     let pp = parent_path(path);
     match last {
@@ -1356,6 +1526,13 @@ pub fn outdent_list_item(doc: &mut Document, path: &TreePath) -> Option<TreePath
                     entry: outer_e + 1,
                     para,
                 }))
+            }
+            // A list nested directly in a quote: lift the item out of the quote, keeping it a
+            // list item (splitting the quote around it) — the inverse of Tab nesting a list
+            // item into a preceding quote — unless we are delisting, in which case fall through
+            // to drop it into the quote as a plain text child.
+            Some(PathSegment::QuoteChild(_)) if keep_list_in_quote => {
+                exit_quote_list_item(doc, &pp, entry, para)
             }
             _ => exit_list_to_container(doc, &pp, entry, para),
         },

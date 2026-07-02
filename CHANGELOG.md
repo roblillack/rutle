@@ -57,7 +57,13 @@ fixes. Additive to the public API.
   and lifts an item of a checklist nested inside an ordered/unordered list entry
   back out to the outer list's level as a checklist (keeping its checkbox) — the
   inverse of nesting a checklist under a bullet item, instead of delisting it into
-  a plain text paragraph. And `indent` nests the selected paragraph(s) into an
+  a plain text paragraph. It further lifts a list item whose list sits **directly
+  in a quote** out of that quote *keeping its bullet* (splitting the quote around
+  it, via the new `exit_quote_list_item`) — the inverse of Tab nesting a list item
+  into a preceding quote. Contexts that mean "stop being a list item" (Enter on an
+  empty item, toggling a list off) instead use the new
+  `outdent_list_item_delisting`, which drops such an item into the quote as a plain
+  paragraph. And `indent` nests the selected paragraph(s) into an
   adjacent container — appended to a container immediately before them, or prepended
   to one immediately after — each paragraph becoming a new list item / checklist item
   / quote child. This works both at the document top level and among a quote's
@@ -76,7 +82,12 @@ fixes. Additive to the public API.
   *checklist* following an ordered/unordered list: its first item nests under the
   preceding list's last item as a checklist sublist (checkboxes preserved),
   reusing a trailing checklist so a whole selected run collects into one sublist
-  rather than staircasing.
+  rather than staircasing. And when a list's first item follows a **quote** instead
+  of another list, `indent_list_item_or_merge` now nests that item *into* the quote
+  while keeping it a list item — as an entry of a list child of the quote (joining a
+  trailing list there, else a new list of the same kind) — pruning the outer list if
+  it empties, so a bullet item directly below a quote can be pulled into the quote
+  with Tab and stay a bullet.
 
 ### Fixed
 

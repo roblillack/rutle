@@ -734,7 +734,9 @@ impl Editor {
                         | PathSegment::QuoteChild(_)
                 )
             ) {
-                return self.outdent_list_item();
+                // Enter on an empty item drops list-ness (an empty item in a quote becomes a
+                // plain quote paragraph, not a lifted-out list), so delist rather than unnest.
+                return self.outdent_list_item_delisting();
             }
         }
         let offset = self.cursor.offset;
@@ -2236,7 +2238,9 @@ impl Editor {
                 }
                 return match self.cursor_top_level_list_index() {
                     Some(i) => self.unwrap_list_at(i),
-                    None => self.outdent_list_item(),
+                    // Toggling a list off means "no longer a list", so delist (a list in a
+                    // quote becomes plain quote paragraphs) rather than lifting it out.
+                    None => self.outdent_list_item_delisting(),
                 };
             }
             // Different kind → convert just the containing list, keeping the nesting intact.
@@ -2418,11 +2422,19 @@ impl Editor {
     }
 
     /// Move the current list item — or every list item in the selection — out one nesting
-    /// level, or out of the list entirely (Shift-Tab).
+    /// level, or out of the list entirely (Shift-Tab). A list item directly inside a quote is
+    /// lifted out of the quote *keeping its bullet* (the inverse of Tab nesting it in).
     pub fn outdent_list_item(&mut self) -> EditResult {
         // Bottom-up: each item's selected followers are lifted out before the earlier items
         // are processed, so they land side by side rather than being re-adopted as children.
         self.shift_list_items(tree_edit::outdent_list_item, true)
+    }
+
+    /// Like [`Self::outdent_list_item`], but delisting: a list item inside a quote drops into
+    /// the quote as a plain paragraph rather than being lifted out as a list. Used where the
+    /// intent is to stop being a list item — Enter on an empty item, and toggling a list off.
+    fn outdent_list_item_delisting(&mut self) -> EditResult {
+        self.shift_list_items(tree_edit::outdent_list_item_delisting, true)
     }
 
     /// Apply a single-item list move (`op`, e.g. indent/outdent) to every list item in the
@@ -3654,6 +3666,196 @@ mod tests {
                 .child(PathSegment::QuoteChild(1))
                 .child(PathSegment::ListEntry { entry: 1, para: 0 }),
             "cursor follows the paragraph into the list"
+        );
+    }
+
+    #[test]
+    fn indent_second_item_in_quote_nests_under_previous_item() {
+        // A list inside a quote, whose first item ends in an inner quote, followed by a second
+        // item: Tab nests the second item one level deeper under the first (as it does at the
+        // top level), landing it in a new sublist after the inner quote.
+        let mut editor = Editor::new();
+        let text = |s: &str| Paragraph::new_text().with_content(vec![Span::new_text(s)]);
+        let mut doc = markdown_to_document("x");
+        doc.paragraphs = vec![Paragraph::new_quote().with_children(vec![
+            text("q lead"),
+            Paragraph::new_unordered_list().with_entries(vec![
+                vec![
+                    text("item one"),
+                    Paragraph::new_quote().with_children(vec![text("inner quote")]),
+                ],
+                vec![text("tab me")],
+            ]),
+        ])];
+        editor.set_document(doc);
+        let second_item = TreePath::root(0)
+            .child(PathSegment::QuoteChild(1))
+            .child(PathSegment::ListEntry { entry: 1, para: 0 });
+        editor.set_cursor(DocumentPosition::at(second_item, 0));
+        assert!(editor.cursor_can_indent());
+
+        editor.indent().unwrap();
+        let Paragraph::Quote { children } = &editor.document().paragraphs[0] else {
+            panic!("outer quote should survive");
+        };
+        let Paragraph::UnorderedList { entries } = &children[1] else {
+            panic!("expected the bullet list");
+        };
+        assert_eq!(
+            entries.len(),
+            1,
+            "the second item left the outer list level"
+        );
+        assert_eq!(
+            entries[0].len(),
+            3,
+            "item one now holds its text, the inner quote, and the nested sublist"
+        );
+        assert!(
+            matches!(entries[0][1], Paragraph::Quote { .. }),
+            "the inner quote is untouched"
+        );
+        let Paragraph::UnorderedList { entries: sub } = &entries[0][2] else {
+            panic!("the second item nested into a new sublist after the quote");
+        };
+        assert_eq!(sub.len(), 1, "the nested sublist holds the indented item");
+        assert_eq!(
+            editor.cursor().path,
+            TreePath::root(0)
+                .child(PathSegment::QuoteChild(1))
+                .child(PathSegment::ListEntry { entry: 0, para: 2 })
+                .child(PathSegment::ListEntry { entry: 0, para: 0 }),
+            "cursor follows the item into the sublist"
+        );
+    }
+
+    #[test]
+    fn indent_first_list_item_after_quote_nests_into_quote() {
+        // A top-level quote directly followed by a top-level bullet list: Tab on the list's
+        // (first) item moves it *into* the quote but keeps it a list item — as an entry of a
+        // list child of the quote — and the emptied outer list is pruned.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("> This is a quote\n\n- tab me"));
+        let item = TreePath::root(1).child(PathSegment::ListEntry { entry: 0, para: 0 });
+        editor.set_cursor(DocumentPosition::at(item, 0));
+        assert!(editor.cursor_can_indent());
+
+        editor.indent().unwrap();
+        assert_eq!(
+            editor.document().paragraphs.len(),
+            1,
+            "the emptied outer list was removed; only the quote remains"
+        );
+        let Paragraph::Quote { children } = &editor.document().paragraphs[0] else {
+            panic!("expected the quote to absorb the item");
+        };
+        assert_eq!(
+            children.len(),
+            2,
+            "quote now holds its text plus a list child"
+        );
+        let Paragraph::UnorderedList { entries } = &children[1] else {
+            panic!("the item stays a bullet list, now inside the quote");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0][0].content()[0].text, "tab me");
+        assert_eq!(
+            editor.cursor().path,
+            TreePath::root(0)
+                .child(PathSegment::QuoteChild(1))
+                .child(PathSegment::ListEntry { entry: 0, para: 0 }),
+            "cursor follows the item into the quote's list"
+        );
+    }
+
+    #[test]
+    fn indent_first_list_item_after_quote_keeps_remaining_items() {
+        // Only the first item moves into the quote; later items stay in the outer list.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("> quote\n\n- one\n- two"));
+        let first = TreePath::root(1).child(PathSegment::ListEntry { entry: 0, para: 0 });
+        editor.set_cursor(DocumentPosition::at(first, 0));
+        editor.indent().unwrap();
+        assert_eq!(
+            editor.document().paragraphs.len(),
+            2,
+            "quote + the leftover list"
+        );
+        let Paragraph::Quote { children } = &editor.document().paragraphs[0] else {
+            panic!("expected the quote");
+        };
+        assert_eq!(
+            children.len(),
+            2,
+            "the first item joined the quote as a list child"
+        );
+        let Paragraph::UnorderedList { entries } = &children[1] else {
+            panic!("the moved item stays a bullet list inside the quote");
+        };
+        assert_eq!(entries[0][0].content()[0].text, "one");
+        let Paragraph::UnorderedList { entries } = &editor.document().paragraphs[1] else {
+            panic!("expected the remaining list");
+        };
+        assert_eq!(entries.len(), 1, "one item left in the outer list");
+        assert_eq!(entries[0][0].content()[0].text, "two");
+    }
+
+    #[test]
+    fn outdent_list_item_in_quote_lifts_out_keeping_bullet() {
+        // The inverse of Tab: a bullet list nested inside a quote — Shift-Tab on its item
+        // lifts it out of the quote as a top-level list item (not a plain text paragraph).
+        let mut editor = Editor::new();
+        let mut doc = markdown_to_document("x");
+        doc.paragraphs = vec![Paragraph::new_quote().with_children(vec![
+            Paragraph::new_text().with_content(vec![Span::new_text("This is a quote")]),
+            Paragraph::new_unordered_list().with_entries(vec![vec![
+                Paragraph::new_text().with_content(vec![Span::new_text("tab me")]),
+            ]]),
+        ])];
+        editor.set_document(doc);
+        editor.set_cursor(DocumentPosition::at(
+            TreePath::root(0)
+                .child(PathSegment::QuoteChild(1))
+                .child(PathSegment::ListEntry { entry: 0, para: 0 }),
+            0,
+        ));
+
+        editor.outdent_list_item().unwrap();
+        assert_eq!(
+            editor.document().paragraphs.len(),
+            2,
+            "the item left the quote as a sibling list"
+        );
+        let Paragraph::Quote { children } = &editor.document().paragraphs[0] else {
+            panic!("the quote keeps its own text");
+        };
+        assert_eq!(children.len(), 1, "only the quote's text remains inside it");
+        let Paragraph::UnorderedList { entries } = &editor.document().paragraphs[1] else {
+            panic!("the item stays a bullet list, now outside the quote");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0][0].content()[0].text, "tab me");
+        assert_eq!(
+            editor.cursor().path,
+            TreePath::root(1).child(PathSegment::ListEntry { entry: 0, para: 0 }),
+        );
+    }
+
+    #[test]
+    fn indent_then_outdent_list_item_across_quote_round_trips() {
+        // Tab into the preceding quote, then Shift-Tab back out, restores the original tree.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("> quote\n\n- tab me"));
+        let before = format!("{:?}", editor.document().paragraphs);
+        let item = TreePath::root(1).child(PathSegment::ListEntry { entry: 0, para: 0 });
+        editor.set_cursor(DocumentPosition::at(item, 0));
+
+        editor.indent().unwrap(); // into the quote
+        editor.outdent_list_item().unwrap(); // back out
+        assert_eq!(
+            format!("{:?}", editor.document().paragraphs),
+            before,
+            "indent into the quote then outdent restores the original structure"
         );
     }
 
