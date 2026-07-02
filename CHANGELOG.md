@@ -26,8 +26,10 @@ fixes. Additive to the public API.
   a container's children up one level), `merge_adjacent_lists`, `delist_item`
   (lift a list item out into its enclosing container), `convert_list_item_range`
   (carve a contiguous run of items out of a list into a new list of another kind,
-  splitting the original into up to three siblings), and `split_leaf_continuation`
-  (split a list item into a continuation paragraph within the same item).
+  splitting the original into up to three siblings), `split_leaf_continuation`
+  (split a list item into a continuation paragraph within the same item), and
+  `split_list_entry` (peel a list item's continuation paragraph off into a new
+  item of the same list).
   `convert_container` / `dissolve_container` / `delist_item` also handle containers
   nested inside a list item, not just at the top level or in a quote.
 - `Editor` block-model methods: `wrap_selection(ContainerKind)` (wrap the
@@ -76,6 +78,14 @@ fixes. Additive to the public API.
 
 ### Fixed
 
+- `insert_newline` (Enter) in an empty paragraph now promotes it one structural
+  level per press instead of dissolving its enclosing list item. An empty
+  *continuation* paragraph in a multi-paragraph list item splits off into a new
+  item (via the new `split_list_entry`) rather than lifting the item's other
+  paragraphs out with it; a genuinely empty item still exits its list; and an
+  empty quote child now exits the quote as well (previously Enter there created
+  another empty quote child). So repeated Enter walks an empty leaf out one
+  container at a time.
 - Nested list items now indent per level in a cell backend (the renderer used the
   font `font_size` as the per-level step, which cell backends force to `0`, so
   nesting collapsed flat). See `Theme::list_indent`.

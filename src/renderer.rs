@@ -1481,7 +1481,13 @@ impl Renderer {
         let step = font.max(self.theme.list_indent);
         let marker_w = self.governing_marker_pad_width(blocks, leaves, block_idx, ctx);
         // Indent contributed by `l` enclosing list levels, matching `interior_x`.
-        let list_part = |l: i32| if l <= 0 { 0 } else { font + step * (l - 1) + marker_w };
+        let list_part = |l: i32| {
+            if l <= 0 {
+                0
+            } else {
+                font + step * (l - 1) + marker_w
+            }
+        };
 
         let mut quotes = 0i32;
         let mut lists = 0i32;
@@ -2744,7 +2750,12 @@ impl Renderer {
     /// dashed stack of segments. When the next line drops the level, the bar stops at
     /// the current line's bottom. Columns come from `layout_leaf_bars`, which already
     /// shifts inner bars right to account for interleaved list nesting.
-    fn draw_quote_bars(&self, ctx: &mut dyn RenderContext, viewport_top: i32, viewport_bottom: i32) {
+    fn draw_quote_bars(
+        &self,
+        ctx: &mut dyn RenderContext,
+        viewport_top: i32,
+        viewport_bottom: i32,
+    ) {
         ctx.set_color(self.theme.quote_bar_color);
         let lh = self.theme.line_height.max(1);
         for (i, line) in self.layout_lines.iter().enumerate() {

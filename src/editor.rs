@@ -714,10 +714,28 @@ impl Editor {
         if self.is_table_leaf(&path) {
             return Ok(());
         }
-        // Enter on an empty list/checklist item outdents one level (and exits the list at
-        // the top level) rather than creating another empty item.
-        if self.cursor_is_list_item() && self.leaf_text_len(&path) == 0 {
-            return self.outdent_list_item();
+        // Enter in an empty block promotes it up one structural level rather than inserting
+        // another empty sibling, so repeated Enter walks it out one container per press:
+        //   - an empty *continuation* paragraph in a multi-paragraph list item splits off
+        //     into a new item of that list (its content is preserved, not dissolved);
+        //   - a genuinely empty item, or an empty quote child, exits its container.
+        if self.leaf_text_len(&path) == 0 {
+            if let Some(new_path) = tree_edit::split_list_entry(&mut self.tdoc, &path) {
+                self.cursor = DocumentPosition::at(new_path, 0);
+                self.normalize_cursor();
+                self.trigger_paragraph_change();
+                return Ok(());
+            }
+            if matches!(
+                path.last(),
+                Some(
+                    PathSegment::ListEntry { .. }
+                        | PathSegment::ChecklistItem(_)
+                        | PathSegment::QuoteChild(_)
+                )
+            ) {
+                return self.outdent_list_item();
+            }
         }
         let offset = self.cursor.offset;
         if let Some(new_path) = tree_edit::split_leaf(&mut self.tdoc, &path, offset) {
@@ -4089,6 +4107,146 @@ mod tests {
         editor.delete_backward().unwrap(); // delete "a" → empty item
         editor.insert_newline().unwrap(); // empty item + Enter → exit to paragraph
         assert!(matches!(editor.current_block_type(), BlockType::Paragraph));
+    }
+
+    #[test]
+    fn enter_on_empty_continuation_para_makes_new_item_not_dissolve() {
+        // A list item with real content plus an empty trailing (continuation) paragraph:
+        // Enter must peel the empty paragraph off into a new item, not dissolve the item.
+        let mut editor = Editor::new();
+        let text = |s: &str| Paragraph::new_text().with_content(vec![Span::new_text(s)]);
+        let mut doc = markdown_to_document("x");
+        doc.paragraphs = vec![Paragraph::new_unordered_list().with_entries(vec![vec![
+            text("lead"),
+            text("second"),
+            Paragraph::new_text(), // empty trailing continuation paragraph
+        ]])];
+        editor.set_document(doc);
+        editor.set_cursor(DocumentPosition::at(
+            TreePath::root(0).child(PathSegment::ListEntry { entry: 0, para: 2 }),
+            0,
+        ));
+
+        editor.insert_newline().unwrap();
+        let Paragraph::UnorderedList { entries } = &editor.document().paragraphs[0] else {
+            panic!("the list must survive, not dissolve into paragraphs");
+        };
+        assert_eq!(entries.len(), 2, "the empty paragraph became a new item");
+        assert_eq!(
+            entries[0].len(),
+            2,
+            "the original item keeps its two real paragraphs"
+        );
+        assert_eq!(
+            entries[1].len(),
+            1,
+            "the new item holds just the empty paragraph"
+        );
+        assert_eq!(
+            editor.cursor().path,
+            TreePath::root(0).child(PathSegment::ListEntry { entry: 1, para: 0 }),
+        );
+    }
+
+    #[test]
+    fn enter_in_empty_nested_para_promotes_one_level_per_press() {
+        // The reported nesting: an outer quote holding two paragraphs and a bullet list
+        // whose single item holds a lead paragraph, a continuation paragraph, an inner
+        // quote, and finally an empty trailing paragraph where the cursor sits.
+        let mut editor = Editor::new();
+        let text = |s: &str| Paragraph::new_text().with_content(vec![Span::new_text(s)]);
+        let list = Paragraph::new_unordered_list().with_entries(vec![vec![
+            text("item lead"),
+            text("second para"),
+            Paragraph::new_quote().with_children(vec![text("inner quote")]),
+            Paragraph::new_text(), // empty trailing continuation paragraph
+        ]]);
+        let mut doc = markdown_to_document("x");
+        doc.paragraphs = vec![Paragraph::new_quote().with_children(vec![
+            text("quote lead"),
+            text("quote second"),
+            list,
+        ])];
+        editor.set_document(doc);
+
+        // Cursor in the empty trailing paragraph: quote child 2 (the list) → entry 0, para 3.
+        editor.set_cursor(DocumentPosition::at(
+            TreePath::root(0)
+                .child(PathSegment::QuoteChild(2))
+                .child(PathSegment::ListEntry { entry: 0, para: 3 }),
+            0,
+        ));
+
+        // Enter #1: empty continuation paragraph → a new (empty) list item; item survives.
+        editor.insert_newline().unwrap();
+        let Paragraph::Quote { children } = &editor.document().paragraphs[0] else {
+            panic!("outer quote should survive");
+        };
+        assert_eq!(
+            children.len(),
+            3,
+            "quote still holds its two paras + the list"
+        );
+        let Paragraph::UnorderedList { entries } = &children[2] else {
+            panic!("the list should survive, not dissolve");
+        };
+        assert_eq!(entries.len(), 2, "a new list item was created");
+        assert_eq!(
+            entries[0].len(),
+            3,
+            "original item keeps its three real paragraphs"
+        );
+        assert_eq!(
+            entries[1].len(),
+            1,
+            "the new item holds the single empty paragraph"
+        );
+        assert_eq!(
+            editor.cursor().path,
+            TreePath::root(0)
+                .child(PathSegment::QuoteChild(2))
+                .child(PathSegment::ListEntry { entry: 1, para: 0 }),
+        );
+
+        // Enter #2: the empty item exits the list, landing as a quote child after the list.
+        editor.insert_newline().unwrap();
+        let Paragraph::Quote { children } = &editor.document().paragraphs[0] else {
+            panic!("outer quote should survive");
+        };
+        assert_eq!(
+            children.len(),
+            4,
+            "quote gained the lifted-out empty paragraph"
+        );
+        let Paragraph::UnorderedList { entries } = &children[2] else {
+            panic!("the list remains");
+        };
+        assert_eq!(entries.len(), 1, "the empty item left the list");
+        assert!(
+            matches!(children[3], Paragraph::Text { .. }),
+            "empty paragraph is now a quote child"
+        );
+        assert_eq!(
+            editor.cursor().path,
+            TreePath::root(0).child(PathSegment::QuoteChild(3)),
+        );
+
+        // Enter #3: the empty quote child exits the quote to the top level.
+        editor.insert_newline().unwrap();
+        assert_eq!(
+            editor.document().paragraphs.len(),
+            2,
+            "quote + a top-level paragraph"
+        );
+        assert!(matches!(
+            editor.document().paragraphs[0],
+            Paragraph::Quote { .. }
+        ));
+        assert!(matches!(
+            editor.document().paragraphs[1],
+            Paragraph::Text { .. }
+        ));
+        assert_eq!(editor.cursor().path, TreePath::root(1));
     }
 
     #[test]

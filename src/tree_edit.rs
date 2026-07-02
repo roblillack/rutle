@@ -223,6 +223,39 @@ pub fn split_leaf_continuation(
     }
 }
 
+/// Split the list entry containing `path` at that paragraph boundary: the paragraph at
+/// `path` — which must be a *continuation* paragraph, not the entry's first — together with
+/// any paragraphs after it move into a new entry inserted immediately after the current one.
+/// So an empty trailing paragraph becomes a fresh (empty) list item rather than dissolving
+/// the whole item. Returns the new entry's first-paragraph path, or `None` if `path` is the
+/// entry's leading paragraph (`para == 0`) or is not a list entry at all.
+pub fn split_list_entry(doc: &mut Document, path: &TreePath) -> Option<TreePath> {
+    let PathSegment::ListEntry { entry, para } = path.0.last()?.clone() else {
+        return None;
+    };
+    if para == 0 {
+        return None;
+    }
+    let pp = parent_path(path);
+    if let NodeMut::Para(
+        Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
+    ) = node_at_mut(doc, &pp)?
+    {
+        let e = entries.get_mut(entry)?;
+        if para >= e.len() {
+            return None;
+        }
+        let new_entry = e.split_off(para);
+        entries.insert(entry + 1, new_entry);
+        Some(pp.child(PathSegment::ListEntry {
+            entry: entry + 1,
+            para: 0,
+        }))
+    } else {
+        None
+    }
+}
+
 /// Merge the leaf at `path` into the previous leaf in document order (appending its text).
 /// Returns the resulting cursor position (the join point), or `None` when there is no
 /// previous leaf or either leaf is a table.
@@ -1528,6 +1561,41 @@ mod tests {
         assert!(outdent_list_item(&mut doc, &path).is_some());
         assert_eq!(doc.paragraphs.len(), 1);
         assert!(matches!(doc.paragraphs[0], Paragraph::Text { .. }));
+    }
+
+    #[test]
+    fn split_list_entry_peels_off_continuation_paragraph() {
+        // An item with a lead paragraph plus a trailing empty paragraph: splitting at the
+        // trailing paragraph moves it into a new entry while the lead stays put.
+        let mut doc = parse("x");
+        doc.paragraphs = vec![
+            Paragraph::new_unordered_list()
+                .with_entries(vec![vec![text("lead"), Paragraph::new_text()]]),
+        ];
+        let path = TreePath::root(0).child(PathSegment::ListEntry { entry: 0, para: 1 });
+        let new = split_list_entry(&mut doc, &path).expect("split off the continuation");
+        assert_eq!(
+            new,
+            TreePath::root(0).child(PathSegment::ListEntry { entry: 1, para: 0 })
+        );
+        let Paragraph::UnorderedList { entries } = &doc.paragraphs[0] else {
+            panic!("expected the list to remain");
+        };
+        assert_eq!(entries.len(), 2, "a new entry was created");
+        assert_eq!(entries[0].len(), 1, "lead stays in the first entry");
+        assert_eq!(
+            entries[1].len(),
+            1,
+            "the continuation moved to the new entry"
+        );
+    }
+
+    #[test]
+    fn split_list_entry_rejects_leading_paragraph() {
+        // The entry's first paragraph is not a continuation, so there is nothing to peel off.
+        let mut doc = parse("- only");
+        let path = TreePath::root(0).child(PathSegment::ListEntry { entry: 0, para: 0 });
+        assert!(split_list_entry(&mut doc, &path).is_none());
     }
 
     #[test]
