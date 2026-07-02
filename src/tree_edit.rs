@@ -735,6 +735,71 @@ fn container_splice(
     }
 }
 
+/// Move the block addressed by `path` one step toward its previous (`up`) or next sibling
+/// within its immediate parent container, carrying any nested descendants. Used by Alt-Up/Down
+/// to resort blocks at whatever level the cursor sits: top-level paragraphs, a quote's
+/// children, checklist items, or list items. For a list the whole entry moves (all its
+/// paragraphs and sublists) regardless of which paragraph `path` addresses, so the cursor's
+/// `para` is preserved. Returns the moved block's new path, or `None` at the container's
+/// first/last boundary or for an invalid path.
+pub fn move_sibling(doc: &mut Document, path: &TreePath, up: bool) -> Option<TreePath> {
+    let last = path.0.last()?.clone();
+    let parent = parent_path(path);
+    match last {
+        PathSegment::Paragraph(i) => {
+            let target = sibling_target(i, doc.paragraphs.len(), up)?;
+            doc.paragraphs.swap(i, target);
+            Some(TreePath::root(target))
+        }
+        PathSegment::QuoteChild(c) => {
+            let NodeMut::Para(Paragraph::Quote { children }) = node_at_mut(doc, &parent)? else {
+                return None;
+            };
+            let target = sibling_target(c, children.len(), up)?;
+            children.swap(c, target);
+            Some(parent.child(PathSegment::QuoteChild(target)))
+        }
+        PathSegment::ListEntry { entry, para } => {
+            let NodeMut::Para(
+                Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
+            ) = node_at_mut(doc, &parent)?
+            else {
+                return None;
+            };
+            let target = sibling_target(entry, entries.len(), up)?;
+            entries.swap(entry, target);
+            Some(parent.child(PathSegment::ListEntry {
+                entry: target,
+                para,
+            }))
+        }
+        PathSegment::ChecklistItem(c) => {
+            let items = match node_at_mut(doc, &parent)? {
+                NodeMut::Para(Paragraph::Checklist { items }) => items,
+                NodeMut::Check(item) => &mut item.children,
+                _ => return None,
+            };
+            let target = sibling_target(c, items.len(), up)?;
+            items.swap(c, target);
+            Some(parent.child(PathSegment::ChecklistItem(target)))
+        }
+    }
+}
+
+/// The index of the sibling one step up (`up`) or down from `idx` in a container of `len`
+/// items, or `None` at the boundary (the first item moving up, the last moving down) or when
+/// `idx` is out of range.
+fn sibling_target(idx: usize, len: usize, up: bool) -> Option<usize> {
+    if idx >= len {
+        return None;
+    }
+    if up {
+        idx.checked_sub(1)
+    } else {
+        (idx + 1 < len).then_some(idx + 1)
+    }
+}
+
 // ---- Container conversion / dissolve / merge --------------------------------------
 
 /// The four convertible container kinds (a superset of [`ListKind`] that adds quotes).

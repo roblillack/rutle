@@ -10,6 +10,15 @@ While pre-1.0, the minor version is bumped for breaking changes.
 
 ## [Unreleased] - ReleaseDate
 
+### Changed
+
+- `Editor::move_blocks_up` / `move_blocks_down` now reorder the block at the
+  cursor's *current* nesting level rather than only top-level paragraphs: list
+  items (the whole entry, carrying its continuation paragraphs and sublists),
+  checklist items, and quote children are all resorted among their siblings, and
+  a nested sub-item stays within its sublist. No-op at a container's first/last
+  boundary. Signatures are unchanged. Backed by a new `tree_edit::move_sibling`.
+
 ## [0.2.0] - 2026-07-02
 
 A general "block model" for containers (quotes and lists), plus list-rendering

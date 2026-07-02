@@ -2382,31 +2382,28 @@ impl Editor {
         tree_edit::toggle_checkmark(&mut self.tdoc, &path).ok_or(EditError::InvalidPosition)
     }
 
-    /// Swap the cursor's top-level block with the previous one. TODO(phase3): reorder
-    /// within lists/quotes.
+    /// Move the block at the cursor one step up among its siblings within its immediate
+    /// container — top-level paragraphs, a quote's children, checklist items, or list items
+    /// (the whole entry moves, carrying its continuation paragraphs and sublists). No-op at
+    /// the container's first position.
     pub fn move_blocks_up(&mut self) -> Result<bool, EditError> {
-        let Some(i) = self.cursor_top_index() else {
-            return Ok(false);
-        };
-        if i == 0 {
-            return Ok(false);
-        }
-        self.tdoc.paragraphs.swap(i - 1, i);
-        self.cursor = DocumentPosition::at(TreePath::root(i - 1), self.cursor.offset);
-        self.normalize_cursor();
-        self.trigger_paragraph_change();
-        Ok(true)
+        self.move_current_block(true)
     }
 
+    /// Move the block at the cursor one step down among its siblings; the counterpart to
+    /// [`Self::move_blocks_up`]. No-op at the container's last position.
     pub fn move_blocks_down(&mut self) -> Result<bool, EditError> {
-        let Some(i) = self.cursor_top_index() else {
+        self.move_current_block(false)
+    }
+
+    /// Swap the cursor's block with its previous (`up`) or next sibling at the cursor's own
+    /// nesting level, following it with the cursor. Returns whether the tree changed.
+    fn move_current_block(&mut self, up: bool) -> Result<bool, EditError> {
+        let Some(new_path) = tree_edit::move_sibling(&mut self.tdoc, &self.cursor.path, up) else {
             return Ok(false);
         };
-        if i + 1 >= self.tdoc.paragraphs.len() {
-            return Ok(false);
-        }
-        self.tdoc.paragraphs.swap(i, i + 1);
-        self.cursor = DocumentPosition::at(TreePath::root(i + 1), self.cursor.offset);
+        self.cursor = DocumentPosition::at(new_path, self.cursor.offset);
+        self.selection = None;
         self.normalize_cursor();
         self.trigger_paragraph_change();
         Ok(true)
@@ -4108,6 +4105,102 @@ mod tests {
         editor.set_cursor(DocumentPosition::at(TreePath::root(0), 0));
         assert_eq!(editor.move_blocks_down(), Ok(true));
         assert_eq!(md(&editor), "second\n\nfirst");
+    }
+
+    #[test]
+    fn move_block_reorders_list_items() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("- a\n- b\n- c"));
+        editor.set_cursor(DocumentPosition::at(list_item_path(0), 0));
+        assert_eq!(editor.move_blocks_down(), Ok(true));
+        assert_eq!(md(&editor), "- b\n- a\n- c");
+        // The cursor follows the moved item.
+        assert_eq!(editor.cursor().path, list_item_path(1));
+        assert_eq!(editor.move_blocks_up(), Ok(true));
+        assert_eq!(md(&editor), "- a\n- b\n- c");
+        assert_eq!(editor.cursor().path, list_item_path(0));
+    }
+
+    #[test]
+    fn move_block_stays_inside_nested_sublist() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("- a\n  - x\n  - y\n  - z"));
+        let x = TreePath::root(0)
+            .child(PathSegment::ListEntry { entry: 0, para: 1 })
+            .child(PathSegment::ListEntry { entry: 0, para: 0 });
+        editor.set_cursor(DocumentPosition::at(x, 0));
+        assert_eq!(editor.move_blocks_down(), Ok(true));
+        // Reordered within the sublist; nesting depths are untouched.
+        assert_eq!(leaf_texts(&editor), vec!["a", "y", "x", "z"]);
+        assert_eq!(leaf_depths(&editor), vec![0, 1, 1, 1]);
+        let moved = TreePath::root(0)
+            .child(PathSegment::ListEntry { entry: 0, para: 1 })
+            .child(PathSegment::ListEntry { entry: 1, para: 0 });
+        assert_eq!(editor.cursor().path, moved);
+    }
+
+    #[test]
+    fn move_block_carries_whole_list_item_subtree() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("- a\n  - x\n- b"));
+        editor.set_cursor(DocumentPosition::at(list_item_path(0), 0));
+        assert_eq!(editor.move_blocks_down(), Ok(true));
+        // The whole "a" item — its nested "x" included — moves below "b".
+        assert_eq!(leaf_texts(&editor), vec!["b", "a", "x"]);
+        assert_eq!(leaf_depths(&editor), vec![0, 0, 1]);
+    }
+
+    #[test]
+    fn move_block_reorders_quote_children() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("> a\n>\n> b"));
+        // Precondition: the quote really has two children.
+        assert_eq!(leaf_texts(&editor), vec!["a", "b"]);
+        editor.set_cursor(DocumentPosition::at(
+            TreePath::root(0).child(PathSegment::QuoteChild(0)),
+            0,
+        ));
+        assert_eq!(editor.move_blocks_down(), Ok(true));
+        assert_eq!(leaf_texts(&editor), vec!["b", "a"]);
+        assert_eq!(
+            editor.cursor().path,
+            TreePath::root(0).child(PathSegment::QuoteChild(1))
+        );
+    }
+
+    #[test]
+    fn move_block_reorders_checklist_items() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("- [ ] a\n- [ ] b"));
+        assert_eq!(leaf_texts(&editor), vec!["a", "b"]);
+        editor.set_cursor(DocumentPosition::at(
+            TreePath::root(0).child(PathSegment::ChecklistItem(0)),
+            0,
+        ));
+        assert_eq!(editor.move_blocks_down(), Ok(true));
+        assert_eq!(leaf_texts(&editor), vec!["b", "a"]);
+    }
+
+    #[test]
+    fn move_block_at_container_boundary_is_noop() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("- a\n- b\n- c"));
+        // First item can't move up; last item can't move down.
+        editor.set_cursor(DocumentPosition::at(list_item_path(0), 0));
+        assert_eq!(editor.move_blocks_up(), Ok(false));
+        editor.set_cursor(DocumentPosition::at(list_item_path(2), 0));
+        assert_eq!(editor.move_blocks_down(), Ok(false));
+        assert_eq!(md(&editor), "- a\n- b\n- c");
+    }
+
+    #[test]
+    fn move_block_preserves_cursor_offset() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("- apple\n- b"));
+        editor.set_cursor(DocumentPosition::at(list_item_path(0), 3));
+        assert_eq!(editor.move_blocks_down(), Ok(true));
+        assert_eq!(editor.cursor().path, list_item_path(1));
+        assert_eq!(editor.cursor().offset, 3);
     }
 
     #[test]
