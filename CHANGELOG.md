@@ -10,6 +10,22 @@ While pre-1.0, the minor version is bumped for breaking changes.
 
 ## [Unreleased] - ReleaseDate
 
+### Added
+
+- **Caret affinity at inline-style boundaries.** At a style boundary (e.g. the
+  seam between plain `Hello ` and bold `World!`) a single byte offset now denotes
+  two navigable caret positions, distinguished by an `Affinity` (`Left`/`Right`):
+  Left/Right arrow keys pause for the extra stop, `Editor::insert_text` inserts
+  into the run on the affinity side (so typing there either joins the style or
+  stays outside it), and the drawn caret gains a short directional "trail" along
+  its foot pointing at the side whose style applies. Active whenever reveal codes
+  is *off* (reveal codes keeps its existing tag-by-tag stepping); the default
+  `Left` affinity preserves the previous left-biased behavior. Toggleable via
+  `Editor::set_style_boundary_stops` (on by default); when off, Left/Right step a
+  plain grapheme, insertion is left-biased, and no trail is drawn. New public API:
+  `Affinity`, `Editor::cursor_affinity`, `Editor::cursor_at_style_boundary`,
+  `Editor::style_boundary_stops`, `Editor::set_style_boundary_stops`.
+
 ## [0.2.1] - 2026-07-02
 
 ### Changed

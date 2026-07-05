@@ -2993,6 +2993,32 @@ impl Renderer {
                 // it's easier to spot (a hairline caret is easy to lose,
                 // especially on high-DPI displays).
                 ctx.draw_rect_filled(screen_x, screen_y, 2, ch);
+
+                // At an inline-style boundary the caret has an affinity — which
+                // side's style newly typed text will inherit. Signal it with a
+                // short "trail" along the caret's foot pointing toward that side,
+                // so one logical offset reads as two visually distinct caret
+                // positions even with reveal codes off. (Reveal codes shows the
+                // tags themselves, so the trail would be redundant there.)
+                if !self.reveal_codes()
+                    && self.editor.style_boundary_stops()
+                    && self.editor.cursor_at_style_boundary()
+                {
+                    let trail_len = 4;
+                    let trail_h = 2;
+                    let foot_y = screen_y + ch - trail_h;
+                    match self.editor.cursor_affinity() {
+                        Affinity::Left => ctx.draw_rect_filled(
+                            screen_x - trail_len,
+                            foot_y,
+                            trail_len + 2,
+                            trail_h,
+                        ),
+                        Affinity::Right => {
+                            ctx.draw_rect_filled(screen_x, foot_y, trail_len + 2, trail_h)
+                        }
+                    }
+                }
             }
         }
 
@@ -3709,6 +3735,9 @@ mod tests {
     struct TestRenderContext {
         focus: bool,
         active: bool,
+        /// Every filled rect drawn this pass, as `(x, y, w, h)` — lets tests
+        /// observe the caret and its direction trail.
+        rects: Vec<(i32, i32, i32, i32)>,
     }
 
     impl TestRenderContext {
@@ -3716,6 +3745,7 @@ mod tests {
             Self {
                 focus: true,
                 active: true,
+                ..Default::default()
             }
         }
     }
@@ -3727,7 +3757,9 @@ mod tests {
 
         fn draw_text(&mut self, _text: &str, _x: i32, _y: i32) {}
 
-        fn draw_rect_filled(&mut self, _x: i32, _y: i32, _w: i32, _h: i32) {}
+        fn draw_rect_filled(&mut self, x: i32, y: i32, w: i32, h: i32) {
+            self.rects.push((x, y, w, h));
+        }
 
         fn draw_line(&mut self, _x1: i32, _y1: i32, _x2: i32, _y2: i32) {}
 
@@ -3782,6 +3814,53 @@ mod tests {
             editor.set_cursor(DocumentPosition::new(0, 0));
         }
         display
+    }
+
+    #[test]
+    fn caret_draws_direction_trail_at_style_boundary() {
+        // "Hello " (plain) + "World!" (bold); style boundary at byte offset 6.
+        let doc = crate::markdown_converter::markdown_to_document("Hello **World!**");
+        let mut display = Renderer::new(0, 0, 400, 300);
+        display.editor_mut().set_document(doc);
+
+        // Draw, then return only the small foot-trail rects (w == 6, h == 2).
+        fn trails(display: &mut Renderer) -> Vec<(i32, i32, i32, i32)> {
+            let mut ctx = TestRenderContext::new_with_focus();
+            display.draw(&mut ctx);
+            ctx.rects
+                .iter()
+                .copied()
+                .filter(|(_, _, w, h)| *w == 6 && *h == 2)
+                .collect()
+        }
+
+        // Mid-plain-text: not a boundary, so no direction trail.
+        display
+            .editor_mut()
+            .set_cursor(DocumentPosition::at(TreePath::root(0), 3));
+        assert!(trails(&mut display).is_empty());
+
+        // At the boundary with (default) Left affinity: one trail, left of the caret.
+        display
+            .editor_mut()
+            .set_cursor(DocumentPosition::at(TreePath::root(0), 6));
+        let left = trails(&mut display);
+        assert_eq!(
+            left.len(),
+            1,
+            "expected one direction trail at the boundary"
+        );
+        let left_x = left[0].0;
+
+        // Flip to Right affinity at the same offset: the trail moves to the right.
+        display.editor_mut().move_cursor_right();
+        assert_eq!(display.editor().cursor_affinity(), Affinity::Right);
+        let right = trails(&mut display);
+        assert_eq!(right.len(), 1);
+        assert!(
+            right[0].0 > left_x,
+            "Right-affinity trail must sit right of the Left-affinity trail"
+        );
     }
 
     fn table_block(rows: usize) -> Block {
