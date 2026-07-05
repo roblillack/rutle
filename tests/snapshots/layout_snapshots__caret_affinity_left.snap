@@ -1,0 +1,6 @@
+---
+source: tests/layout_snapshots.rs
+expression: "common::caret_affinity_left(MODE)"
+extension: svg
+snapshot_kind: binary
+---

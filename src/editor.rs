@@ -181,6 +181,13 @@ pub struct Editor {
     /// direction indicator, providing the "two caret positions per boundary"
     /// behavior when reveal codes is *off*.
     cursor_affinity: Affinity,
+    /// Whether the *backend* can render the affinity lean at all. A cell backend
+    /// can't (its caret is one indivisible cell), so the renderer syncs this from
+    /// [`crate::RenderContext::supports_caret_affinity`] on every layout pass. When
+    /// `false`, affinity is inert no matter what `style_boundary_stops` says — the
+    /// two stops collapse to one and the caret never leans. `true` by default,
+    /// matching a pixel backend (and a bare editor with no renderer attached yet).
+    affinity_supported: bool,
 }
 
 impl Editor {
@@ -210,6 +217,7 @@ impl Editor {
             cursor_reveal_stop: 0,
             style_boundary_stops: true,
             cursor_affinity: Affinity::Left,
+            affinity_supported: true,
         };
         editor.normalize_cursor();
         editor
@@ -325,6 +333,30 @@ impl Editor {
         if !enabled {
             self.cursor_affinity = Affinity::Left;
         }
+    }
+
+    /// Tell the editor whether the backend can render the affinity lean. Driven by
+    /// the renderer from [`crate::RenderContext::supports_caret_affinity`]; hosts
+    /// don't normally call it directly. A cell backend passes `false`, which makes
+    /// affinity inert (the two boundary stops collapse to one) irrespective of the
+    /// user's `style_boundary_stops` preference. Idempotent; clearing support resets
+    /// any lingering right-bias to the neutral `Left`, like disabling the toggle.
+    pub fn set_affinity_supported(&mut self, supported: bool) {
+        if self.affinity_supported == supported {
+            return;
+        }
+        self.affinity_supported = supported;
+        if !supported {
+            self.cursor_affinity = Affinity::Left;
+        }
+    }
+
+    /// Whether inline-style affinity is *actually* in effect right now: the user
+    /// preference ([`Self::style_boundary_stops`]) is on **and** the backend can
+    /// render the lean ([`Self::set_affinity_supported`]). This is the single gate
+    /// the navigation, insertion, and caret-drawing paths consult.
+    pub(crate) fn affinity_active(&self) -> bool {
+        self.style_boundary_stops && self.affinity_supported
     }
 
     /// How many reveal tags at the cursor's offset the caret sits past (see the
@@ -767,7 +799,7 @@ impl Editor {
         // Right affinity (only reachable at a style boundary, and irrelevant when a
         // selection is about to be replaced) makes the inserted text join the run
         // beginning at the offset instead of the one ending there.
-        let bias_right = self.style_boundary_stops
+        let bias_right = self.affinity_active()
             && self.selection.is_none()
             && self.cursor_affinity == Affinity::Right;
         self.cursor_reveal_stop = 0;
@@ -1162,7 +1194,7 @@ impl Editor {
             self.selection = None;
             // normalize_cursor reset the reveal-stop; restore the stepped value.
             self.cursor_reveal_stop = stop;
-        } else if self.style_boundary_stops {
+        } else if self.affinity_active() {
             let (new, affinity) = self.affinity_position_left();
             self.cursor = new;
             self.normalize_cursor();
@@ -1184,7 +1216,7 @@ impl Editor {
             self.normalize_cursor();
             self.selection = None;
             self.cursor_reveal_stop = stop;
-        } else if self.style_boundary_stops {
+        } else if self.affinity_active() {
             let (new, affinity) = self.affinity_position_right();
             self.cursor = new;
             self.normalize_cursor();
@@ -3180,6 +3212,46 @@ mod tests {
         editor.set_cursor(DocumentPosition::at(TreePath::root(0), 6));
         editor.insert_text("X").unwrap();
         assert_eq!(md(&editor), "Hello X**World!**");
+    }
+
+    #[test]
+    fn unsupported_backend_collapses_affinity() {
+        // A cell backend reports no lean support: affinity must be inert even
+        // though `style_boundary_stops` is on by default — the guarantee a cell
+        // renderer relies on. Mirrors disabling the toggle, but via the backend.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("Hello **World!**"));
+        assert!(editor.style_boundary_stops());
+
+        // Establish Right affinity first, then pull backend support: it resets.
+        editor.set_cursor(DocumentPosition::at(TreePath::root(0), 6));
+        editor.move_cursor_right();
+        assert_eq!(editor.cursor_affinity(), Affinity::Right);
+        editor.set_affinity_supported(false);
+        assert!(!editor.affinity_active());
+        assert_eq!(editor.cursor_affinity(), Affinity::Left);
+
+        // No extra stop at the boundary: 5 -> 6 -> 7 with single presses.
+        editor.set_cursor(DocumentPosition::at(TreePath::root(0), 5));
+        editor.move_cursor_right();
+        assert_eq!(editor.cursor().offset, 6);
+        editor.move_cursor_right();
+        assert_eq!(editor.cursor().offset, 7);
+
+        // Insertion at the boundary stays left-biased (outside the bold run).
+        editor.set_cursor(DocumentPosition::at(TreePath::root(0), 6));
+        editor.insert_text("X").unwrap();
+        assert_eq!(md(&editor), "Hello X**World!**");
+
+        // Restoring support brings the extra stop back. Reset the document so the
+        // boundary is at offset 6 again (the insert above shifted it).
+        editor.set_affinity_supported(true);
+        editor.set_document(markdown_to_document("Hello **World!**"));
+        assert!(editor.affinity_active());
+        editor.set_cursor(DocumentPosition::at(TreePath::root(0), 6));
+        editor.move_cursor_right(); // flips to Right affinity in place
+        assert_eq!(editor.cursor().offset, 6);
+        assert_eq!(editor.cursor_affinity(), Affinity::Right);
     }
 
     #[test]

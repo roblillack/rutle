@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="360" height="120" viewBox="0 0 360 120">
+<style>
+            @font-face { font-family: 'SnapshotSans'; font-weight: 500; font-style: normal; src: url('../NotoSans-Medium.ttf') format('truetype'); }
+            @font-face { font-family: 'SnapshotSans'; font-weight: 700; font-style: normal; src: url('../NotoSans-Bold.ttf') format('truetype'); }
+            @font-face { font-family: 'SnapshotSans'; font-weight: 500; font-style: italic; src: url('../NotoSans-MediumItalic.ttf') format('truetype'); }
+            @font-face { font-family: 'SnapshotSans'; font-weight: 700; font-style: italic; src: url('../NotoSans-BoldItalic.ttf') format('truetype'); }
+            </style>
+  <rect width="360" height="120" fill="#ffffff"/>
+  <rect x="0" y="0" width="360" height="120" fill="#fffff5"/>
+  <defs>
+    <clipPath id="clip-0-0-360-120">
+      <rect x="0" y="0" width="360" height="120"/>
+    </clipPath>
+  </defs>
+  <text x="25" y="24" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-360-120)">Hello </text>
+  <text x="64" y="24" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="bold" font-style="normal" clip-path="url(#clip-0-0-360-120)">World!</text>
+  <rect x="64" y="10" width="2" height="17" fill="#000000" clip-path="url(#clip-0-0-360-120)"/>
+  <rect x="64" y="10" width="6" height="2" fill="#000000" clip-path="url(#clip-0-0-360-120)"/>
+  <rect x="64" y="25" width="6" height="2" fill="#000000" clip-path="url(#clip-0-0-360-120)"/>
+</svg>

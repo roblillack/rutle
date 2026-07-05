@@ -51,6 +51,22 @@ pub trait RenderContext {
     fn set_underline(&mut self, _on: bool) {}
     fn set_strikethrough(&mut self, _on: bool) {}
 
+    /// Whether this backend can render a caret that leans to signal inline-style
+    /// affinity (see [`crate::Affinity`]). A pixel canvas can draw the sub-cell
+    /// lean, so the default is `true`. A character-cell backend cannot — its caret
+    /// is one indivisible cell, and it typically drives the terminal's own hardware
+    /// caret rather than [`Self::draw_caret`] — so it overrides this to `false`.
+    ///
+    /// When it returns `false` the engine collapses the two affinity stops back
+    /// into one: Left/Right step a plain grapheme, insertion stays left-biased, and
+    /// no caret ever leans — regardless of the user-facing
+    /// [`crate::Editor::set_style_boundary_stops`] toggle (both must be on for
+    /// affinity to take effect). The renderer keeps the editor's capability in sync
+    /// with this on every layout pass, so a backend only needs to answer honestly.
+    fn supports_caret_affinity(&self) -> bool {
+        true
+    }
+
     /// Draw the text caret: a 2px-wide vertical bar `height` tall with its
     /// top-left at (x, y), in the active color. When `lean` is `Left`/`Right`, mark
     /// the inline-style affinity (see [`crate::Affinity`]) by leaning the caret

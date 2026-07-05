@@ -855,6 +855,16 @@ impl Renderer {
 
     /// Perform layout
     fn layout(&mut self, ctx: &mut dyn RenderContext) {
+        // Keep the editor's affinity capability in step with the backend: a cell
+        // backend can't render the lean, so it reports
+        // `supports_caret_affinity() == false` and the engine collapses the two
+        // affinity stops into one (no extra navigation stop, no lean, left-biased
+        // insertion). Runs before the layout-memoization early return — and `draw`
+        // calls `layout` every frame — so navigation always sees the current
+        // backend's capability. Idempotent and cheap.
+        self.editor
+            .set_affinity_supported(ctx.supports_caret_affinity());
+
         if self.layout_valid {
             return;
         }
@@ -2993,12 +3003,14 @@ impl Renderer {
                 // style newly typed text will take, so one logical offset reads as
                 // two visually distinct caret positions even with reveal codes off.
                 // Suppressed when a selection is active (the lean is about where
-                // typing lands, which doesn't apply to a selection) and under reveal
-                // codes (which draws the tags themselves). The backend decides how
-                // to render the lean; the default draws head and foot ticks.
+                // typing lands, which doesn't apply to a selection), under reveal
+                // codes (which draws the tags themselves), and on a cell backend
+                // that can't render the lean (folded into `affinity_active`). The
+                // backend decides how to draw the lean; the default draws head and
+                // foot ticks.
                 let lean = if !self.reveal_codes()
                     && self.editor.selection().is_none()
-                    && self.editor.style_boundary_stops()
+                    && self.editor.affinity_active()
                     && self.editor.cursor_at_style_boundary()
                 {
                     match self.editor.cursor_affinity() {
@@ -3726,6 +3738,10 @@ mod tests {
     struct TestRenderContext {
         focus: bool,
         active: bool,
+        /// Emulate a character-cell backend: report no caret-affinity support, so
+        /// the engine should collapse the two boundary stops into one. Default
+        /// `false` keeps the pixel-backend behavior the other tests expect.
+        cell_backend: bool,
         /// Every filled rect drawn this pass, as `(x, y, w, h)` — lets tests
         /// observe the caret bar and its foot tick.
         rects: Vec<(i32, i32, i32, i32)>,
@@ -3753,6 +3769,10 @@ mod tests {
         }
 
         fn draw_line(&mut self, _x1: i32, _y1: i32, _x2: i32, _y2: i32) {}
+
+        fn supports_caret_affinity(&self) -> bool {
+            !self.cell_backend
+        }
 
         fn text_width(&mut self, text: &str, _font: FontType, _style: FontStyle, size: u8) -> f64 {
             // Simplistic width model: proportional to character count and font size
@@ -3883,6 +3903,53 @@ mod tests {
             .filter(|(_, _, w, h)| *w == 6 && *h == 2)
             .count();
         assert_eq!(ticks, 0, "no direction ticks while a selection is active");
+    }
+
+    #[test]
+    fn cell_backend_collapses_affinity() {
+        // A backend that can't render the lean (a character cell) must get the
+        // classic single-caret model: no extra stop, no lean, even at a boundary.
+        let doc = crate::markdown_converter::markdown_to_document("Hello **World!**");
+        let mut display = Renderer::new(0, 0, 400, 300);
+        display.editor_mut().set_document(doc);
+        // Land on the boundary and try to flip to Right affinity — before any draw
+        // has synced the backend capability, so this momentarily takes.
+        {
+            let editor = display.editor_mut();
+            editor.set_cursor(DocumentPosition::at(TreePath::root(0), 6));
+            editor.move_cursor_right();
+            assert_eq!(editor.cursor_affinity(), Affinity::Right);
+        }
+
+        // Draw through a cell backend: the layout pass syncs the capability, which
+        // resets the affinity and makes it inert.
+        let mut ctx = TestRenderContext {
+            focus: true,
+            active: true,
+            cell_backend: true,
+            ..Default::default()
+        };
+        display.draw(&mut ctx);
+
+        assert!(!display.editor().affinity_active(), "affinity is inert");
+        assert_eq!(display.editor().cursor_affinity(), Affinity::Left);
+        let ticks = ctx
+            .rects
+            .iter()
+            .filter(|(_, _, w, h)| *w == 6 && *h == 2)
+            .count();
+        assert_eq!(ticks, 0, "cell backend draws no direction ticks");
+
+        // And Right stepping no longer pauses at the boundary: from just before it,
+        // one press crosses the grapheme instead of flipping affinity in place.
+        display
+            .editor_mut()
+            .set_cursor(DocumentPosition::at(TreePath::root(0), 6));
+        display.editor_mut().move_cursor_right();
+        assert!(
+            !display.editor().cursor_at_style_boundary(),
+            "no extra affinity stop on a cell backend"
+        );
     }
 
     fn table_block(rows: usize) -> Block {

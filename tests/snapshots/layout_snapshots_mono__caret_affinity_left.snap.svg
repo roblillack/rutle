@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="360" height="120" viewBox="0 0 360 120">
+  <rect width="360" height="120" fill="#ffffff"/>
+  <rect x="0" y="0" width="360" height="120" fill="#fffff5"/>
+  <defs>
+    <clipPath id="clip-0-0-360-120">
+      <rect x="0" y="0" width="360" height="120"/>
+    </clipPath>
+  </defs>
+  <text x="25" y="24" fill="#000000" font-family="'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="14" font-weight="normal" font-style="normal" textLength="48" lengthAdjust="spacingAndGlyphs" xml:space="preserve" clip-path="url(#clip-0-0-360-120)">Hello </text>
+  <text x="73" y="24" fill="#000000" font-family="'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="14" font-weight="bold" font-style="normal" textLength="48" lengthAdjust="spacingAndGlyphs" xml:space="preserve" clip-path="url(#clip-0-0-360-120)">World!</text>
+  <rect x="73" y="10" width="2" height="17" fill="#000000" clip-path="url(#clip-0-0-360-120)"/>
+</svg>

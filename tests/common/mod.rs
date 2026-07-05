@@ -293,6 +293,15 @@ impl RenderContext for SvgRenderContext {
         .unwrap();
     }
 
+    /// The proportional (pixel) mode can render the sub-cell caret lean; the
+    /// monospace mode stands in for a character-cell backend, which can't — so it
+    /// reports no support and the engine collapses the two affinity stops into one.
+    /// This makes the two suites double as a regression guard that cell renderers
+    /// never get affinity behavior (see the `caret_affinity_*` scenarios).
+    fn supports_caret_affinity(&self) -> bool {
+        self.mode == FontMode::Proportional
+    }
+
     fn text_width(&mut self, text: &str, font: FontType, style: FontStyle, size: u8) -> f64 {
         match self.mode {
             FontMode::Proportional => {
@@ -524,6 +533,36 @@ pub fn cursor_positioning_middle_of_line(mode: FontMode) -> Vec<u8> {
     display
         .editor_mut()
         .set_cursor(DocumentPosition::new(0, pos));
+    render(display, mode, w, h)
+}
+
+pub fn caret_affinity_left(mode: FontMode) -> Vec<u8> {
+    // Caret resting on the plain->bold boundary of "Hello **World!**" (byte
+    // offset 6) with the default Left affinity: newly typed text stays outside the
+    // bold run, and a pixel backend leans the caret left (bar + head/foot ticks).
+    // The monospace/cell backend can't render the lean, so its snapshot is a plain
+    // caret at the same offset.
+    let md = "Hello **World!**";
+    let (w, h) = (360, 120);
+    let mut display = display_for(md, w, h);
+    display.editor_mut().set_cursor(DocumentPosition::new(0, 6));
+    render(display, mode, w, h)
+}
+
+pub fn caret_affinity_right(mode: FontMode) -> Vec<u8> {
+    // The same boundary flipped to Right affinity (one right step, in place):
+    // newly typed text would join the bold run, and a pixel backend leans the
+    // caret right. The cell backend reports no affinity support, so the layout
+    // pass makes the flip inert and the caret stays a plain bar — visual proof of
+    // the guarantee cell renderers rely on.
+    let md = "Hello **World!**";
+    let (w, h) = (360, 120);
+    let mut display = display_for(md, w, h);
+    {
+        let editor = display.editor_mut();
+        editor.set_cursor(DocumentPosition::new(0, 6));
+        editor.move_cursor_right();
+    }
     render(display, mode, w, h)
 }
 
