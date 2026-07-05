@@ -42,7 +42,7 @@ mod markdown_converter;
 
 // Convenience re-exports for the most common entry points.
 pub use editor::{Affinity, EditError, Editor, UndoKind};
-pub use render_context::{FontStyle, FontType, RenderContext};
+pub use render_context::{CaretLean, FontStyle, FontType, RenderContext};
 pub use renderer::Renderer;
 pub use structured_document::{
     Block, BlockType, InlineContent, Link, TableCell, TableRow, TextRun, TextStyle,

@@ -17,14 +17,20 @@ While pre-1.0, the minor version is bumped for breaking changes.
   two navigable caret positions, distinguished by an `Affinity` (`Left`/`Right`):
   Left/Right arrow keys pause for the extra stop, `Editor::insert_text` inserts
   into the run on the affinity side (so typing there either joins the style or
-  stays outside it), and the drawn caret gains a short directional "trail" along
-  its foot pointing at the side whose style applies. Active whenever reveal codes
-  is *off* (reveal codes keeps its existing tag-by-tag stepping); the default
-  `Left` affinity preserves the previous left-biased behavior. Toggleable via
+  stays outside it), and the drawn caret leans toward that side (how the lean is
+  drawn is up to the backend — see `RenderContext::draw_caret`). Active whenever
+  reveal codes is *off* (reveal codes keeps its existing tag-by-tag stepping); the
+  default `Left` affinity preserves the previous left-biased behavior. Toggleable via
   `Editor::set_style_boundary_stops` (on by default); when off, Left/Right step a
-  plain grapheme, insertion is left-biased, and no trail is drawn. New public API:
-  `Affinity`, `Editor::cursor_affinity`, `Editor::cursor_at_style_boundary`,
-  `Editor::style_boundary_stops`, `Editor::set_style_boundary_stops`.
+  plain grapheme, insertion is left-biased, and the caret is a plain bar. New
+  public API: `Affinity`, `Editor::cursor_affinity`,
+  `Editor::cursor_at_style_boundary`, `Editor::style_boundary_stops`,
+  `Editor::set_style_boundary_stops`.
+- **`RenderContext::draw_caret`** — backends now render the caret themselves, so
+  the *design* of the affinity lean is backend-specific. The default is a plain
+  bar plus short horizontal head and foot ticks (filled rects) pointing toward the
+  lean; a backend can override it to draw something richer. Accompanied by the
+  `CaretLean` enum (`None`/`Left`/`Right`).
 
 ## [0.2.1] - 2026-07-02
 

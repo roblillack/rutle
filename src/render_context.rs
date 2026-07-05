@@ -13,6 +13,19 @@ pub enum FontStyle {
     BoldItalic,
 }
 
+/// Which way a caret leans to signal inline-style affinity at a boundary. The
+/// *rendering* of the lean is up to the backend (see [`RenderContext::draw_caret`]);
+/// this only says which side newly typed text will take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaretLean {
+    /// Plain caret — no lean.
+    None,
+    /// Leans left: newly typed text takes the run to the left.
+    Left,
+    /// Leans right: newly typed text takes the run to the right.
+    Right,
+}
+
 // Drawing backend trait - abstracts over FLTK's drawing primitives
 pub trait RenderContext {
     fn set_color(&mut self, color: u32);
@@ -37,6 +50,30 @@ pub trait RenderContext {
     /// into the glyph's attributes (see [`crate::theme::Theme::text_decoration_lines`]).
     fn set_underline(&mut self, _on: bool) {}
     fn set_strikethrough(&mut self, _on: bool) {}
+
+    /// Draw the text caret: a 2px-wide vertical bar `height` tall with its
+    /// top-left at (x, y), in the active color. When `lean` is `Left`/`Right`, mark
+    /// the inline-style affinity (see [`crate::Affinity`]) by leaning the caret
+    /// toward that side.
+    ///
+    /// The *design* of the lean is deliberately backend-specific. The default is a
+    /// plain, cheap indicator: the bar plus short horizontal "head" and "foot"
+    /// ticks pointing toward the lean, built from filled rects only — right for any
+    /// pixel canvas. A backend can override this to render something richer (e.g. a
+    /// filled bracket) or, for a character cell, stamp a glyph.
+    fn draw_caret(&mut self, x: i32, y: i32, height: i32, lean: CaretLean) {
+        self.draw_rect_filled(x, y, 2, height);
+        let tick_len = 4;
+        let tick_h = 2;
+        let tick_x = match lean {
+            CaretLean::None => return,
+            CaretLean::Left => x - tick_len,
+            CaretLean::Right => x,
+        };
+        let tick_w = tick_len + 2;
+        self.draw_rect_filled(tick_x, y, tick_w, tick_h); // head tick
+        self.draw_rect_filled(tick_x, y + height - tick_h, tick_w, tick_h); // foot tick
+    }
 
     /// Draw a checklist checkbox of `size` at (x, y) in the active color.
     ///

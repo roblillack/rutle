@@ -10,6 +10,7 @@ use super::reveal::{RevealReconciler, RevealStyle, item_reveal_styles, reveal_st
 use super::structured_document::*;
 use super::tree_path::{DocumentPosition, PathSegment, TreePath};
 use super::tree_walk::{self, LeafInfo};
+use crate::render_context::CaretLean;
 use crate::render_context::FontStyle;
 use crate::render_context::FontType;
 use crate::render_context::RenderContext;
@@ -2988,37 +2989,27 @@ impl Renderer {
             let screen_x = self.x + cx;
 
             if screen_y >= self.y && screen_y < self.y + self.h {
-                ctx.set_color(self.theme.cursor_color);
-                // Draw the caret as a 2px-wide bar rather than a 1px line so
-                // it's easier to spot (a hairline caret is easy to lose,
-                // especially on high-DPI displays).
-                ctx.draw_rect_filled(screen_x, screen_y, 2, ch);
-
-                // At an inline-style boundary the caret has an affinity — which
-                // side's style newly typed text will inherit. Signal it with a
-                // short "trail" along the caret's foot pointing toward that side,
-                // so one logical offset reads as two visually distinct caret
-                // positions even with reveal codes off. (Reveal codes shows the
-                // tags themselves, so the trail would be redundant there.)
-                if !self.reveal_codes()
+                // At an inline-style boundary the caret leans toward the side whose
+                // style newly typed text will take, so one logical offset reads as
+                // two visually distinct caret positions even with reveal codes off.
+                // Suppressed when a selection is active (the lean is about where
+                // typing lands, which doesn't apply to a selection) and under reveal
+                // codes (which draws the tags themselves). The backend decides how
+                // to render the lean; the default draws head and foot ticks.
+                let lean = if !self.reveal_codes()
+                    && self.editor.selection().is_none()
                     && self.editor.style_boundary_stops()
                     && self.editor.cursor_at_style_boundary()
                 {
-                    let trail_len = 4;
-                    let trail_h = 2;
-                    let foot_y = screen_y + ch - trail_h;
                     match self.editor.cursor_affinity() {
-                        Affinity::Left => ctx.draw_rect_filled(
-                            screen_x - trail_len,
-                            foot_y,
-                            trail_len + 2,
-                            trail_h,
-                        ),
-                        Affinity::Right => {
-                            ctx.draw_rect_filled(screen_x, foot_y, trail_len + 2, trail_h)
-                        }
+                        Affinity::Left => CaretLean::Left,
+                        Affinity::Right => CaretLean::Right,
                     }
-                }
+                } else {
+                    CaretLean::None
+                };
+                ctx.set_color(self.theme.cursor_color);
+                ctx.draw_caret(screen_x, screen_y, ch, lean);
             }
         }
 
@@ -3736,7 +3727,7 @@ mod tests {
         focus: bool,
         active: bool,
         /// Every filled rect drawn this pass, as `(x, y, w, h)` — lets tests
-        /// observe the caret and its direction trail.
+        /// observe the caret bar and its foot tick.
         rects: Vec<(i32, i32, i32, i32)>,
     }
 
@@ -3817,14 +3808,15 @@ mod tests {
     }
 
     #[test]
-    fn caret_draws_direction_trail_at_style_boundary() {
+    fn default_caret_draws_direction_ticks_at_style_boundary() {
         // "Hello " (plain) + "World!" (bold); style boundary at byte offset 6.
+        // The default draw_caret marks the lean with 6x2 head and foot ticks.
         let doc = crate::markdown_converter::markdown_to_document("Hello **World!**");
         let mut display = Renderer::new(0, 0, 400, 300);
         display.editor_mut().set_document(doc);
 
-        // Draw, then return only the small foot-trail rects (w == 6, h == 2).
-        fn trails(display: &mut Renderer) -> Vec<(i32, i32, i32, i32)> {
+        // Draw, then return the direction-tick rects (w == 6, h == 2).
+        fn ticks(display: &mut Renderer) -> Vec<(i32, i32, i32, i32)> {
             let mut ctx = TestRenderContext::new_with_focus();
             display.draw(&mut ctx);
             ctx.rects
@@ -3834,33 +3826,63 @@ mod tests {
                 .collect()
         }
 
-        // Mid-plain-text: not a boundary, so no direction trail.
+        // Mid-plain-text: not a boundary, so no ticks.
         display
             .editor_mut()
             .set_cursor(DocumentPosition::at(TreePath::root(0), 3));
-        assert!(trails(&mut display).is_empty());
+        assert!(ticks(&mut display).is_empty());
 
-        // At the boundary with (default) Left affinity: one trail, left of the caret.
+        // At the boundary with (default) Left affinity: a head and a foot tick,
+        // aligned in x and at distinct y's, both left of the caret.
         display
             .editor_mut()
             .set_cursor(DocumentPosition::at(TreePath::root(0), 6));
-        let left = trails(&mut display);
+        let left = ticks(&mut display);
         assert_eq!(
             left.len(),
-            1,
-            "expected one direction trail at the boundary"
+            2,
+            "expected head and foot ticks at the boundary"
         );
         let left_x = left[0].0;
+        assert!(left.iter().all(|t| t.0 == left_x), "ticks share an x");
+        assert_ne!(
+            left[0].1, left[1].1,
+            "head and foot ticks sit at different y"
+        );
 
-        // Flip to Right affinity at the same offset: the trail moves to the right.
+        // Flip to Right affinity at the same offset: the ticks move to the right.
         display.editor_mut().move_cursor_right();
         assert_eq!(display.editor().cursor_affinity(), Affinity::Right);
-        let right = trails(&mut display);
-        assert_eq!(right.len(), 1);
+        let right = ticks(&mut display);
+        assert_eq!(right.len(), 2);
         assert!(
             right[0].0 > left_x,
-            "Right-affinity trail must sit right of the Left-affinity trail"
+            "Right-affinity ticks must sit right of the Left-affinity ticks"
         );
+    }
+
+    #[test]
+    fn selection_suppresses_direction_ticks() {
+        // Cursor resting on the style boundary, but with a selection active.
+        let doc = crate::markdown_converter::markdown_to_document("Hello **World!**");
+        let mut display = Renderer::new(0, 0, 400, 300);
+        display.editor_mut().set_document(doc);
+        {
+            let editor = display.editor_mut();
+            editor.set_cursor(DocumentPosition::at(TreePath::root(0), 5));
+            editor.move_cursor_right_extend(); // active end lands on the boundary (6)
+        }
+        assert!(display.editor().selection().is_some());
+        assert!(display.editor().cursor_at_style_boundary());
+
+        let mut ctx = TestRenderContext::new_with_focus();
+        display.draw(&mut ctx);
+        let ticks = ctx
+            .rects
+            .iter()
+            .filter(|(_, _, w, h)| *w == 6 && *h == 2)
+            .count();
+        assert_eq!(ticks, 0, "no direction ticks while a selection is active");
     }
 
     fn table_block(rows: usize) -> Block {
