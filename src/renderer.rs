@@ -10,6 +10,7 @@ use super::reveal::{RevealReconciler, RevealStyle, item_reveal_styles, reveal_st
 use super::structured_document::*;
 use super::tree_path::{DocumentPosition, PathSegment, TreePath};
 use super::tree_walk::{self, LeafInfo};
+use crate::render_context::CaretLean;
 use crate::render_context::FontStyle;
 use crate::render_context::FontType;
 use crate::render_context::RenderContext;
@@ -854,6 +855,16 @@ impl Renderer {
 
     /// Perform layout
     fn layout(&mut self, ctx: &mut dyn RenderContext) {
+        // Keep the editor's affinity capability in step with the backend: a cell
+        // backend can't render the lean, so it reports
+        // `supports_caret_affinity() == false` and the engine collapses the two
+        // affinity stops into one (no extra navigation stop, no lean, left-biased
+        // insertion). Runs before the layout-memoization early return — and `draw`
+        // calls `layout` every frame — so navigation always sees the current
+        // backend's capability. Idempotent and cheap.
+        self.editor
+            .set_affinity_supported(ctx.supports_caret_affinity());
+
         if self.layout_valid {
             return;
         }
@@ -2988,11 +2999,29 @@ impl Renderer {
             let screen_x = self.x + cx;
 
             if screen_y >= self.y && screen_y < self.y + self.h {
+                // At an inline-style boundary the caret leans toward the side whose
+                // style newly typed text will take, so one logical offset reads as
+                // two visually distinct caret positions even with reveal codes off.
+                // Suppressed when a selection is active (the lean is about where
+                // typing lands, which doesn't apply to a selection), under reveal
+                // codes (which draws the tags themselves), and on a cell backend
+                // that can't render the lean (folded into `affinity_active`). The
+                // backend decides how to draw the lean; the default draws head and
+                // foot ticks.
+                let lean = if !self.reveal_codes()
+                    && self.editor.selection().is_none()
+                    && self.editor.affinity_active()
+                    && self.editor.cursor_at_style_boundary()
+                {
+                    match self.editor.cursor_affinity() {
+                        Affinity::Left => CaretLean::Left,
+                        Affinity::Right => CaretLean::Right,
+                    }
+                } else {
+                    CaretLean::None
+                };
                 ctx.set_color(self.theme.cursor_color);
-                // Draw the caret as a 2px-wide bar rather than a 1px line so
-                // it's easier to spot (a hairline caret is easy to lose,
-                // especially on high-DPI displays).
-                ctx.draw_rect_filled(screen_x, screen_y, 2, ch);
+                ctx.draw_caret(screen_x, screen_y, ch, lean);
             }
         }
 
@@ -3709,6 +3738,13 @@ mod tests {
     struct TestRenderContext {
         focus: bool,
         active: bool,
+        /// Emulate a character-cell backend: report no caret-affinity support, so
+        /// the engine should collapse the two boundary stops into one. Default
+        /// `false` keeps the pixel-backend behavior the other tests expect.
+        cell_backend: bool,
+        /// Every filled rect drawn this pass, as `(x, y, w, h)` — lets tests
+        /// observe the caret bar and its foot tick.
+        rects: Vec<(i32, i32, i32, i32)>,
     }
 
     impl TestRenderContext {
@@ -3716,6 +3752,7 @@ mod tests {
             Self {
                 focus: true,
                 active: true,
+                ..Default::default()
             }
         }
     }
@@ -3727,9 +3764,15 @@ mod tests {
 
         fn draw_text(&mut self, _text: &str, _x: i32, _y: i32) {}
 
-        fn draw_rect_filled(&mut self, _x: i32, _y: i32, _w: i32, _h: i32) {}
+        fn draw_rect_filled(&mut self, x: i32, y: i32, w: i32, h: i32) {
+            self.rects.push((x, y, w, h));
+        }
 
         fn draw_line(&mut self, _x1: i32, _y1: i32, _x2: i32, _y2: i32) {}
+
+        fn supports_caret_affinity(&self) -> bool {
+            !self.cell_backend
+        }
 
         fn text_width(&mut self, text: &str, _font: FontType, _style: FontStyle, size: u8) -> f64 {
             // Simplistic width model: proportional to character count and font size
@@ -3782,6 +3825,131 @@ mod tests {
             editor.set_cursor(DocumentPosition::new(0, 0));
         }
         display
+    }
+
+    #[test]
+    fn default_caret_draws_direction_ticks_at_style_boundary() {
+        // "Hello " (plain) + "World!" (bold); style boundary at byte offset 6.
+        // The default draw_caret marks the lean with 6x2 head and foot ticks.
+        let doc = crate::markdown_converter::markdown_to_document("Hello **World!**");
+        let mut display = Renderer::new(0, 0, 400, 300);
+        display.editor_mut().set_document(doc);
+
+        // Draw, then return the direction-tick rects (w == 6, h == 2).
+        fn ticks(display: &mut Renderer) -> Vec<(i32, i32, i32, i32)> {
+            let mut ctx = TestRenderContext::new_with_focus();
+            display.draw(&mut ctx);
+            ctx.rects
+                .iter()
+                .copied()
+                .filter(|(_, _, w, h)| *w == 6 && *h == 2)
+                .collect()
+        }
+
+        // Mid-plain-text: not a boundary, so no ticks.
+        display
+            .editor_mut()
+            .set_cursor(DocumentPosition::at(TreePath::root(0), 3));
+        assert!(ticks(&mut display).is_empty());
+
+        // At the boundary with (default) Left affinity: a head and a foot tick,
+        // aligned in x and at distinct y's, both left of the caret.
+        display
+            .editor_mut()
+            .set_cursor(DocumentPosition::at(TreePath::root(0), 6));
+        let left = ticks(&mut display);
+        assert_eq!(
+            left.len(),
+            2,
+            "expected head and foot ticks at the boundary"
+        );
+        let left_x = left[0].0;
+        assert!(left.iter().all(|t| t.0 == left_x), "ticks share an x");
+        assert_ne!(
+            left[0].1, left[1].1,
+            "head and foot ticks sit at different y"
+        );
+
+        // Flip to Right affinity at the same offset: the ticks move to the right.
+        display.editor_mut().move_cursor_right();
+        assert_eq!(display.editor().cursor_affinity(), Affinity::Right);
+        let right = ticks(&mut display);
+        assert_eq!(right.len(), 2);
+        assert!(
+            right[0].0 > left_x,
+            "Right-affinity ticks must sit right of the Left-affinity ticks"
+        );
+    }
+
+    #[test]
+    fn selection_suppresses_direction_ticks() {
+        // Cursor resting on the style boundary, but with a selection active.
+        let doc = crate::markdown_converter::markdown_to_document("Hello **World!**");
+        let mut display = Renderer::new(0, 0, 400, 300);
+        display.editor_mut().set_document(doc);
+        {
+            let editor = display.editor_mut();
+            editor.set_cursor(DocumentPosition::at(TreePath::root(0), 5));
+            editor.move_cursor_right_extend(); // active end lands on the boundary (6)
+        }
+        assert!(display.editor().selection().is_some());
+        assert!(display.editor().cursor_at_style_boundary());
+
+        let mut ctx = TestRenderContext::new_with_focus();
+        display.draw(&mut ctx);
+        let ticks = ctx
+            .rects
+            .iter()
+            .filter(|(_, _, w, h)| *w == 6 && *h == 2)
+            .count();
+        assert_eq!(ticks, 0, "no direction ticks while a selection is active");
+    }
+
+    #[test]
+    fn cell_backend_collapses_affinity() {
+        // A backend that can't render the lean (a character cell) must get the
+        // classic single-caret model: no extra stop, no lean, even at a boundary.
+        let doc = crate::markdown_converter::markdown_to_document("Hello **World!**");
+        let mut display = Renderer::new(0, 0, 400, 300);
+        display.editor_mut().set_document(doc);
+        // Land on the boundary and try to flip to Right affinity — before any draw
+        // has synced the backend capability, so this momentarily takes.
+        {
+            let editor = display.editor_mut();
+            editor.set_cursor(DocumentPosition::at(TreePath::root(0), 6));
+            editor.move_cursor_right();
+            assert_eq!(editor.cursor_affinity(), Affinity::Right);
+        }
+
+        // Draw through a cell backend: the layout pass syncs the capability, which
+        // resets the affinity and makes it inert.
+        let mut ctx = TestRenderContext {
+            focus: true,
+            active: true,
+            cell_backend: true,
+            ..Default::default()
+        };
+        display.draw(&mut ctx);
+
+        assert!(!display.editor().affinity_active(), "affinity is inert");
+        assert_eq!(display.editor().cursor_affinity(), Affinity::Left);
+        let ticks = ctx
+            .rects
+            .iter()
+            .filter(|(_, _, w, h)| *w == 6 && *h == 2)
+            .count();
+        assert_eq!(ticks, 0, "cell backend draws no direction ticks");
+
+        // And Right stepping no longer pauses at the boundary: from just before it,
+        // one press crosses the grapheme instead of flipping affinity in place.
+        display
+            .editor_mut()
+            .set_cursor(DocumentPosition::at(TreePath::root(0), 6));
+        display.editor_mut().move_cursor_right();
+        assert!(
+            !display.editor().cursor_at_style_boundary(),
+            "no extra affinity stop on a cell backend"
+        );
     }
 
     fn table_block(rows: usize) -> Block {

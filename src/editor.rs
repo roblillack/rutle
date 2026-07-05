@@ -27,20 +27,30 @@ use tdoc::Document;
 use tdoc::inline::Span;
 use tdoc::paragraph::{ChecklistItem, Paragraph};
 
-/// Inline-style labels active at byte `offset` within a leaf's flat runs,
-/// outermost first. Left-biased at a run boundary (the cursor inherits the run
-/// ending there), so a cursor resting at the end of a bold word still reads as
-/// bold — matching classic Pure.
-fn inline_labels_at(runs: &[InlineContent], offset: usize) -> Vec<&'static str> {
+/// Inline-style labels active at byte `offset` within a leaf's flat runs, outermost
+/// first. At a run boundary `affinity` selects which side is read: `Left` inherits the
+/// run ending there (so a cursor resting at the end of a bold word still reads as bold —
+/// matching classic Pure), `Right` the run beginning there.
+fn inline_labels_at(
+    runs: &[InlineContent],
+    offset: usize,
+    affinity: Affinity,
+) -> Vec<&'static str> {
     let mut pos = 0usize;
     for item in runs {
         let len = item.to_plain_text().len();
-        if offset > pos && offset <= pos + len {
+        // Left affinity reads the run ending at `offset`; Right affinity the run
+        // beginning there. They differ only at a style boundary.
+        let in_run = match affinity {
+            Affinity::Left => offset > pos && offset <= pos + len,
+            Affinity::Right => offset >= pos && offset < pos + len,
+        };
+        if in_run {
             return match item {
                 InlineContent::Text(run) => style_labels(run.style),
                 InlineContent::Link { content, .. } => {
                     let mut labels = vec!["Link"];
-                    let inner = inline_labels_at(content, offset - pos);
+                    let inner = inline_labels_at(content, offset - pos, affinity);
                     // A link nested directly inside a link is degenerate; show a
                     // single "Link" rather than "Link > Link".
                     let inner = if inner.first() == Some(&"Link") {
@@ -81,6 +91,25 @@ fn style_labels(style: TextStyle) -> Vec<&'static str> {
         labels.push("Code");
     }
     labels
+}
+
+/// Which side of an inline-style boundary the caret associates with — its *affinity*.
+///
+/// At a style boundary (e.g. the seam between `Hello ` and a bold `World!`) a single
+/// byte offset denotes two distinct caret positions: one belonging to the run that
+/// *ends* there and one to the run that *begins* there. Affinity disambiguates them,
+/// deciding which run newly typed text joins (and hence what style it inherits) and
+/// which way the caret's direction indicator points. Away from a boundary it is always
+/// `Left`, so the default preserves the historical left-biased behavior. This is the
+/// mechanism that gives "two caret positions per style boundary" even when reveal codes
+/// is off — see [`Editor::cursor_at_style_boundary`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Affinity {
+    /// Associate with the run *ending* at the offset (the character to the left).
+    #[default]
+    Left,
+    /// Associate with the run *beginning* at the offset (the character to the right).
+    Right,
 }
 
 /// Result of an editing operation
@@ -139,6 +168,26 @@ pub struct Editor {
     /// the bare `DocumentPosition` can't express — without changing row:col.
     /// Always 0 unless reveal codes is on.
     cursor_reveal_stop: usize,
+    /// Whether the caret pauses for an extra affinity stop at each inline-style
+    /// boundary (the "two caret positions per boundary" behavior). On by default.
+    /// When off, Left/Right step a plain grapheme, insertion is left-biased, and
+    /// the caret draws no direction trail — i.e. the classic single-caret model.
+    /// Independent of (and inert under) reveal codes, which has its own stepping.
+    style_boundary_stops: bool,
+    /// Which side of an inline-style boundary the caret associates with. Only
+    /// meaningful when the cursor sits exactly on a style boundary (see
+    /// [`Editor::cursor_at_style_boundary`]); elsewhere it stays `Left`. Drives
+    /// both the style newly typed text inherits and the caret's on-screen
+    /// direction indicator, providing the "two caret positions per boundary"
+    /// behavior when reveal codes is *off*.
+    cursor_affinity: Affinity,
+    /// Whether the *backend* can render the affinity lean at all. A cell backend
+    /// can't (its caret is one indivisible cell), so the renderer syncs this from
+    /// [`crate::RenderContext::supports_caret_affinity`] on every layout pass. When
+    /// `false`, affinity is inert no matter what `style_boundary_stops` says — the
+    /// two stops collapse to one and the caret never leans. `true` by default,
+    /// matching a pixel backend (and a bare editor with no renderer attached yet).
+    affinity_supported: bool,
 }
 
 impl Editor {
@@ -166,6 +215,9 @@ impl Editor {
             last_edit_time: None,
             reveal_codes: false,
             cursor_reveal_stop: 0,
+            style_boundary_stops: true,
+            cursor_affinity: Affinity::Left,
+            affinity_supported: true,
         };
         editor.normalize_cursor();
         editor
@@ -253,7 +305,7 @@ impl Editor {
     /// inline portion of classic Pure's cursor breadcrumb.
     pub fn cursor_inline_labels(&self) -> Vec<&'static str> {
         let runs = tree_walk::leaf_inline(&self.tdoc, &self.cursor.path);
-        inline_labels_at(&runs, self.cursor.offset)
+        inline_labels_at(&runs, self.cursor.offset, self.cursor_affinity)
     }
 
     /// Whether reveal-codes mode is active (see the `reveal_codes` field).
@@ -267,10 +319,75 @@ impl Editor {
         self.cursor_reveal_stop = 0;
     }
 
+    /// Whether the caret pauses for an extra affinity stop at inline-style
+    /// boundaries (see the `style_boundary_stops` field). On by default.
+    pub fn style_boundary_stops(&self) -> bool {
+        self.style_boundary_stops
+    }
+
+    /// Enable or disable the extra affinity stop at inline-style boundaries. When
+    /// disabling, the caret's affinity is reset to the neutral `Left` so no stale
+    /// right-bias lingers.
+    pub fn set_style_boundary_stops(&mut self, enabled: bool) {
+        self.style_boundary_stops = enabled;
+        if !enabled {
+            self.cursor_affinity = Affinity::Left;
+        }
+    }
+
+    /// Tell the editor whether the backend can render the affinity lean. Driven by
+    /// the renderer from [`crate::RenderContext::supports_caret_affinity`]; hosts
+    /// don't normally call it directly. A cell backend passes `false`, which makes
+    /// affinity inert (the two boundary stops collapse to one) irrespective of the
+    /// user's `style_boundary_stops` preference. Idempotent; clearing support resets
+    /// any lingering right-bias to the neutral `Left`, like disabling the toggle.
+    pub fn set_affinity_supported(&mut self, supported: bool) {
+        if self.affinity_supported == supported {
+            return;
+        }
+        self.affinity_supported = supported;
+        if !supported {
+            self.cursor_affinity = Affinity::Left;
+        }
+    }
+
+    /// Whether inline-style affinity is *actually* in effect right now: the user
+    /// preference ([`Self::style_boundary_stops`]) is on **and** the backend can
+    /// render the lean ([`Self::set_affinity_supported`]). This is the single gate
+    /// the navigation, insertion, and caret-drawing paths consult.
+    pub(crate) fn affinity_active(&self) -> bool {
+        self.style_boundary_stops && self.affinity_supported
+    }
+
     /// How many reveal tags at the cursor's offset the caret sits past (see the
     /// `cursor_reveal_stop` field). Consumed by the display when placing the caret.
     pub fn cursor_reveal_stop(&self) -> usize {
         self.cursor_reveal_stop
+    }
+
+    /// The caret's current affinity — which side of a style boundary it associates
+    /// with. Consumed by the display to point the caret's direction indicator and by
+    /// [`Self::insert_text`] to pick the style newly typed text inherits.
+    pub fn cursor_affinity(&self) -> Affinity {
+        self.cursor_affinity
+    }
+
+    /// Whether the caret currently sits exactly on an inline-style boundary — an offset
+    /// where the run to its left and the run to its right carry different styles
+    /// (including a leaf's leading/trailing style edges). Only at such a position does
+    /// [`Self::cursor_affinity`] have an effect and does Left/Right stepping pause for
+    /// the extra affinity stop.
+    pub fn cursor_at_style_boundary(&self) -> bool {
+        self.style_boundary_at(&self.cursor.path, self.cursor.offset)
+    }
+
+    /// Whether `offset` is an inline-style boundary within the leaf at `path`. Derived
+    /// from the same reveal-tag model reveal codes uses, but without requiring reveal
+    /// codes to be on — a style transition (or a leaf's leading/trailing styled edge)
+    /// produces at least one tag there.
+    fn style_boundary_at(&self, path: &TreePath, offset: usize) -> bool {
+        let content = tree_walk::leaf_inline(&self.tdoc, path);
+        reveal_tag_count_at(&content, offset) > 0
     }
 
     /// Number of reveal-tag cursor stops at `offset` in the given leaf (0 when
@@ -354,6 +471,41 @@ impl Editor {
         }
         let stops = self.reveal_stops_at(&word.path, word.offset);
         (word, stops)
+    }
+
+    /// Affinity-aware left step used when reveal codes is *off*. At a style boundary the
+    /// caret pauses for two stops — `Right` (the run to its right) then `Left` (the run
+    /// to its left) — before crossing to the previous grapheme. Mirror of
+    /// [`Self::affinity_position_right`].
+    fn affinity_position_left(&self) -> (DocumentPosition, Affinity) {
+        // Standing on a boundary with Right affinity: flip to Left in place.
+        if self.cursor_affinity == Affinity::Right
+            && self.style_boundary_at(&self.cursor.path, self.cursor.offset)
+        {
+            return (self.cursor.clone(), Affinity::Left);
+        }
+        let prev = self.position_left(&self.cursor);
+        // Crossing left onto a boundary lands on its right-hand (later) stop first.
+        let affinity = if prev != self.cursor && self.style_boundary_at(&prev.path, prev.offset) {
+            Affinity::Right
+        } else {
+            Affinity::Left
+        };
+        (prev, affinity)
+    }
+
+    /// Affinity-aware right step used when reveal codes is *off*. Mirror of
+    /// [`Self::affinity_position_left`]: on a boundary, `Left` flips to `Right` in place
+    /// before the next press crosses to the following grapheme.
+    fn affinity_position_right(&self) -> (DocumentPosition, Affinity) {
+        if self.cursor_affinity == Affinity::Left
+            && self.style_boundary_at(&self.cursor.path, self.cursor.offset)
+        {
+            return (self.cursor.clone(), Affinity::Right);
+        }
+        // Crossing right always arrives on the earlier (Left) stop of the destination;
+        // a boundary's Right stop is only ever reached by the in-place flip above.
+        (self.position_right(&self.cursor), Affinity::Left)
     }
 
     /// When reveal codes is on, delete the inline-style tag the caret sits beside
@@ -524,6 +676,9 @@ impl Editor {
         // Any cursor move other than reveal-tag stepping lands "before" the tags;
         // the two horizontal movers restore the stepped value after calling this.
         self.cursor_reveal_stop = 0;
+        // Likewise, most moves reset affinity to the historical left bias; the
+        // horizontal movers restore the stepped affinity after normalizing.
+        self.cursor_affinity = Affinity::Left;
     }
 
     // ----- Cursor & selection --------------------------------------------------------
@@ -536,6 +691,7 @@ impl Editor {
         self.break_undo_coalescing();
         self.cursor = tree_walk::clamp_position(&self.tdoc, &pos);
         self.selection = None;
+        self.cursor_affinity = Affinity::Left;
         self.trigger_paragraph_change();
     }
 
@@ -640,7 +796,14 @@ impl Editor {
     // ----- Insertion -----------------------------------------------------------------
 
     pub fn insert_text(&mut self, text: &str) -> EditResult {
+        // Right affinity (only reachable at a style boundary, and irrelevant when a
+        // selection is about to be replaced) makes the inserted text join the run
+        // beginning at the offset instead of the one ending there.
+        let bias_right = self.affinity_active()
+            && self.selection.is_none()
+            && self.cursor_affinity == Affinity::Right;
         self.cursor_reveal_stop = 0;
+        self.cursor_affinity = Affinity::Left;
         if self.leaf_count() == 0 {
             self.tdoc
                 .add_paragraph(Paragraph::new_text().with_content(inline_to_spans(&[
@@ -662,7 +825,9 @@ impl Editor {
         }
 
         let offset = self.cursor.offset;
-        self.edit_leaf(&path, |content| insert_into_content(content, offset, text));
+        self.edit_leaf(&path, |content| {
+            insert_into_content(content, offset, text, bias_right)
+        });
         self.cursor.offset = offset + text.len();
         Ok(())
     }
@@ -1022,21 +1187,46 @@ impl Editor {
 
     pub fn move_cursor_left(&mut self) {
         self.break_undo_coalescing();
-        let (new, stop) = self.reveal_position_left();
-        self.cursor = new;
-        self.normalize_cursor();
-        self.selection = None;
-        // normalize_cursor reset the reveal-stop; restore the stepped value.
-        self.cursor_reveal_stop = stop;
+        if self.reveal_codes {
+            let (new, stop) = self.reveal_position_left();
+            self.cursor = new;
+            self.normalize_cursor();
+            self.selection = None;
+            // normalize_cursor reset the reveal-stop; restore the stepped value.
+            self.cursor_reveal_stop = stop;
+        } else if self.affinity_active() {
+            let (new, affinity) = self.affinity_position_left();
+            self.cursor = new;
+            self.normalize_cursor();
+            self.selection = None;
+            // normalize_cursor reset the affinity; restore the stepped value.
+            self.cursor_affinity = affinity;
+        } else {
+            self.cursor = self.position_left(&self.cursor);
+            self.normalize_cursor();
+            self.selection = None;
+        }
     }
 
     pub fn move_cursor_right(&mut self) {
         self.break_undo_coalescing();
-        let (new, stop) = self.reveal_position_right();
-        self.cursor = new;
-        self.normalize_cursor();
-        self.selection = None;
-        self.cursor_reveal_stop = stop;
+        if self.reveal_codes {
+            let (new, stop) = self.reveal_position_right();
+            self.cursor = new;
+            self.normalize_cursor();
+            self.selection = None;
+            self.cursor_reveal_stop = stop;
+        } else if self.affinity_active() {
+            let (new, affinity) = self.affinity_position_right();
+            self.cursor = new;
+            self.normalize_cursor();
+            self.selection = None;
+            self.cursor_affinity = affinity;
+        } else {
+            self.cursor = self.position_right(&self.cursor);
+            self.normalize_cursor();
+            self.selection = None;
+        }
     }
 
     fn position_left(&self, pos: &DocumentPosition) -> DocumentPosition {
@@ -2674,8 +2864,17 @@ impl Default for Editor {
 
 /// Insert `text` into a flat inline-content vector at byte `offset`, preserving the style
 /// of the run the cursor sits in and keeping insertions at link edges outside the link.
-fn insert_into_content(content: &mut Vec<InlineContent>, offset: usize, text: &str) {
-    let (idx, content_offset) = find_content_at_offset(content, offset);
+fn insert_into_content(
+    content: &mut Vec<InlineContent>,
+    offset: usize,
+    text: &str,
+    bias_right: bool,
+) {
+    let (idx, content_offset) = if bias_right {
+        find_content_at_offset_right(content, offset)
+    } else {
+        find_content_at_offset(content, offset)
+    };
     if idx >= content.len() {
         content.push(InlineContent::Text(TextRun::plain(text)));
         return;
@@ -2727,11 +2926,28 @@ fn insert_into_content(content: &mut Vec<InlineContent>, offset: usize, text: &s
 }
 
 /// Find the inline element index and the offset within it for a flattened byte offset.
+/// Left-biased: at an exact run boundary this targets the run *ending* at `offset`.
 fn find_content_at_offset(content: &[InlineContent], offset: usize) -> (usize, usize) {
     let mut current = 0;
     for (idx, item) in content.iter().enumerate() {
         let len = item.text_len();
         if current + len >= offset {
+            return (idx, offset - current);
+        }
+        current += len;
+    }
+    (content.len(), 0)
+}
+
+/// Right-biased variant of [`find_content_at_offset`]: at an exact run boundary it
+/// targets the run *beginning* at `offset` rather than the one ending there, so text
+/// inserted with `Right` affinity inherits the following run's style. Past the last run
+/// (a trailing style edge) it falls through to a fresh plain run at the end.
+fn find_content_at_offset_right(content: &[InlineContent], offset: usize) -> (usize, usize) {
+    let mut current = 0;
+    for (idx, item) in content.iter().enumerate() {
+        let len = item.text_len();
+        if current + len > offset {
             return (idx, offset - current);
         }
         current += len;
@@ -2885,6 +3101,157 @@ mod tests {
         editor.set_cursor(DocumentPosition::at(TreePath::root(0), 2));
         editor.insert_text("X").unwrap();
         assert_eq!(editor.leaf_plain_text(&TreePath::root(0)), "boXld");
+    }
+
+    #[test]
+    fn affinity_pauses_at_style_boundary_moving_right() {
+        // "Hello " (plain) + "World!" (bold); the style boundary is at byte offset 6.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("Hello **World!**"));
+        editor.set_cursor(DocumentPosition::at(TreePath::root(0), 5));
+        assert!(!editor.cursor_at_style_boundary());
+
+        // Crossing into the boundary lands on its Left (earlier) stop.
+        editor.move_cursor_right();
+        assert_eq!(editor.cursor().offset, 6);
+        assert!(editor.cursor_at_style_boundary());
+        assert_eq!(editor.cursor_affinity(), Affinity::Left);
+
+        // Same offset — flip to the Right (later) stop.
+        editor.move_cursor_right();
+        assert_eq!(editor.cursor().offset, 6);
+        assert_eq!(editor.cursor_affinity(), Affinity::Right);
+
+        // Only now does the caret cross the grapheme.
+        editor.move_cursor_right();
+        assert_eq!(editor.cursor().offset, 7);
+        assert_eq!(editor.cursor_affinity(), Affinity::Left);
+    }
+
+    #[test]
+    fn affinity_pauses_at_style_boundary_moving_left() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("Hello **World!**"));
+        editor.set_cursor(DocumentPosition::at(TreePath::root(0), 7));
+
+        // Crossing left into the boundary lands on its Right (later) stop.
+        editor.move_cursor_left();
+        assert_eq!(editor.cursor().offset, 6);
+        assert_eq!(editor.cursor_affinity(), Affinity::Right);
+
+        // Flip to the Left stop in place.
+        editor.move_cursor_left();
+        assert_eq!(editor.cursor().offset, 6);
+        assert_eq!(editor.cursor_affinity(), Affinity::Left);
+
+        // Then cross the grapheme.
+        editor.move_cursor_left();
+        assert_eq!(editor.cursor().offset, 5);
+        assert!(!editor.cursor_at_style_boundary());
+    }
+
+    #[test]
+    fn plain_text_has_no_extra_affinity_stops() {
+        // Without a style boundary, Left/Right step a grapheme each — no pause.
+        let mut editor = Editor::new();
+        editor.insert_text("abc").unwrap();
+        editor.set_cursor(DocumentPosition::at(TreePath::root(0), 1));
+        editor.move_cursor_right();
+        assert_eq!(editor.cursor().offset, 2);
+        assert!(!editor.cursor_at_style_boundary());
+    }
+
+    #[test]
+    fn insert_at_boundary_respects_affinity() {
+        // Left affinity keeps typed text outside the bold run.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("Hello **World!**"));
+        editor.set_cursor(DocumentPosition::at(TreePath::root(0), 6));
+        assert_eq!(editor.cursor_affinity(), Affinity::Left);
+        editor.insert_text("X").unwrap();
+        assert_eq!(md(&editor), "Hello X**World!**");
+
+        // Right affinity makes the same keystroke join the bold run.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("Hello **World!**"));
+        editor.set_cursor(DocumentPosition::at(TreePath::root(0), 6));
+        editor.move_cursor_right(); // flip to Right affinity at the boundary
+        assert_eq!(editor.cursor_affinity(), Affinity::Right);
+        editor.insert_text("X").unwrap();
+        assert_eq!(md(&editor), "Hello **XWorld!**");
+    }
+
+    #[test]
+    fn cursor_inline_labels_follow_affinity() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("Hello **World!**"));
+        editor.set_cursor(DocumentPosition::at(TreePath::root(0), 6));
+        // Left stop reads the plain run to the left.
+        assert!(editor.cursor_inline_labels().is_empty());
+        // Right stop reads the bold run to the right.
+        editor.move_cursor_right();
+        assert_eq!(editor.cursor_inline_labels(), vec!["Bold"]);
+    }
+
+    #[test]
+    fn disabling_style_boundary_stops_restores_single_caret() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("Hello **World!**"));
+        editor.set_style_boundary_stops(false);
+        assert!(!editor.style_boundary_stops());
+
+        // No extra stop at the boundary: 5 -> 6 -> 7 with single presses.
+        editor.set_cursor(DocumentPosition::at(TreePath::root(0), 5));
+        editor.move_cursor_right();
+        assert_eq!(editor.cursor().offset, 6);
+        assert_eq!(editor.cursor_affinity(), Affinity::Left);
+        editor.move_cursor_right();
+        assert_eq!(editor.cursor().offset, 7);
+
+        // Insertion at the boundary stays left-biased (outside the bold run).
+        editor.set_cursor(DocumentPosition::at(TreePath::root(0), 6));
+        editor.insert_text("X").unwrap();
+        assert_eq!(md(&editor), "Hello X**World!**");
+    }
+
+    #[test]
+    fn unsupported_backend_collapses_affinity() {
+        // A cell backend reports no lean support: affinity must be inert even
+        // though `style_boundary_stops` is on by default — the guarantee a cell
+        // renderer relies on. Mirrors disabling the toggle, but via the backend.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("Hello **World!**"));
+        assert!(editor.style_boundary_stops());
+
+        // Establish Right affinity first, then pull backend support: it resets.
+        editor.set_cursor(DocumentPosition::at(TreePath::root(0), 6));
+        editor.move_cursor_right();
+        assert_eq!(editor.cursor_affinity(), Affinity::Right);
+        editor.set_affinity_supported(false);
+        assert!(!editor.affinity_active());
+        assert_eq!(editor.cursor_affinity(), Affinity::Left);
+
+        // No extra stop at the boundary: 5 -> 6 -> 7 with single presses.
+        editor.set_cursor(DocumentPosition::at(TreePath::root(0), 5));
+        editor.move_cursor_right();
+        assert_eq!(editor.cursor().offset, 6);
+        editor.move_cursor_right();
+        assert_eq!(editor.cursor().offset, 7);
+
+        // Insertion at the boundary stays left-biased (outside the bold run).
+        editor.set_cursor(DocumentPosition::at(TreePath::root(0), 6));
+        editor.insert_text("X").unwrap();
+        assert_eq!(md(&editor), "Hello X**World!**");
+
+        // Restoring support brings the extra stop back. Reset the document so the
+        // boundary is at offset 6 again (the insert above shifted it).
+        editor.set_affinity_supported(true);
+        editor.set_document(markdown_to_document("Hello **World!**"));
+        assert!(editor.affinity_active());
+        editor.set_cursor(DocumentPosition::at(TreePath::root(0), 6));
+        editor.move_cursor_right(); // flips to Right affinity in place
+        assert_eq!(editor.cursor().offset, 6);
+        assert_eq!(editor.cursor_affinity(), Affinity::Right);
     }
 
     #[test]

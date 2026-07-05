@@ -33,6 +33,16 @@ fn cursor_positioning_middle_of_line() {
 }
 
 #[test]
+fn caret_affinity_left() {
+    insta::assert_binary_snapshot!(".svg", common::caret_affinity_left(MODE));
+}
+
+#[test]
+fn caret_affinity_right() {
+    insta::assert_binary_snapshot!(".svg", common::caret_affinity_right(MODE));
+}
+
+#[test]
 fn table_render() {
     insta::assert_binary_snapshot!(".svg", common::table_render(MODE));
 }
