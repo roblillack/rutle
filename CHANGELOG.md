@@ -21,7 +21,7 @@ While pre-1.0, the minor version is bumped for breaking changes.
   `inline_to_spans` now factors shared styles (outermost first) into a single
   wrapping span, so the round-trip stays stable. As a side effect, a run that
   combines `code` with another style now nests correctly instead of dropping the
-  other style.
+  other style. (#2)
 
 ## [0.3.0] - 2026-07-05
 
