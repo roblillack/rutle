@@ -10,6 +10,19 @@ While pre-1.0, the minor version is bumped for breaking changes.
 
 ## [Unreleased] - ReleaseDate
 
+### Fixed
+
+- Rebuilding a tdoc span tree from the flat inline model no longer emits two
+  adjacent same-style spans when consecutive runs share an outer style (e.g.
+  `~~**durch**gestrichen~~`, where only the first run is also bold). Previously
+  each run was nested independently, producing sibling `Strike{…}` spans that
+  tdoc serialized to a colliding delimiter run (`~~…~~~~…~~`, `****`) which no
+  longer parsed as emphasis — so editing and saving such text corrupted it.
+  `inline_to_spans` now factors shared styles (outermost first) into a single
+  wrapping span, so the round-trip stays stable. As a side effect, a run that
+  combines `code` with another style now nests correctly instead of dropping the
+  other style. (#2)
+
 ## [0.3.0] - 2026-07-05
 
 ### Added
