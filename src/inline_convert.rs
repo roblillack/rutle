@@ -23,12 +23,33 @@ pub(crate) fn spans_to_inline(spans: &[Span]) -> Vec<InlineContent> {
 }
 
 /// Rebuild a tdoc span tree from the editor's flat inline representation.
+///
+/// Consecutive text runs that share an outer style are wrapped in a *single*
+/// span for that style rather than one span per run. Emitting one span per run
+/// would place two same-style spans side by side (e.g. `Strike{…}` next to
+/// `Strike{…}`), which serializes to a colliding delimiter run (`~~…~~~~…~~`,
+/// `****`) that no longer parses. Factoring shared styles out keeps the tree —
+/// and the Markdown produced from it — round-trippable.
 pub(crate) fn inline_to_spans(content: &[InlineContent]) -> Vec<Span> {
     let mut spans = Vec::new();
-    for item in content {
-        match item {
-            InlineContent::Text(run) => {
-                spans.extend(text_run_to_spans(run));
+    let mut idx = 0;
+    while idx < content.len() {
+        match &content[idx] {
+            // Gather a maximal run of adjacent text runs and rebuild them
+            // together so shared styles can be factored across the boundary.
+            InlineContent::Text(_) => {
+                let start = idx;
+                while let Some(InlineContent::Text(_)) = content.get(idx) {
+                    idx += 1;
+                }
+                let runs: Vec<&TextRun> = content[start..idx]
+                    .iter()
+                    .filter_map(|item| match item {
+                        InlineContent::Text(run) => Some(run),
+                        _ => None,
+                    })
+                    .collect();
+                spans.extend(runs_to_spans(&runs, 0));
             }
             InlineContent::Link { link, content } => {
                 let mut span =
@@ -37,66 +58,95 @@ pub(crate) fn inline_to_spans(content: &[InlineContent]) -> Vec<Span> {
                     span = span.with_link_target(link.destination.clone());
                 }
                 spans.push(span);
+                idx += 1;
             }
             InlineContent::HardBreak => {
                 spans.push(Span::new_text("\n"));
+                idx += 1;
             }
         }
     }
     spans
 }
 
-fn text_run_to_spans(run: &TextRun) -> Vec<Span> {
+/// Emphasis styles applied by [`runs_to_spans`], ordered outermost → innermost.
+/// This fixed order defines the canonical nesting and mirrors the inverse
+/// flattening in `spans_to_inline`, so an edit→serialize cycle is stable.
+const STYLE_LAYERS: [InlineStyle; 5] = [
+    InlineStyle::Highlight,
+    InlineStyle::Underline,
+    InlineStyle::Strike,
+    InlineStyle::Bold,
+    InlineStyle::Italic,
+];
+
+fn style_has_layer(style: &TextStyle, layer: InlineStyle) -> bool {
+    match layer {
+        InlineStyle::Highlight => style.highlight,
+        InlineStyle::Underline => style.underline,
+        InlineStyle::Strike => style.strikethrough,
+        InlineStyle::Bold => style.bold,
+        InlineStyle::Italic => style.italic,
+        _ => false,
+    }
+}
+
+/// Rebuild spans for a slice of consecutive text runs, factoring the style at
+/// `layer` (and, recursively, the inner layers) out of maximal groups of runs
+/// that share it.
+fn runs_to_spans(runs: &[&TextRun], layer: usize) -> Vec<Span> {
+    if runs.is_empty() {
+        return Vec::new();
+    }
+
+    let Some(&style) = STYLE_LAYERS.get(layer) else {
+        // All emphasis layers consumed; emit the leaves.
+        return runs.iter().flat_map(|run| leaf_run_to_spans(run)).collect();
+    };
+
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < runs.len() {
+        let active = style_has_layer(&runs[i].style, style);
+        let start = i;
+        while i < runs.len() && style_has_layer(&runs[i].style, style) == active {
+            i += 1;
+        }
+        let group = &runs[start..i];
+        if active {
+            let children = runs_to_spans(group, layer + 1);
+            spans.push(Span::new_styled(style).with_children(children));
+        } else {
+            spans.extend(runs_to_spans(group, layer + 1));
+        }
+    }
+    spans
+}
+
+/// Emit the leaf spans for a fully-unwrapped run: a code span, or plain text
+/// with any embedded newlines split out (matching tdoc's representation).
+fn leaf_run_to_spans(run: &TextRun) -> Vec<Span> {
     if run.style.code {
         return vec![Span::new_styled(InlineStyle::Code).with_text(&run.text)];
     }
 
     let mut spans = Vec::new();
     let mut buffer = String::new();
-
     for ch in run.text.chars() {
         if ch == '\n' {
             if !buffer.is_empty() {
-                spans.push(apply_style_to_text(&buffer, run.style));
-                buffer.clear();
+                spans.push(Span::new_text(std::mem::take(&mut buffer)));
             }
             spans.push(Span::new_text("\n"));
         } else {
             buffer.push(ch);
         }
     }
-
     if !buffer.is_empty() {
-        spans.push(apply_style_to_text(&buffer, run.style));
+        spans.push(Span::new_text(buffer));
     }
 
     spans
-}
-
-fn apply_style_to_text(text: &str, style: TextStyle) -> Span {
-    if style.code {
-        return Span::new_styled(InlineStyle::Code).with_text(text);
-    }
-
-    let mut span = Span::new_text(text);
-
-    if style.italic {
-        span = Span::new_styled(InlineStyle::Italic).with_children(vec![span]);
-    }
-    if style.bold {
-        span = Span::new_styled(InlineStyle::Bold).with_children(vec![span]);
-    }
-    if style.strikethrough {
-        span = Span::new_styled(InlineStyle::Strike).with_children(vec![span]);
-    }
-    if style.underline {
-        span = Span::new_styled(InlineStyle::Underline).with_children(vec![span]);
-    }
-    if style.highlight {
-        span = Span::new_styled(InlineStyle::Highlight).with_children(vec![span]);
-    }
-
-    span
 }
 
 fn span_to_inline_internal(span: &Span, active: TextStyle, out: &mut Vec<InlineContent>) {
@@ -249,5 +299,55 @@ mod tests {
         let spans = inline_to_spans(&content);
         let back = spans_to_inline(&spans);
         assert_eq!(back, content);
+    }
+
+    /// Adjacent runs sharing an outer style must rebuild into a single wrapping
+    /// span, not two siblings — otherwise the Markdown serializer emits a
+    /// colliding `~~…~~~~…~~` delimiter run. This models `~~**durch**gestrichen~~`,
+    /// where only the first run is also bold.
+    #[test]
+    fn adjacent_shared_style_is_factored() {
+        let strike = TextStyle {
+            strikethrough: true,
+            ..Default::default()
+        };
+        let strike_bold = TextStyle {
+            strikethrough: true,
+            bold: true,
+            ..Default::default()
+        };
+        let content = vec![
+            InlineContent::Text(TextRun::new("durch", strike_bold)),
+            InlineContent::Text(TextRun::new("gestrichen", strike)),
+        ];
+
+        let spans = inline_to_spans(&content);
+
+        // One Strike span wrapping both runs, with the bold nested inside it.
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].style, InlineStyle::Strike);
+        assert_eq!(spans[0].children.len(), 2);
+        assert_eq!(spans[0].children[0].style, InlineStyle::Bold);
+        assert_eq!(spans[0].children[1].style, InlineStyle::None);
+
+        // The rebuild is the exact inverse of the flatten.
+        assert_eq!(spans_to_inline(&spans), content);
+    }
+
+    #[test]
+    fn adjacent_bold_runs_share_one_span() {
+        let content = vec![
+            InlineContent::Text(TextRun::new("a", TextStyle::bold())),
+            InlineContent::Text(TextRun::new("b", TextStyle::bold())),
+        ];
+        let spans = inline_to_spans(&content);
+        // A single bold span, not two siblings (which would emit `**a****b**`).
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].style, InlineStyle::Bold);
+        // Flattening coalesces the two same-style runs into one.
+        assert_eq!(
+            spans_to_inline(&spans),
+            vec![InlineContent::Text(TextRun::new("ab", TextStyle::bold()))]
+        );
     }
 }
