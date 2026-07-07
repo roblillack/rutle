@@ -1824,6 +1824,19 @@ impl Editor {
                 return Ok(());
             }
         }
+        // A leaf-type change (Paragraph / Heading / Code) applied to a selection that spans more
+        // than one block must convert *every* selected block, not just the one the cursor sits
+        // in. Do it leaf by leaf so each is lifted out of its list/quote container exactly as a
+        // single-block change would be; otherwise a multi-item/multi-block selection only
+        // updates the cursor's block (the collapsed-container path below is cursor-only).
+        if matches!(
+            block_type,
+            BlockType::Paragraph | BlockType::Heading { .. } | BlockType::CodeBlock { .. }
+        ) && let Some((i0, i1)) = self.selected_leaf_index_range()
+            && i0 < i1
+        {
+            return self.set_leaf_block_type_over_selection(i0, i1, block_type);
+        }
         let path = self.cursor.path.clone();
         if tree_walk::cursor_in_collapsed_container(&self.tdoc, &path) {
             return self.set_collapsed_container_block_type(&path, block_type);
@@ -2048,6 +2061,83 @@ impl Editor {
         self.normalize_cursor();
         self.trigger_paragraph_change();
         Ok(())
+    }
+
+    /// The inclusive flat leaf-index range the selection covers, or `None` if there is no
+    /// selection or its endpoints do not resolve to leaves. Structural block ops (delist,
+    /// dissolve) preserve leaf order and count, so a range identified here stays valid as
+    /// blocks are converted one by one.
+    fn selected_leaf_index_range(&self) -> Option<(usize, usize)> {
+        let (a, b) = self.selection.clone()?;
+        let i = self.leaf_index(&a.path)?;
+        let j = self.leaf_index(&b.path)?;
+        Some((i.min(j), i.max(j)))
+    }
+
+    /// Convert every leaf in flat-index range `i0..=i1` to a leaf block type (Paragraph /
+    /// Heading / Code), lifting each out of any list/quote container just as a single-block
+    /// change does. Walks last→first so lifting a block (which can split a list) never shifts
+    /// the earlier, not-yet-processed leaves; the whole converted range is left selected.
+    fn set_leaf_block_type_over_selection(
+        &mut self,
+        i0: usize,
+        i1: usize,
+        block_type: BlockType,
+    ) -> EditResult {
+        for k in (i0..=i1).rev() {
+            let Some(path) = self.leaf_paths().get(k).cloned() else {
+                continue;
+            };
+            match block_type {
+                BlockType::Paragraph => {
+                    self.convert_pseudo_leaf(&path, |s| Paragraph::new_text().with_content(s));
+                }
+                BlockType::Heading { level } => {
+                    let level = level.clamp(1, 3);
+                    self.convert_pseudo_leaf(&path, move |s| make_header(level, s));
+                }
+                BlockType::CodeBlock { .. } => {
+                    self.convert_pseudo_leaf(&path, |s| {
+                        Paragraph::new_code_block().with_content(s)
+                    });
+                }
+                _ => {}
+            }
+        }
+        let leaves = self.leaf_paths();
+        if let (Some(a), Some(b)) = (leaves.get(i0).cloned(), leaves.get(i1).cloned()) {
+            let end = self.leaf_text_len(&b);
+            self.cursor = DocumentPosition::at(b.clone(), end);
+            self.selection = Some((DocumentPosition::at(a, 0), DocumentPosition::at(b, end)));
+        }
+        self.normalize_cursor();
+        self.trigger_paragraph_change();
+        Ok(())
+    }
+
+    /// Change the pseudo-leaf at `path` into the leaf paragraph `make` produces. A collapsed
+    /// single-text container (a one-line list item / quote / checklist item) is first lifted out
+    /// of that container so the new block lands at the container's level — mirroring a
+    /// single-cursor block change. The leaf's flat index is stable across the lift, so the
+    /// lifted node is relocated by that index before the variant swap.
+    fn convert_pseudo_leaf(&mut self, path: &TreePath, make: impl Fn(Vec<Span>) -> Paragraph) {
+        if tree_walk::cursor_in_collapsed_container(&self.tdoc, path) {
+            let idx = self.leaf_index(path);
+            let lifted = if matches!(path.last(), Some(PathSegment::QuoteChild(_))) {
+                let container = TreePath(path.segments()[..path.len().saturating_sub(1)].to_vec());
+                tree_edit::dissolve_container(&mut self.tdoc, &container).is_some()
+            } else {
+                tree_edit::delist_item(&mut self.tdoc, path).is_some()
+            };
+            if !lifted {
+                return;
+            }
+            if let Some(new_path) = idx.and_then(|i| self.leaf_paths().get(i).cloned()) {
+                tree_edit::replace_leaf_variant(&mut self.tdoc, &new_path, &make);
+            }
+        } else {
+            tree_edit::replace_leaf_variant(&mut self.tdoc, path, &make);
+        }
     }
 
     /// The cursor's top-level paragraph index, if the cursor is at the top level.
@@ -4719,6 +4809,105 @@ mod tests {
         assert!(editor.selection().is_some());
         editor.toggle_ordered_list().unwrap();
         assert_eq!(md(&editor), "first\n\nsecond\n\nthird");
+    }
+
+    /// Select a whole block range from either end, apply a block type, and assert the result is
+    /// the same both ways (i.e. it does not depend on where the cursor/focus landed).
+    fn assert_block_type_reproducible(
+        markdown: &str,
+        a: TreePath,
+        b: TreePath,
+        block_type: BlockType,
+        expected: &str,
+    ) {
+        for (focus, anchor) in [(a.clone(), b.clone()), (b.clone(), a.clone())] {
+            let mut editor = Editor::new();
+            editor.set_document(markdown_to_document(markdown));
+            editor.set_cursor(DocumentPosition::at(focus.clone(), 0));
+            editor.set_selection(
+                DocumentPosition::at(anchor, 0),
+                DocumentPosition::at(focus, 0),
+            );
+            editor.set_block_type(block_type.clone()).unwrap();
+            assert_eq!(
+                md(&editor),
+                expected,
+                "block-type change should not depend on selection direction"
+            );
+        }
+    }
+
+    #[test]
+    fn heading_over_all_list_items_converts_every_item() {
+        // Selecting every item of a bullet list and choosing Heading 1 turns each into a
+        // top-level heading (the list dissolves) — not just the cursor's item.
+        assert_block_type_reproducible(
+            "- one\n- two\n- three",
+            list_item_path(0),
+            list_item_path(2),
+            BlockType::Heading { level: 1 },
+            "# one\n\n# two\n\n# three",
+        );
+    }
+
+    #[test]
+    fn heading_over_partial_list_items_splits_the_list() {
+        // Selecting the middle two of four items converts exactly those, splitting the list
+        // into the untouched head and tail around the new headings.
+        assert_block_type_reproducible(
+            "- a\n- b\n- c\n- d",
+            list_item_path(1),
+            list_item_path(2),
+            BlockType::Heading { level: 2 },
+            "- a\n\n## b\n\n## c\n\n- d",
+        );
+    }
+
+    #[test]
+    fn paragraph_over_headings_converts_all() {
+        assert_block_type_reproducible(
+            "# one\n\n## two\n\n### three",
+            TreePath::root(0),
+            TreePath::root(2),
+            BlockType::Paragraph,
+            "one\n\ntwo\n\nthree",
+        );
+    }
+
+    #[test]
+    fn heading_over_mixed_blocks_converts_all() {
+        // A plain paragraph, a checklist, and a quote line, all selected → three headings.
+        assert_block_type_reproducible(
+            "intro\n\n- [ ] task\n\n> quoted",
+            TreePath::root(0),
+            TreePath::root(2).child(PathSegment::QuoteChild(0)),
+            BlockType::Heading { level: 3 },
+            "### intro\n\n### task\n\n### quoted",
+        );
+    }
+
+    #[test]
+    fn heading_over_plain_paragraphs_still_converts_all() {
+        // Regression guard for the case that already worked (no collapsed containers involved).
+        assert_block_type_reproducible(
+            "one\n\ntwo\n\nthree",
+            TreePath::root(0),
+            TreePath::root(2),
+            BlockType::Heading { level: 1 },
+            "# one\n\n# two\n\n# three",
+        );
+    }
+
+    #[test]
+    fn single_list_item_heading_change_is_unchanged() {
+        // With no multi-block selection the existing single-block (delist + convert) path stands.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("- one\n- two\n- three"));
+        editor.set_cursor(DocumentPosition::at(list_item_path(1), 0));
+        editor
+            .set_block_type(BlockType::Heading { level: 1 })
+            .unwrap();
+        assert_eq!(md(&editor), "- one\n\n# two\n\n- three");
     }
 
     #[test]
