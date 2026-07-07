@@ -10,6 +10,8 @@ While pre-1.0, the minor version is bumped for breaking changes.
 
 ## [Unreleased] - ReleaseDate
 
+## [0.4.0] - 2026-07-07
+
 ### Changed
 
 - Alt-Up/Down block moves (`move_blocks_up` / `move_blocks_down`) now cross
@@ -247,7 +249,8 @@ across multiple tools.
   metric regimes, plus layout/edit performance benchmarks.
 
 <!-- next-url -->
-[Unreleased]: https://github.com/roblillack/rutle/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/roblillack/rutle/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/roblillack/rutle/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/roblillack/rutle/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/roblillack/rutle/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/roblillack/rutle/compare/v0.2.1...v0.3.0
