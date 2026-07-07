@@ -10,6 +10,30 @@ While pre-1.0, the minor version is bumped for breaking changes.
 
 ## [Unreleased] - ReleaseDate
 
+### Changed
+
+- The default theme's `paragraph_spacing` is now `12` (was `5`). At the default
+  17px line height the old value left a paragraph break barely distinguishable
+  from a hard line break; `12` opens a clear gap between paragraphs. (#8)
+- A heading's bottom margin is now `heading_bottom_margin` alone (default raised
+  `10` → `15`) instead of `paragraph_spacing + heading_bottom_margin`.
+  `layout_inline_block` no longer folds `paragraph_spacing` into its result — each
+  block adds its own trailing gap at the call site — so raising the paragraph gap
+  no longer inflates the space below headings. The net gap below a heading is
+  unchanged from before the `paragraph_spacing` bump (was `5 + 10`, now `15`).
+  Paragraph and block-quote trailing spacing are unchanged. (#8)
+
+### Fixed
+
+- A list now leaves proper trailing space before the following block instead of
+  the tight inter-item `list_item_spacing`. Previously a list hugged the next
+  paragraph even though it sat well clear of the preceding one; where a list
+  ends and non-list content resumes, the list is now separated by
+  `paragraph_spacing`, matching the gap that precedes it. Spacing *between* list
+  items (and before continuation content that stays inside the list) is
+  unchanged. Only affects the additive spacing model (the GUI); the classic
+  cell-backend model, which zeroes these fields, is untouched. (#8)
+
 ## [0.4.1] - 2026-07-07
 
 ### Fixed

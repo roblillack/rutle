@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300" viewBox="0 0 400 300">
+  <rect width="400" height="300" fill="#ffffff"/>
+  <rect x="0" y="0" width="400" height="300" fill="#fffff5"/>
+  <defs>
+    <clipPath id="clip-0-0-400-300">
+      <rect x="0" y="0" width="400" height="300"/>
+    </clipPath>
+  </defs>
+  <text x="25" y="24" fill="#000000" font-family="'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="14" font-weight="normal" font-style="normal" textLength="40" lengthAdjust="spacingAndGlyphs" xml:space="preserve" clip-path="url(#clip-0-0-400-300)">Text </text>
+  <text x="65" y="24" fill="#000000" font-family="'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="14" font-weight="normal" font-style="normal" textLength="56" lengthAdjust="spacingAndGlyphs" xml:space="preserve" clip-path="url(#clip-0-0-400-300)">before </text>
+  <text x="121" y="24" fill="#000000" font-family="'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="14" font-weight="normal" font-style="normal" textLength="32" lengthAdjust="spacingAndGlyphs" xml:space="preserve" clip-path="url(#clip-0-0-400-300)">the </text>
+  <text x="153" y="24" fill="#000000" font-family="'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="14" font-weight="normal" font-style="normal" textLength="40" lengthAdjust="spacingAndGlyphs" xml:space="preserve" clip-path="url(#clip-0-0-400-300)">list.</text>
+  <text x="39" y="53" fill="#000000" font-family="'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="14" font-weight="normal" font-style="normal" textLength="24" lengthAdjust="spacingAndGlyphs" xml:space="preserve" clip-path="url(#clip-0-0-400-300)">1. </text>
+  <text x="63" y="53" fill="#000000" font-family="'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="14" font-weight="normal" font-style="normal" textLength="48" lengthAdjust="spacingAndGlyphs" xml:space="preserve" clip-path="url(#clip-0-0-400-300)">first </text>
+  <text x="111" y="53" fill="#000000" font-family="'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="14" font-weight="normal" font-style="normal" textLength="32" lengthAdjust="spacingAndGlyphs" xml:space="preserve" clip-path="url(#clip-0-0-400-300)">item</text>
+  <text x="39" y="72" fill="#000000" font-family="'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="14" font-weight="normal" font-style="normal" textLength="24" lengthAdjust="spacingAndGlyphs" xml:space="preserve" clip-path="url(#clip-0-0-400-300)">2. </text>
+  <text x="63" y="72" fill="#000000" font-family="'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="14" font-weight="normal" font-style="normal" textLength="56" lengthAdjust="spacingAndGlyphs" xml:space="preserve" clip-path="url(#clip-0-0-400-300)">second </text>
+  <text x="119" y="72" fill="#000000" font-family="'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="14" font-weight="normal" font-style="normal" textLength="32" lengthAdjust="spacingAndGlyphs" xml:space="preserve" clip-path="url(#clip-0-0-400-300)">item</text>
+  <text x="39" y="91" fill="#000000" font-family="'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="14" font-weight="normal" font-style="normal" textLength="24" lengthAdjust="spacingAndGlyphs" xml:space="preserve" clip-path="url(#clip-0-0-400-300)">3. </text>
+  <text x="63" y="91" fill="#000000" font-family="'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="14" font-weight="normal" font-style="normal" textLength="48" lengthAdjust="spacingAndGlyphs" xml:space="preserve" clip-path="url(#clip-0-0-400-300)">third </text>
+  <text x="111" y="91" fill="#000000" font-family="'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="14" font-weight="normal" font-style="normal" textLength="32" lengthAdjust="spacingAndGlyphs" xml:space="preserve" clip-path="url(#clip-0-0-400-300)">item</text>
+  <text x="25" y="120" fill="#000000" font-family="'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="14" font-weight="normal" font-style="normal" textLength="40" lengthAdjust="spacingAndGlyphs" xml:space="preserve" clip-path="url(#clip-0-0-400-300)">Text </text>
+  <text x="65" y="120" fill="#000000" font-family="'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="14" font-weight="normal" font-style="normal" textLength="48" lengthAdjust="spacingAndGlyphs" xml:space="preserve" clip-path="url(#clip-0-0-400-300)">after </text>
+  <text x="113" y="120" fill="#000000" font-family="'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="14" font-weight="normal" font-style="normal" textLength="32" lengthAdjust="spacingAndGlyphs" xml:space="preserve" clip-path="url(#clip-0-0-400-300)">the </text>
+  <text x="145" y="120" fill="#000000" font-family="'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="14" font-weight="normal" font-style="normal" textLength="40" lengthAdjust="spacingAndGlyphs" xml:space="preserve" clip-path="url(#clip-0-0-400-300)">list.</text>
+  <rect x="25" y="10" width="2" height="17" fill="#000000" clip-path="url(#clip-0-0-400-300)"/>
+</svg>

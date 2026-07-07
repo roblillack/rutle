@@ -19,12 +19,12 @@
   <text x="130" y="70" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-640-260)">with </text>
   <rect x="163" y="56" width="57" height="17" fill="#b4d5fe" clip-path="url(#clip-0-0-640-260)"/>
   <text x="163" y="70" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-640-260)">content.</text>
-  <rect x="25" y="78" width="76" height="17" fill="#b4d5fe" clip-path="url(#clip-0-0-640-260)"/>
-  <text x="25" y="92" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-640-260)">Paragraph </text>
-  <rect x="101" y="78" width="29" height="17" fill="#b4d5fe" clip-path="url(#clip-0-0-640-260)"/>
-  <text x="101" y="92" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-640-260)">two </text>
-  <rect x="130" y="78" width="52" height="17" fill="#b4d5fe" clip-path="url(#clip-0-0-640-260)"/>
-  <text x="130" y="92" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-640-260)">continues </text>
-  <text x="201" y="92" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-640-260)">here.</text>
+  <rect x="25" y="85" width="76" height="17" fill="#b4d5fe" clip-path="url(#clip-0-0-640-260)"/>
+  <text x="25" y="99" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-640-260)">Paragraph </text>
+  <rect x="101" y="85" width="29" height="17" fill="#b4d5fe" clip-path="url(#clip-0-0-640-260)"/>
+  <text x="101" y="99" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-640-260)">two </text>
+  <rect x="130" y="85" width="52" height="17" fill="#b4d5fe" clip-path="url(#clip-0-0-640-260)"/>
+  <text x="130" y="99" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-640-260)">continues </text>
+  <text x="201" y="99" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-640-260)">here.</text>
   <rect x="25" y="10" width="2" height="31" fill="#000000" clip-path="url(#clip-0-0-640-260)"/>
 </svg>

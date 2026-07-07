@@ -1565,15 +1565,17 @@ impl Renderer {
         let interior_width = width - (interior_x - start_x);
 
         match &block.block_type {
-            BlockType::Paragraph => self.layout_inline_block(
-                block,
-                block_idx,
-                y,
-                interior_x,
-                interior_width,
-                default_line_height,
-                ctx,
-            ),
+            BlockType::Paragraph => {
+                self.layout_inline_block(
+                    block,
+                    block_idx,
+                    y,
+                    interior_x,
+                    interior_width,
+                    default_line_height,
+                    ctx,
+                ) + self.theme.paragraph_spacing
+            }
             BlockType::Heading { level } => {
                 let header_font = match level {
                     1 => self.theme.header_level_1,
@@ -1610,6 +1612,10 @@ impl Renderer {
                 } else {
                     0
                 };
+                // `y_after` is the bottom of the heading text (no paragraph gap
+                // folded in), so `heading_bottom_margin` is the whole gap below a
+                // heading — sized to stand on its own rather than topping up the
+                // paragraph spacing.
                 y_after + self.theme.heading_bottom_margin + underline_row
             }
             BlockType::CodeBlock { .. } => {
@@ -1690,6 +1696,10 @@ impl Renderer {
             BlockType::BlockQuote => {
                 // The quote indent is already folded into `start_x`/`interior_x`; the
                 // vertical bar(s) are drawn per line in draw() from the leaf's quote depth.
+                // A quote wraps paragraph-like content: it keeps the paragraph's
+                // own `paragraph_spacing` and adds `quote_spacing` padding above
+                // and below. (layout_inline_block no longer folds paragraph_spacing
+                // in, so it is added explicitly here to preserve quote spacing.)
                 self.layout_inline_block(
                     block,
                     block_idx,
@@ -1698,7 +1708,8 @@ impl Renderer {
                     interior_width,
                     default_line_height,
                     ctx,
-                ) + self.theme.quote_spacing
+                ) + self.theme.paragraph_spacing
+                    + self.theme.quote_spacing
             }
             BlockType::ListItem {
                 ordered,
@@ -1948,7 +1959,19 @@ impl Renderer {
                     current_y += default_line_height;
                 }
 
-                current_y + self.theme.list_item_spacing
+                // Trailing space below this item. Between items — and before any
+                // continuation content that stays inside the list — the tight
+                // `list_item_spacing` is right. But where the list ends and normal
+                // text resumes, that gap is far too cramped: the list would hug
+                // the following paragraph while sitting well clear of the
+                // preceding one. When the next block leaves the list entirely,
+                // give the list the same trailing gap a paragraph gets, so a list
+                // is separated from what follows as clearly as from what precedes.
+                let trailing = match leaves.get(block_idx + 1) {
+                    Some(next) if next.list_levels > 0 => self.theme.list_item_spacing,
+                    _ => self.theme.paragraph_spacing,
+                };
+                current_y + trailing
             }
             BlockType::Table { rows } => self.layout_table(block_idx, rows, y, start_x, width, ctx),
         }
@@ -2171,7 +2194,12 @@ impl Renderer {
             }
         }
 
-        current_y + self.theme.paragraph_spacing
+        // Return the y directly below the last laid-out line — the bottom of the
+        // inline content, with NO trailing block gap. Each block type owns its own
+        // trailing spacing at the call site (a paragraph adds `paragraph_spacing`,
+        // a heading its `heading_bottom_margin`), so this helper stays neutral and
+        // a heading's margin is never inflated by the paragraph gap.
+        current_y
     }
 
     /// Horizontally center the layout lines `from..` within a column of `width`

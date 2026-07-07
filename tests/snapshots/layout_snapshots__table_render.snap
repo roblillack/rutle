@@ -1,5 +1,5 @@
 ---
-source: tdoc-editor/tests/layout_snapshots.rs
+source: tests/layout_snapshots.rs
 expression: "common::table_render(MODE)"
 extension: svg
 snapshot_kind: binary
