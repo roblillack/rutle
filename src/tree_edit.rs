@@ -466,6 +466,92 @@ pub fn containing_list_kind(doc: &Document, path: &TreePath) -> Option<ListKind>
     }
 }
 
+/// The list kind of a top-level paragraph *node* (ordered / unordered / checklist), or `None`
+/// for any other paragraph. Unlike [`containing_list_kind`], this classifies the node itself
+/// rather than a leaf's container.
+pub fn list_node_kind(p: &Paragraph) -> Option<ListKind> {
+    match p {
+        Paragraph::OrderedList { .. } => Some(ListKind::Ordered),
+        Paragraph::UnorderedList { .. } => Some(ListKind::Unordered),
+        Paragraph::Checklist { .. } => Some(ListKind::Checklist),
+        _ => None,
+    }
+}
+
+/// Fold a run of top-level paragraphs into a single list/checklist node of `target` kind.
+/// Existing list/checklist nodes contribute their items (remapped to the target kind); every
+/// other paragraph becomes one item, flattened to plain text (dropping heading/code styling) —
+/// the same flattening a single-paragraph list toggle performs.
+pub fn paragraphs_into_list(paragraphs: Vec<Paragraph>, target: ListKind) -> Paragraph {
+    match target {
+        ListKind::Checklist => {
+            let mut items: Vec<ChecklistItem> = Vec::new();
+            for p in paragraphs {
+                match p {
+                    Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries } => {
+                        items.extend(entries.into_iter().map(entry_to_checklist_item));
+                    }
+                    Paragraph::Checklist { items: its } => items.extend(its),
+                    other => {
+                        items.push(ChecklistItem::new(false).with_content(other.content().to_vec()))
+                    }
+                }
+            }
+            Paragraph::new_checklist().with_checklist_items(items)
+        }
+        ListKind::Ordered | ListKind::Unordered => {
+            let ordered = target == ListKind::Ordered;
+            let mut entries: Vec<Vec<Paragraph>> = Vec::new();
+            for p in paragraphs {
+                match p {
+                    Paragraph::OrderedList { entries: es }
+                    | Paragraph::UnorderedList { entries: es } => entries.extend(es),
+                    Paragraph::Checklist { items } => entries.extend(
+                        items
+                            .into_iter()
+                            .map(|it| checklist_item_to_entry(it, ordered)),
+                    ),
+                    other => entries.push(vec![
+                        Paragraph::new_text().with_content(other.content().to_vec()),
+                    ]),
+                }
+            }
+            new_list(ordered, entries)
+        }
+    }
+}
+
+/// Expand a run of top-level paragraphs, replacing every list/checklist node with its items as
+/// plain paragraphs (an entry's first paragraph loses its bullet; continuation paragraphs and
+/// nested sublists are lifted out alongside it). Non-list paragraphs pass through unchanged.
+/// The inverse of [`paragraphs_into_list`]; mirrors how a single list is unwrapped.
+pub fn lists_into_paragraphs(paragraphs: Vec<Paragraph>) -> Vec<Paragraph> {
+    let mut out: Vec<Paragraph> = Vec::new();
+    for p in paragraphs {
+        match p {
+            Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries } => {
+                for entry in entries {
+                    let mut paras = entry.into_iter();
+                    if let Some(first) = paras.next() {
+                        out.push(Paragraph::new_text().with_content(first.content().to_vec()));
+                    }
+                    out.extend(paras);
+                }
+            }
+            Paragraph::Checklist { items } => {
+                for item in items {
+                    out.push(Paragraph::new_text().with_content(item.content));
+                    if !item.children.is_empty() {
+                        out.push(Paragraph::new_checklist().with_checklist_items(item.children));
+                    }
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Convert one ordered/unordered list entry into a checklist item: the entry's first
 /// paragraph supplies the item text, and any continuation paragraphs / nested sublists
 /// become nested checklist children.
