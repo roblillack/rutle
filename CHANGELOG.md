@@ -28,7 +28,7 @@ While pre-1.0, the minor version is bumped for breaking changes.
   Moves are a no-op only at the document's edge; sublist items nested inside a
   list item keep reordering within their sublist (Shift-Tab is still the way out
   of a nested sublist). `tree_edit::move_sibling` is superseded for this path by
-  the new `tree_edit::move_block`.
+  the new `tree_edit::move_block`. (#5)
 
 ### Fixed
 
