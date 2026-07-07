@@ -1,7 +1,7 @@
 [package]
 name = "rutle"
 description = "Rob's Universal Text Layout Engine: a rendering-agnostic structured editor and layout core for tdoc::Document"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 rust-version = "1.87"
 authors = ["Robert Lillack <rob@lillack.net>"]

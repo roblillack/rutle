@@ -10,6 +10,8 @@ While pre-1.0, the minor version is bumped for breaking changes.
 
 ## [Unreleased] - ReleaseDate
 
+## [0.3.2] - 2026-07-07
+
 ### Fixed
 
 - Rebuilding a tdoc span tree from the flat inline model no longer fragments an
@@ -203,7 +205,8 @@ across multiple tools.
   metric regimes, plus layout/edit performance benchmarks.
 
 <!-- next-url -->
-[Unreleased]: https://github.com/roblillack/rutle/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/roblillack/rutle/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/roblillack/rutle/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/roblillack/rutle/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/roblillack/rutle/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/roblillack/rutle/compare/v0.2.0...v0.2.1
