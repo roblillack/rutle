@@ -606,3 +606,18 @@ pub fn selection_across_blocks(mode: FontMode) -> Vec<u8> {
     );
     render(display, mode, w, h)
 }
+
+pub fn list_then_paragraph(mode: FontMode) -> Vec<u8> {
+    // A paragraph, a list, then another paragraph. The gap *before* the list
+    // (the leading paragraph's trailing space) and the gap *after* it (before
+    // the trailing paragraph) should read as the same block break — a list must
+    // not hug the following text while sitting clear of the preceding text.
+    // Between the items themselves, the tight inter-item spacing is preserved.
+    let md = "Text before the list.\n\n\
+        1. first item\n\
+        2. second item\n\
+        3. third item\n\n\
+        Text after the list.";
+    let (w, h) = (400, 300);
+    render(display_for(md, w, h), mode, w, h)
+}

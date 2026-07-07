@@ -189,7 +189,7 @@ impl Default for Theme {
             line_height: 17,
             heading_top_margin: 15,
             heading_bottom_margin: 10,
-            paragraph_spacing: 5,
+            paragraph_spacing: 12,
             list_item_spacing: 2,
             quote_spacing: 5,
             code_block_padding: 5,

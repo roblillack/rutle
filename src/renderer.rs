@@ -1948,7 +1948,19 @@ impl Renderer {
                     current_y += default_line_height;
                 }
 
-                current_y + self.theme.list_item_spacing
+                // Trailing space below this item. Between items — and before any
+                // continuation content that stays inside the list — the tight
+                // `list_item_spacing` is right. But where the list ends and normal
+                // text resumes, that gap is far too cramped: the list would hug
+                // the following paragraph while sitting well clear of the
+                // preceding one. When the next block leaves the list entirely,
+                // give the list the same trailing gap a paragraph gets, so a list
+                // is separated from what follows as clearly as from what precedes.
+                let trailing = match leaves.get(block_idx + 1) {
+                    Some(next) if next.list_levels > 0 => self.theme.list_item_spacing,
+                    _ => self.theme.paragraph_spacing,
+                };
+                current_y + trailing
             }
             BlockType::Table { rows } => self.layout_table(block_idx, rows, y, start_x, width, ctx),
         }

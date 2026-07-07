@@ -1,6 +1,6 @@
 ---
 source: tests/layout_snapshots.rs
-expression: "common::complex_rendering(MODE)"
+expression: "common::list_then_paragraph(MODE)"
 extension: svg
 snapshot_kind: binary
 ---

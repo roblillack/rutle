@@ -56,3 +56,8 @@ fn table_force_wrap_long_tokens() {
 fn selection_across_blocks() {
     insta::assert_binary_snapshot!(".svg", common::selection_across_blocks(MODE));
 }
+
+#[test]
+fn list_then_paragraph() {
+    insta::assert_binary_snapshot!(".svg", common::list_then_paragraph(MODE));
+}
