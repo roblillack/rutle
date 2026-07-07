@@ -2573,24 +2573,29 @@ impl Editor {
         tree_edit::toggle_checkmark(&mut self.tdoc, &path).ok_or(EditError::InvalidPosition)
     }
 
-    /// Move the block at the cursor one step up among its siblings within its immediate
-    /// container — top-level paragraphs, a quote's children, checklist items, or list items
-    /// (the whole entry moves, carrying its continuation paragraphs and sublists). No-op at
-    /// the container's first position.
+    /// Move the block at the cursor one step up in reading order, crossing container
+    /// boundaries. Within a list it reorders siblings (the whole entry moves, carrying its
+    /// continuation paragraphs and sublists); at a list's edge the item leaves the list as a
+    /// same-kind single-item list and moves past the block above it in one step, then keeps
+    /// hopping and merges into the next same-kind list it reaches — a plain paragraph that
+    /// meets a list is drawn into it, and a quote child at the quote's edge is lifted out.
+    /// No-op only for a block already at the document's start (a first list item with nothing
+    /// above its list, or a nested sublist item at its edge).
     pub fn move_blocks_up(&mut self) -> Result<bool, EditError> {
         self.move_current_block(true)
     }
 
-    /// Move the block at the cursor one step down among its siblings; the counterpart to
-    /// [`Self::move_blocks_up`]. No-op at the container's last position.
+    /// Move the block at the cursor one step down in reading order; the counterpart to
+    /// [`Self::move_blocks_up`]. No-op at the document's end.
     pub fn move_blocks_down(&mut self) -> Result<bool, EditError> {
         self.move_current_block(false)
     }
 
-    /// Swap the cursor's block with its previous (`up`) or next sibling at the cursor's own
-    /// nesting level, following it with the cursor. Returns whether the tree changed.
+    /// Move the cursor's block one step up/down in reading order, following it with the
+    /// cursor. Crosses container boundaries (see [`tree_edit::move_block`]). Returns whether
+    /// the tree changed.
     fn move_current_block(&mut self, up: bool) -> Result<bool, EditError> {
-        let Some(new_path) = tree_edit::move_sibling(&mut self.tdoc, &self.cursor.path, up) else {
+        let Some(new_path) = tree_edit::move_block(&mut self.tdoc, &self.cursor.path, up) else {
             return Ok(false);
         };
         self.cursor = DocumentPosition::at(new_path, self.cursor.offset);
@@ -4641,16 +4646,251 @@ mod tests {
         assert_eq!(leaf_texts(&editor), vec!["b", "a"]);
     }
 
+    // ----- Cross-boundary block moves (Alt-Up/Down) -----
+
+    /// Checkbox state of every leaf in document order (`None` = not a checklist item).
+    fn leaf_checks(editor: &Editor) -> Vec<Option<bool>> {
+        tree_walk::enumerate_leaves(editor.document())
+            .iter()
+            .map(|l| l.marker.as_ref().and_then(|m| m.checkbox))
+            .collect()
+    }
+
     #[test]
-    fn move_block_at_container_boundary_is_noop() {
+    fn move_first_ordered_item_up_hops_over_heading() {
+        // The reported scenario: moving the first item up carries it *past* the heading in one
+        // step (as its own numbered list), rather than splitting off a same-position list that
+        // just renumbers. The remaining list renumbers from 1.
         let mut editor = Editor::new();
-        editor.set_document(markdown_to_document("- a\n- b\n- c"));
-        // First item can't move up; last item can't move down.
+        editor.set_document(markdown_to_document(
+            "# Test 123\n\n1. erster\n2. zweiter\n3. dritter",
+        ));
+        editor.set_cursor(DocumentPosition::at(list_item_path_at(1, 0), 0));
+        assert_eq!(editor.move_blocks_up(), Ok(true));
+        assert_eq!(
+            md(&editor),
+            "1. erster\n\n# Test 123\n\n1. zweiter\n2. dritter"
+        );
+        assert_eq!(
+            editor.cursor().path,
+            TreePath::root(0).child(PathSegment::ListEntry { entry: 0, para: 0 })
+        );
+    }
+
+    #[test]
+    fn move_last_ordered_item_down_hops_over_following_block() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("1. a\n2. b\n3. c\n\nafter"));
+        editor.set_cursor(DocumentPosition::at(list_item_path(2), 0));
+        assert_eq!(editor.move_blocks_down(), Ok(true));
+        assert_eq!(md(&editor), "1. a\n2. b\n\nafter\n\n1. c");
+        assert_eq!(
+            editor.cursor().path,
+            TreePath::root(2).child(PathSegment::ListEntry { entry: 0, para: 0 })
+        );
+    }
+
+    #[test]
+    fn move_lone_list_down_into_following_list_merges() {
+        // Inverse of `move_first_ordered_item_up_hops_over_heading`: a lone numbered item above
+        // a heading moves down past it and merges into the list below (continuous numbering),
+        // rather than landing as a separate list that restarts at 1.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document(
+            "1. erster\n\n# Test 123\n\n1. zweiter\n2. dritter",
+        ));
+        editor.set_cursor(DocumentPosition::at(list_item_path_at(0, 0), 0));
+        assert_eq!(editor.move_blocks_down(), Ok(true));
+        assert_eq!(
+            md(&editor),
+            "# Test 123\n\n1. erster\n2. zweiter\n3. dritter"
+        );
+        assert_eq!(
+            editor.cursor().path,
+            TreePath::root(1).child(PathSegment::ListEntry { entry: 0, para: 0 })
+        );
+    }
+
+    #[test]
+    fn move_first_item_up_with_nothing_above_the_list_is_noop() {
+        // Nothing to move past → no split, no renumber.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("1. a\n2. b"));
         editor.set_cursor(DocumentPosition::at(list_item_path(0), 0));
         assert_eq!(editor.move_blocks_up(), Ok(false));
-        editor.set_cursor(DocumentPosition::at(list_item_path(2), 0));
+        assert_eq!(md(&editor), "1. a\n2. b");
+    }
+
+    #[test]
+    fn move_checklist_item_travels_down_across_heading_and_merges() {
+        // A checked item leaves its checklist, hops the heading, and joins the next checklist —
+        // keeping its checkbox the whole way.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document(
+            "- [ ] a\n- [x] b\n\n## Notes\n\n- [ ] c",
+        ));
+        let b = TreePath::root(0).child(PathSegment::ChecklistItem(1));
+        editor.set_cursor(DocumentPosition::at(b, 1));
+
+        // One press: b leaves its checklist, crosses the heading, and merges into c's checklist
+        // as its first item — one visual line down (b and the heading swap places).
+        assert_eq!(editor.move_blocks_down(), Ok(true));
+        assert_eq!(md(&editor), "- [ ] a\n\n## Notes\n\n- [x] b\n- [ ] c");
+        // Checkbox preserved (the middle `None` is the heading); cursor and offset ride along.
+        assert_eq!(
+            leaf_checks(&editor),
+            vec![Some(false), None, Some(true), Some(false)]
+        );
+        assert_eq!(
+            editor.cursor().path,
+            TreePath::root(2).child(PathSegment::ChecklistItem(0))
+        );
+        assert_eq!(editor.cursor().offset, 1);
+    }
+
+    #[test]
+    fn move_checklist_item_travels_up_across_heading_and_merges() {
+        // Mirror of the down case: the first item of the second checklist hops up over the
+        // heading and merges into the first checklist at its end, in one press.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document(
+            "- [ ] a\n\n## Notes\n\n- [x] b\n- [ ] c",
+        ));
+        let b = TreePath::root(2).child(PathSegment::ChecklistItem(0));
+        editor.set_cursor(DocumentPosition::at(b, 0));
+        assert_eq!(editor.move_blocks_up(), Ok(true));
+        assert_eq!(md(&editor), "- [ ] a\n- [x] b\n\n## Notes\n\n- [ ] c");
+        assert_eq!(
+            leaf_checks(&editor),
+            vec![Some(false), Some(true), None, Some(false)]
+        );
+        assert_eq!(
+            editor.cursor().path,
+            TreePath::root(0).child(PathSegment::ChecklistItem(1))
+        );
+    }
+
+    #[test]
+    fn move_up_then_down_round_trips_across_heading() {
+        // erster up (lands separate above the heading) then down (merges back) returns to start.
+        let mut editor = Editor::new();
+        let start = "# Test 123\n\n1. erster\n2. zweiter\n3. dritter";
+        editor.set_document(markdown_to_document(start));
+        editor.set_cursor(DocumentPosition::at(list_item_path_at(1, 0), 0));
+        assert_eq!(editor.move_blocks_up(), Ok(true));
+        assert_eq!(
+            md(&editor),
+            "1. erster\n\n# Test 123\n\n1. zweiter\n2. dritter"
+        );
+        assert_eq!(editor.move_blocks_down(), Ok(true));
+        assert_eq!(md(&editor), start);
+    }
+
+    #[test]
+    fn move_interior_list_item_still_swaps_in_place() {
+        // Reordering within a list is unchanged by the cross-boundary logic.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("- a\n- b\n- c"));
+        editor.set_cursor(DocumentPosition::at(list_item_path(0), 0));
+        assert_eq!(editor.move_blocks_down(), Ok(true));
+        assert_eq!(md(&editor), "- b\n- a\n- c");
+        assert_eq!(editor.cursor().path, list_item_path(1));
+    }
+
+    #[test]
+    fn move_paragraph_collapses_into_following_list() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("para\n\n- a\n- b"));
+        editor.set_cursor(DocumentPosition::at(TreePath::root(0), 4));
+        assert_eq!(editor.move_blocks_down(), Ok(true));
+        assert_eq!(md(&editor), "- para\n- a\n- b");
+        assert_eq!(editor.cursor().path, list_item_path(0));
+        assert_eq!(editor.cursor().offset, 4);
+    }
+
+    #[test]
+    fn move_paragraph_collapses_into_preceding_list_at_its_end() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("- a\n- b\n\npara"));
+        editor.set_cursor(DocumentPosition::at(TreePath::root(1), 0));
+        assert_eq!(editor.move_blocks_up(), Ok(true));
+        assert_eq!(md(&editor), "- a\n- b\n- para");
+        assert_eq!(
+            editor.cursor().path,
+            TreePath::root(0).child(PathSegment::ListEntry { entry: 2, para: 0 })
+        );
+    }
+
+    #[test]
+    fn move_paragraph_collapses_into_checklist() {
+        // A plain paragraph drawn into a checklist becomes an (unchecked) checklist item.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("para\n\n- [ ] a"));
+        editor.set_cursor(DocumentPosition::at(TreePath::root(0), 0));
+        assert_eq!(editor.move_blocks_down(), Ok(true));
+        assert_eq!(md(&editor), "- [ ] para\n- [ ] a");
+        assert_eq!(leaf_checks(&editor), vec![Some(false), Some(false)]);
+    }
+
+    #[test]
+    fn move_heading_hops_over_a_list_rather_than_joining_it() {
+        // A heading is a structural divider, not list content — it jumps past the whole list.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("# Title\n\n- a\n- b"));
+        editor.set_cursor(DocumentPosition::at(TreePath::root(0), 0));
+        assert_eq!(editor.move_blocks_down(), Ok(true));
+        assert_eq!(md(&editor), "- a\n- b\n\n# Title");
+        assert_eq!(editor.cursor().path, TreePath::root(1));
+    }
+
+    #[test]
+    fn move_quote_child_exits_quote_at_boundary() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("> a\n>\n> b\n\nafter"));
+        editor.set_cursor(DocumentPosition::at(
+            TreePath::root(0).child(PathSegment::QuoteChild(1)),
+            0,
+        ));
+        assert_eq!(editor.move_blocks_down(), Ok(true));
+        assert_eq!(md(&editor), "> a\n\nb\n\nafter");
+        assert_eq!(editor.cursor().path, TreePath::root(1));
+    }
+
+    #[test]
+    fn move_top_level_block_at_document_edge_is_noop() {
+        // A plain block already at the document's start/end cannot move further.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("first\n\nsecond"));
+        editor.set_cursor(DocumentPosition::at(TreePath::root(0), 0));
+        assert_eq!(editor.move_blocks_up(), Ok(false));
+        editor.set_cursor(DocumentPosition::at(TreePath::root(1), 0));
         assert_eq!(editor.move_blocks_down(), Ok(false));
-        assert_eq!(md(&editor), "- a\n- b\n- c");
+        assert_eq!(md(&editor), "first\n\nsecond");
+    }
+
+    #[test]
+    fn move_lone_item_at_document_edge_is_noop() {
+        // A single-item list that is the last block can't leave the document.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("text\n\n- only"));
+        editor.set_cursor(DocumentPosition::at(list_item_path_at(1, 0), 0));
+        assert_eq!(editor.move_blocks_down(), Ok(false));
+        assert_eq!(md(&editor), "text\n\n- only");
+    }
+
+    #[test]
+    fn move_nested_sublist_item_at_edge_stays_put() {
+        // Cross-boundary moves are scoped to top-level / quote lists; a sublist item at its
+        // edge keeps the old no-op behavior (Shift-Tab is the way out of a sublist).
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("- a\n  - x\n  - y"));
+        let x = TreePath::root(0)
+            .child(PathSegment::ListEntry { entry: 0, para: 1 })
+            .child(PathSegment::ListEntry { entry: 0, para: 0 });
+        editor.set_cursor(DocumentPosition::at(x, 0));
+        assert_eq!(editor.move_blocks_up(), Ok(false));
+        assert_eq!(leaf_texts(&editor), vec!["a", "x", "y"]);
+        assert_eq!(leaf_depths(&editor), vec![0, 1, 1]);
     }
 
     #[test]
@@ -4694,6 +4934,10 @@ mod tests {
 
     fn list_item_path(entry: usize) -> TreePath {
         TreePath::root(0).child(PathSegment::ListEntry { entry, para: 0 })
+    }
+
+    fn list_item_path_at(paragraph: usize, entry: usize) -> TreePath {
+        TreePath::root(paragraph).child(PathSegment::ListEntry { entry, para: 0 })
     }
 
     #[test]

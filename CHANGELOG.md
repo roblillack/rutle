@@ -10,6 +10,26 @@ While pre-1.0, the minor version is bumped for breaking changes.
 
 ## [Unreleased] - ReleaseDate
 
+### Changed
+
+- Alt-Up/Down block moves (`move_blocks_up` / `move_blocks_down`) now cross
+  container boundaries instead of stopping at a list's edge. Reordering *within*
+  a list is unchanged, but a list/checklist item at the list's edge now leaves
+  the list — carried as a same-kind single-item list that keeps its
+  bullet/number/checkbox — and in one step moves past the block beyond the list
+  (a heading, paragraph, …), then keeps hopping and merges into the next
+  same-kind list it reaches — merging directly in when it lands beside one, so
+  two adjacent same-kind lists never coexist (ordered lists stay continuously
+  numbered) and each press advances the item by one visual line. A plain text
+  paragraph that meets a list/quote is drawn into it, and a quote child at the
+  quote's edge is lifted out. So an item can now be reordered across a whole note
+  (e.g. moved from one checklist to another past an intervening heading) rather
+  than only within its own list.
+  Moves are a no-op only at the document's edge; sublist items nested inside a
+  list item keep reordering within their sublist (Shift-Tab is still the way out
+  of a nested sublist). `tree_edit::move_sibling` is superseded for this path by
+  the new `tree_edit::move_block`.
+
 ### Fixed
 
 - Converting a plain paragraph into a list item now merges it into an adjacent
