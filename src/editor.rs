@@ -2592,9 +2592,15 @@ impl Editor {
     }
 
     /// Move the cursor's block one step up/down in reading order, following it with the
-    /// cursor. Crosses container boundaries (see [`tree_edit::move_block`]). Returns whether
+    /// cursor. Crosses container boundaries (see [`tree_edit::move_block`]). A selection that
+    /// spans several sibling blocks moves them together, keeping them selected. Returns whether
     /// the tree changed.
     fn move_current_block(&mut self, up: bool) -> Result<bool, EditError> {
+        if self.selection.is_some()
+            && let Some(changed) = self.move_selected_blocks(up)
+        {
+            return Ok(changed);
+        }
         let Some(new_path) = tree_edit::move_block(&mut self.tdoc, &self.cursor.path, up) else {
             return Ok(false);
         };
@@ -2603,6 +2609,55 @@ impl Editor {
         self.normalize_cursor();
         self.trigger_paragraph_change();
         Ok(true)
+    }
+
+    /// Move a selection that spans several sibling blocks together, keeping the run selected.
+    /// Returns `Some(changed)` when it handled a multi-block selection, or `None` to fall back
+    /// to a single-block move (the selection sits within one block, or spans blocks that aren't
+    /// siblings of one container).
+    fn move_selected_blocks(&mut self, up: bool) -> Option<bool> {
+        let (start, end) = self.selection_or_cursor_range();
+        let (container, first, last) = common_child_run(&start.path, &end.path)?;
+        if first == last {
+            return None; // a single block: let the single-block path handle it
+        }
+        let (new_container, nf, nl) =
+            tree_edit::move_block_range(&mut self.tdoc, &container, first, last, up)?;
+        self.reselect_child_run(&new_container, nf, nl);
+        self.trigger_paragraph_change();
+        Some(true)
+    }
+
+    /// Select the run of children `[first, last]` of the container at `container_path`: the
+    /// selection spans from the first child's first leaf to the last child's last leaf, with the
+    /// cursor at the end. Used to keep a moved block group selected.
+    fn reselect_child_run(&mut self, container_path: &TreePath, first: usize, last: usize) {
+        let level = container_path.len();
+        let mut min: Option<TreePath> = None;
+        let mut max: Option<TreePath> = None;
+        for p in self.leaf_paths() {
+            let segs = p.segments();
+            if segs.len() <= level || &segs[..level] != container_path.segments() {
+                continue;
+            }
+            let ci = child_index(&segs[level]);
+            if ci < first || ci > last {
+                continue;
+            }
+            if min.is_none() {
+                min = Some(p.clone());
+            }
+            max = Some(p);
+        }
+        if let (Some(mn), Some(mx)) = (min, max) {
+            let end_len = self.leaf_text_len(&mx);
+            self.selection = Some((
+                DocumentPosition::at(mn, 0),
+                DocumentPosition::at(mx.clone(), end_len),
+            ));
+            self.cursor = DocumentPosition::at(mx, end_len);
+            self.normalize_cursor();
+        }
     }
 
     /// Nest the current list item — or every list item in the selection — beneath its
@@ -2850,6 +2905,39 @@ fn top_index(path: &TreePath) -> Option<usize> {
         [PathSegment::Paragraph(i)] => Some(*i),
         _ => None,
     }
+}
+
+/// The index a path segment addresses within its container (the entry for a list segment,
+/// ignoring which paragraph of the entry it points at).
+fn child_index(seg: &PathSegment) -> usize {
+    match seg {
+        PathSegment::Paragraph(i) => *i,
+        PathSegment::QuoteChild(c) => *c,
+        PathSegment::ListEntry { entry, .. } => *entry,
+        PathSegment::ChecklistItem(c) => *c,
+    }
+}
+
+/// The common container of two leaf paths and the run of its direct children the paths span:
+/// the longest shared prefix is the container, and the two paths' next segments give the first
+/// and last child indices (`first <= last` since `a <= b`). `None` if one path is a prefix of
+/// the other (e.g. the same leaf), which has no sibling run.
+fn common_child_run(a: &TreePath, b: &TreePath) -> Option<(TreePath, usize, usize)> {
+    let (sa, sb) = (a.segments(), b.segments());
+    let mut cp = 0;
+    while cp < sa.len() && cp < sb.len() && sa[cp] == sb[cp] {
+        cp += 1;
+    }
+    if cp >= sa.len() || cp >= sb.len() {
+        return None;
+    }
+    let container = TreePath(sa[..cp].to_vec());
+    let first = child_index(&sa[cp]);
+    let last = child_index(&sb[cp]);
+    if first > last {
+        return None;
+    }
+    Some((container, first, last))
 }
 
 /// The index a path addresses within its parent container, when that parent is a paragraph
@@ -4654,6 +4742,98 @@ mod tests {
             .iter()
             .map(|l| l.marker.as_ref().and_then(|m| m.checkbox))
             .collect()
+    }
+
+    /// Assert the selection spans exactly leaves `texts` (in order), by their plain text.
+    fn assert_selection_texts(editor: &Editor, texts: &[&str]) {
+        let (s, e) = editor.selection().expect("a selection");
+        let selected: Vec<String> = tree_walk::leaf_paths(editor.document())
+            .into_iter()
+            .filter(|p| *p >= s.path && *p <= e.path)
+            .map(|p| editor.leaf_plain_text(&p))
+            .collect();
+        assert_eq!(selected, texts);
+    }
+
+    #[test]
+    fn move_selected_paragraphs_down_together() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("A\n\nB\n\nC\n\nD"));
+        editor.set_selection(
+            DocumentPosition::at(TreePath::root(1), 0),
+            DocumentPosition::at(TreePath::root(2), 1),
+        );
+        assert_eq!(editor.move_blocks_down(), Ok(true));
+        assert_eq!(md(&editor), "A\n\nD\n\nB\n\nC");
+        assert_selection_texts(&editor, &["B", "C"]);
+    }
+
+    #[test]
+    fn move_selected_paragraphs_up_together() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("A\n\nB\n\nC\n\nD"));
+        editor.set_selection(
+            DocumentPosition::at(TreePath::root(1), 0),
+            DocumentPosition::at(TreePath::root(2), 1),
+        );
+        assert_eq!(editor.move_blocks_up(), Ok(true));
+        assert_eq!(md(&editor), "B\n\nC\n\nA\n\nD");
+        assert_selection_texts(&editor, &["B", "C"]);
+    }
+
+    #[test]
+    fn move_selected_list_items_reorder_together() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("- a\n- b\n- c\n- d\n- e"));
+        editor.set_selection(
+            DocumentPosition::at(list_item_path(1), 0),
+            DocumentPosition::at(list_item_path(2), 1),
+        );
+        assert_eq!(editor.move_blocks_down(), Ok(true));
+        assert_eq!(md(&editor), "- a\n- d\n- b\n- c\n- e");
+        assert_selection_texts(&editor, &["b", "c"]);
+    }
+
+    #[test]
+    fn move_selected_paragraphs_at_document_edge_is_noop() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("A\n\nB\n\nC"));
+        editor.set_selection(
+            DocumentPosition::at(TreePath::root(0), 0),
+            DocumentPosition::at(TreePath::root(1), 1),
+        );
+        assert_eq!(editor.move_blocks_up(), Ok(false));
+        assert_eq!(md(&editor), "A\n\nB\n\nC");
+    }
+
+    #[test]
+    fn move_selected_checklist_items_down_across_heading_and_merge() {
+        // Two checked/unchecked items leave their checklist together, cross a heading, and
+        // merge into the next checklist as a group — checkboxes preserved, selection kept.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document(
+            "- [ ] a\n- [x] b\n- [ ] c\n\n## H\n\n- [ ] z",
+        ));
+        editor.set_selection(
+            DocumentPosition::at(TreePath::root(0).child(PathSegment::ChecklistItem(1)), 0),
+            DocumentPosition::at(TreePath::root(0).child(PathSegment::ChecklistItem(2)), 1),
+        );
+        assert_eq!(editor.move_blocks_down(), Ok(true));
+        assert_eq!(md(&editor), "- [ ] a\n\n## H\n\n- [x] b\n- [ ] c\n- [ ] z");
+        assert_selection_texts(&editor, &["b", "c"]);
+    }
+
+    #[test]
+    fn move_selected_ordered_items_up_across_heading_together() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("# T\n\n1. one\n2. two\n3. three"));
+        editor.set_selection(
+            DocumentPosition::at(list_item_path_at(1, 0), 0),
+            DocumentPosition::at(list_item_path_at(1, 1), 1),
+        );
+        assert_eq!(editor.move_blocks_up(), Ok(true));
+        assert_eq!(md(&editor), "1. one\n2. two\n\n# T\n\n1. three");
+        assert_selection_texts(&editor, &["one", "two"]);
     }
 
     #[test]

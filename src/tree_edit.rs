@@ -1125,6 +1125,301 @@ fn collapse_into_neighbor(doc: &mut Document, path: &TreePath, up: bool) -> Opti
     Some(container_child_path(path, nj).child(seg))
 }
 
+// ---- Multi-block (selection) move -------------------------------------------------
+
+/// Number of direct children of the container at `container_path` (the document top level for
+/// an empty path, else a quote/list/checklist node), or `None` for a non-container.
+pub fn container_child_count_at(doc: &Document, container_path: &TreePath) -> Option<usize> {
+    if container_path.is_empty() {
+        return Some(doc.paragraphs.len());
+    }
+    Some(match node_at(doc, container_path)? {
+        NodeRef::Para(
+            Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
+        ) => entries.len(),
+        NodeRef::Para(Paragraph::Checklist { items }) => items.len(),
+        NodeRef::Para(Paragraph::Quote { children }) => children.len(),
+        NodeRef::Check(item) => item.children.len(),
+        _ => return None,
+    })
+}
+
+/// Shift the single child just outside the `[first, last]` run to the run's far side, moving
+/// the run one step within `vec`: the child before the run moves to just after it (`up`), or
+/// the child after the run moves to just before it. No-op (false) at the vec's edge.
+fn rotate_run<T>(vec: &mut Vec<T>, first: usize, last: usize, up: bool) -> bool {
+    if up {
+        if first == 0 || last >= vec.len() {
+            return false;
+        }
+        let x = vec.remove(first - 1);
+        vec.insert(last, x);
+    } else {
+        if last + 1 >= vec.len() {
+            return false;
+        }
+        let x = vec.remove(last + 1);
+        vec.insert(first, x);
+    }
+    true
+}
+
+/// Reorder the run of children `[first, last]` of the container at `container_path` one step
+/// up/down among its siblings (see [`rotate_run`]). Treats each child as an opaque block.
+pub fn rotate_children(
+    doc: &mut Document,
+    container_path: &TreePath,
+    first: usize,
+    last: usize,
+    up: bool,
+) -> bool {
+    if container_path.is_empty() {
+        return rotate_run(&mut doc.paragraphs, first, last, up);
+    }
+    match node_at_mut(doc, container_path) {
+        Some(NodeMut::Para(
+            Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
+        )) => rotate_run(entries, first, last, up),
+        Some(NodeMut::Para(Paragraph::Checklist { items })) => rotate_run(items, first, last, up),
+        Some(NodeMut::Para(Paragraph::Quote { children })) => rotate_run(children, first, last, up),
+        Some(NodeMut::Check(item)) => rotate_run(&mut item.children, first, last, up),
+        _ => false,
+    }
+}
+
+/// Move the run of children `[first, last]` of the container at `container_path` one step in
+/// reading order, carrying them together. Within the container this reorders siblings; at the
+/// container's edge a list/checklist run leaves the list (as a same-kind list that hops the
+/// neighbour or merges into the next same-kind list) and a quote run is lifted out. Returns the
+/// run's new `(container, first, last)` location, or `None` when it cannot move (a top-level run
+/// at the document edge, a nested sublist run at its edge, or an invalid range).
+pub fn move_block_range(
+    doc: &mut Document,
+    container_path: &TreePath,
+    first: usize,
+    last: usize,
+    up: bool,
+) -> Option<(TreePath, usize, usize)> {
+    let count = last.checked_sub(first)? + 1;
+    let cc = container_child_count_at(doc, container_path)?;
+    if last >= cc {
+        return None;
+    }
+    let has_neighbor = if up { first > 0 } else { last + 1 < cc };
+    if has_neighbor {
+        if !rotate_children(doc, container_path, first, last, up) {
+            return None;
+        }
+        return Some(if up {
+            (container_path.clone(), first - 1, last - 1)
+        } else {
+            (container_path.clone(), first + 1, last + 1)
+        });
+    }
+    // Boundary: the run must leave its container.
+    if container_path.is_empty() {
+        return None; // top-level run already at the document's edge
+    }
+    // Only a list/checklist/quote sitting directly in a `Vec<Paragraph>` can be crossed out of;
+    // a container nested inside a list/checklist item keeps the run where it is.
+    sibling_slice(doc, container_path)?;
+    match node_at(doc, container_path)? {
+        NodeRef::Para(
+            Paragraph::OrderedList { .. }
+            | Paragraph::UnorderedList { .. }
+            | Paragraph::Checklist { .. },
+        ) => cross_out_list_run(doc, container_path, first, last, count, up),
+        NodeRef::Para(Paragraph::Quote { .. }) => {
+            cross_out_quote_run(doc, container_path, first, last, count, up)
+        }
+        _ => None,
+    }
+}
+
+/// Prepend `src`'s entries/items to the start of the same-kind list `dst` (mirror of
+/// [`append_list_items`], which appends).
+fn prepend_list_items(dst: &mut Paragraph, src: Paragraph) {
+    match dst {
+        Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries } => {
+            if let Paragraph::OrderedList { entries: s } | Paragraph::UnorderedList { entries: s } =
+                src
+            {
+                entries.splice(0..0, s);
+            }
+        }
+        Paragraph::Checklist { items } => {
+            if let Paragraph::Checklist { items: s } = src {
+                items.splice(0..0, s);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Carry the list/checklist run `[first, last]` out of the list at `list_path` as one group: it
+/// leaves as a same-kind list that then hops past the block beyond the list, or merges (all its
+/// items) into the next same-kind list, or is lifted out of an enclosing quote. Returns the
+/// group's new `(container, first, last)`.
+fn cross_out_list_run(
+    doc: &mut Document,
+    list_path: &TreePath,
+    first: usize,
+    last: usize,
+    count: usize,
+    up: bool,
+) -> Option<(TreePath, usize, usize)> {
+    // Guard: the group can only advance if there is a block beyond the list (or the list sits in
+    // a quote to leave); otherwise it is already at the document edge — splitting it off would
+    // just leave a same-position adjacent list.
+    let (slice0, li0) = sibling_slice(doc, list_path)?;
+    let has_nb = if up { li0 > 0 } else { li0 + 1 < slice0.len() };
+    let in_quote = matches!(list_path.0.last(), Some(PathSegment::QuoteChild(_)));
+    if !has_nb && !in_quote {
+        return None;
+    }
+    let ordered = match node_at(doc, list_path)? {
+        NodeRef::Para(Paragraph::OrderedList { .. }) => Some(true),
+        NodeRef::Para(Paragraph::UnorderedList { .. }) => Some(false),
+        NodeRef::Para(Paragraph::Checklist { .. }) => None,
+        _ => return None,
+    };
+    // Extract the run into a fresh same-kind list `g`.
+    let g = match node_at_mut(doc, list_path)? {
+        NodeMut::Para(
+            Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
+        ) => {
+            if last >= entries.len() {
+                return None;
+            }
+            let run: Vec<Vec<Paragraph>> = entries.splice(first..=last, []).collect();
+            new_list(ordered?, run)
+        }
+        NodeMut::Para(Paragraph::Checklist { items }) => {
+            if last >= items.len() {
+                return None;
+            }
+            let run: Vec<ChecklistItem> = items.splice(first..=last, []).collect();
+            Paragraph::new_checklist().with_checklist_items(run)
+        }
+        _ => return None,
+    };
+    let list_empty =
+        matches!(node_at(doc, list_path), Some(NodeRef::Para(p)) if container_child_count(p) == 0);
+    let (vec, li) = sibling_vec_mut(doc, list_path)?;
+    // Place `g` beside the (possibly now-empty) source list.
+    let gi = if up {
+        vec.insert(li, g);
+        if list_empty {
+            vec.remove(li + 1); // drop the emptied source list, now just after `g`
+        }
+        li
+    } else if list_empty {
+        vec[li] = g; // replace the emptied source list in place
+        li
+    } else {
+        vec.insert(li + 1, g);
+        li + 1
+    };
+
+    // Move `g` one step within the container: lift out of a quote at the edge, merge into a
+    // same-kind list, or hop past a plain neighbour.
+    let len = vec.len();
+    let at_edge = if up { gi == 0 } else { gi + 1 >= len };
+    if at_edge {
+        // Guard guaranteed a quote here (a plain edge would have returned early).
+        let quote_path = parent_path(list_path);
+        let lifted = exit_quote_to_container(doc, &quote_path, gi)?;
+        return Some((lifted, 0, count - 1));
+    }
+    let j = if up { gi - 1 } else { gi + 1 };
+    let my_kind = list_like_kind(&vec[gi]);
+    if my_kind.is_some() && list_like_kind(&vec[j]) == my_kind {
+        return merge_group_into(doc, list_path, gi, j, count, up);
+    }
+    let beyond = if up { j.checked_sub(1) } else { Some(j + 1) };
+    if my_kind.is_some()
+        && !is_container_para(&vec[j])
+        && let Some(k) = beyond
+        && vec.get(k).and_then(list_like_kind) == my_kind
+    {
+        return merge_group_into(doc, list_path, gi, k, count, up);
+    }
+    vec.swap(gi, j);
+    // `g` now sits at `j`; the group is its own items `[0, count-1]`.
+    Some((container_child_path(list_path, j), 0, count - 1))
+}
+
+/// Merge the whole group list at `gi` into the same-kind list at `k` (both children of the
+/// container holding `list_path`): appended at `k`'s end when moving up, prepended at its start
+/// when moving down. Returns the merged run's new `(container, first, last)`.
+fn merge_group_into(
+    doc: &mut Document,
+    list_path: &TreePath,
+    gi: usize,
+    k: usize,
+    count: usize,
+    up: bool,
+) -> Option<(TreePath, usize, usize)> {
+    let (vec, _) = sibling_vec_mut(doc, list_path)?;
+    let base = if up {
+        container_child_count(&vec[k])
+    } else {
+        0
+    };
+    let g = std::mem::replace(&mut vec[gi], Paragraph::new_text());
+    if up {
+        append_list_items(&mut vec[k], g);
+    } else {
+        prepend_list_items(&mut vec[k], g);
+    }
+    vec.remove(gi);
+    let target = if gi < k { k - 1 } else { k };
+    Some((
+        container_child_path(list_path, target),
+        base,
+        base + count - 1,
+    ))
+}
+
+/// Lift the quote-child run `[first, last]` out of the quote at `quote_path` into the quote's
+/// container (each child becomes a plain paragraph), splitting the quote around it. Returns the
+/// lifted run's new `(container, first, last)`.
+fn cross_out_quote_run(
+    doc: &mut Document,
+    quote_path: &TreePath,
+    first: usize,
+    last: usize,
+    count: usize,
+    up: bool,
+) -> Option<(TreePath, usize, usize)> {
+    let _ = up; // a quote run lifts out the same way in either direction
+    let children = match node_at_mut(doc, quote_path)? {
+        NodeMut::Para(Paragraph::Quote { children }) => {
+            if last >= children.len() {
+                return None;
+            }
+            std::mem::take(children)
+        }
+        _ => return None,
+    };
+    let mut before = children;
+    let after = before.split_off(last + 1);
+    let run = before.split_off(first); // `before` keeps [0, first), `run` is [first, last]
+
+    let mut replacement: Vec<Paragraph> = Vec::new();
+    if !before.is_empty() {
+        replacement.push(Paragraph::new_quote().with_children(before));
+    }
+    let run_start = replacement.len();
+    replacement.extend(run);
+    if !after.is_empty() {
+        replacement.push(Paragraph::new_quote().with_children(after));
+    }
+    let base = container_splice(doc, quote_path, replacement)?;
+    let container = parent_path(quote_path);
+    Some((container, base + run_start, base + run_start + count - 1))
+}
+
 // ---- Container conversion / dissolve / merge --------------------------------------
 
 /// The four convertible container kinds (a superset of [`ListKind`] that adds quotes).
