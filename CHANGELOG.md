@@ -10,6 +10,19 @@ While pre-1.0, the minor version is bumped for breaking changes.
 
 ## [Unreleased] - ReleaseDate
 
+### Fixed
+
+- Converting a plain paragraph into a list item now merges it into an adjacent
+  same-kind list instead of leaving a second, separate list beside it. Turning a
+  fresh paragraph above (or below) an existing checklist into a checklist item —
+  a common way to prepend a new entry — previously produced two adjacent
+  checklists rather than one. The merge-with-neighbour step lived only in
+  `set_block_type`, so the direct `toggle_list` / `toggle_ordered_list` /
+  `toggle_checklist` entry points (used by menus and shortcuts) skipped it; it now
+  lives in `toggle_list_kind` itself, so every caller folds into the neighbouring
+  list, ordered lists renumber correctly, and only a list of the *same* kind is
+  ever merged in. (#4)
+
 ## [0.3.2] - 2026-07-07
 
 ### Fixed
