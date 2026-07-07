@@ -10,6 +10,17 @@ While pre-1.0, the minor version is bumped for breaking changes.
 
 ## [Unreleased] - ReleaseDate
 
+### Fixed
+
+- Pasting a multi-paragraph fragment into a list item or quote child (any
+  non-top-level cursor) via `insert_document` now preserves inline styling.
+  Previously only a single-paragraph fragment was spliced run-by-run; a
+  multi-paragraph fragment fell back to inserting the document's raw Markdown as
+  literal text, so links and emphasis were lost (e.g. `[label](url)` showed up
+  verbatim). Each fragment paragraph is now inserted run-by-run and separated by
+  a structural break, so pasting N copied list items yields N styled sibling
+  items rather than one block of escaped Markdown. (#7)
+
 ## [0.4.0] - 2026-07-07
 
 ### Changed

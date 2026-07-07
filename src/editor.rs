@@ -2803,23 +2803,23 @@ impl Editor {
             return Ok(());
         }
         let Some(i) = self.cursor_top_index() else {
-            // Non-top-level cursor (inside a quote child or list item). Splicing a
-            // multi-paragraph fragment into nested structure isn't supported yet, but
-            // a single-paragraph fragment can be inserted run-by-run so its inline
-            // styling (bold/italic/links/…) survives. Only multi-paragraph fragments
-            // fall back to plain markdown text.
-            if document.paragraphs.len() == 1 {
-                let runs = spans_to_inline(document.paragraphs[0].content());
-                for run in runs {
+            // Non-top-level cursor (inside a quote child or list item). Full structural
+            // splicing into nested containers isn't supported yet, but each fragment
+            // paragraph can be inserted run-by-run so its inline styling
+            // (bold/italic/links/…) survives. Between paragraphs, break the current leaf
+            // into a new sibling (a fresh list item / quote paragraph) so a multi-line
+            // paste mirrors the source's block structure instead of collapsing into raw
+            // Markdown text.
+            for (idx, p) in document.paragraphs.iter().enumerate() {
+                if idx > 0 {
+                    self.insert_newline()?;
+                }
+                for run in spans_to_inline(p.content()) {
                     self.insert_inline_at_cursor(run)?;
                 }
-                self.trigger_paragraph_change();
-                return Ok(());
             }
-            let mut buf = Vec::new();
-            let _ = tdoc::markdown::write(&mut buf, document);
-            let text = String::from_utf8_lossy(&buf).into_owned();
-            return self.insert_text(text.trim_end_matches('\n'));
+            self.trigger_paragraph_change();
+            return Ok(());
         };
 
         let offset = self.cursor.offset;
@@ -4348,6 +4348,53 @@ mod tests {
             panic!("expected a list");
         };
         assert_eq!(entries.len(), 2, "Enter starts a new list item");
+    }
+
+    #[test]
+    fn paste_multi_paragraph_into_list_item_keeps_styling() {
+        // Regression: pasting a multi-paragraph fragment (e.g. several copied list
+        // items) into an empty list item used to dump raw Markdown text, losing all
+        // inline styling. It should instead splice each paragraph run-by-run into its
+        // own list item, preserving links/emphasis.
+        // An empty bullet, as the live editor represents it: one list entry holding a
+        // single empty text paragraph (not the degenerate empty entry that parsing bare
+        // "- " yields).
+        let mut editor = Editor::new();
+        let mut doc = Document::new();
+        doc.add_paragraph(Paragraph::UnorderedList {
+            entries: vec![vec![Paragraph::new_text()]],
+        });
+        editor.set_document(doc);
+        editor.set_cursor(DocumentPosition::at(
+            TreePath::root(0).child(PathSegment::ListEntry { entry: 0, para: 0 }),
+            0,
+        ));
+
+        let fragment = markdown_to_document(
+            "[erster](https://example.net) — one\n\n[zweiter](https://example.net) — two",
+        );
+        editor.insert_document(&fragment).unwrap();
+
+        let Paragraph::UnorderedList { entries } = &editor.document().paragraphs[0] else {
+            panic!("expected a list, got {:?}", editor.document().paragraphs);
+        };
+        assert_eq!(
+            entries.len(),
+            2,
+            "each pasted paragraph becomes a list item"
+        );
+
+        // The link survives as a real link run rather than literal "[erster](…)" text.
+        let md = document_to_markdown(editor.document());
+        assert!(
+            md.contains("[erster](https://example.net)")
+                && md.contains("[zweiter](https://example.net)"),
+            "links preserved, not flattened to text: {md}"
+        );
+        assert!(
+            !md.contains("\\["),
+            "no escaped literal Markdown brackets: {md}"
+        );
     }
 
     #[test]
