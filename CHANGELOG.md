@@ -25,6 +25,16 @@ While pre-1.0, the minor version is bumped for breaking changes.
 
 ### Fixed
 
+- Toggling a list kind (`toggle_list` / `toggle_ordered_list` / `toggle_checklist`)
+  over a selection that spans several top-level paragraphs now produces the same
+  result regardless of where the cursor sits in the selection or how the block
+  kinds are mixed. Previously the outcome depended on the selection's direction:
+  with the cursor in an existing list the whole thing was toggled *off*, and with
+  the cursor in a plain paragraph the command silently did nothing when the other
+  end of the selection reached into a list. The range now folds into a single list
+  of the requested kind (plain paragraphs become items, other-kind lists are
+  remapped, an adjacent same-kind list is absorbed), or, when the whole range is
+  already that kind, delists back to plain paragraphs.
 - A list now leaves proper trailing space before the following block instead of
   the tight inter-item `list_item_spacing`. Previously a list hugged the next
   paragraph even though it sat well clear of the preceding one; where a list

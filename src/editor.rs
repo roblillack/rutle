@@ -2416,6 +2416,16 @@ impl Editor {
     /// for a nested item — re-selecting the kind it already has should not move it.
     fn toggle_list_kind(&mut self, ordered: bool, checklist: bool) -> EditResult {
         let target = tree_edit::ListKind::from_flags(ordered, checklist);
+        // A selection spanning several top-level paragraphs must convert the same way no matter
+        // where the cursor sits within it or how the block kinds are mixed — otherwise the
+        // outcome depends on the selection's direction. Handle that whole-range case here;
+        // a selection confined to one top-level block keeps the cursor-aware path below (which
+        // handles nested items, in-place kind swaps, and merging with adjacent lists).
+        if let Some((s, e)) = self.selected_top_level_span()
+            && s < e
+        {
+            return self.toggle_list_kind_over_range(s, e, target);
+        }
         if let Some(current) = tree_edit::containing_list_kind(&self.tdoc, &self.cursor.path) {
             if current == target {
                 // Already this kind. A nested item stays put; a top-level list toggles off.
@@ -2490,6 +2500,82 @@ impl Editor {
         // The freshly wrapped list may abut a same-kind sibling (e.g. a paragraph turned
         // into a checklist item next to an existing checklist) — fold them into one list.
         self.merge_lists_at_cursor();
+        Ok(())
+    }
+
+    /// The inclusive range of top-level paragraph indices the current selection covers, or
+    /// `None` when there is no active selection. The endpoints may sit at any depth (inside a
+    /// list item, quote, …); only their owning top-level paragraph matters here.
+    fn selected_top_level_span(&self) -> Option<(usize, usize)> {
+        let (a, b) = self.selection.clone()?;
+        let s = top_para_index(&a.path)?;
+        let e = top_para_index(&b.path)?;
+        Some((s.min(e), s.max(e)))
+    }
+
+    /// Convert the top-level paragraphs in `s..=e` as one unit. If every paragraph in the range
+    /// is already a list of `target` kind, toggle it off (delist to plain paragraphs);
+    /// otherwise fold the whole range into a single list of `target` kind, flattening plain
+    /// paragraphs to items and remapping any other-kind lists. The result is independent of
+    /// where the cursor sits in the range. Afterwards the transformed region is re-selected so
+    /// a follow-up toggle acts on the same span.
+    fn toggle_list_kind_over_range(
+        &mut self,
+        mut s: usize,
+        mut e: usize,
+        target: tree_edit::ListKind,
+    ) -> EditResult {
+        if s >= e || e >= self.tdoc.paragraphs.len() {
+            return Ok(());
+        }
+        let all_target = self.tdoc.paragraphs[s..=e]
+            .iter()
+            .all(|p| tree_edit::list_node_kind(p) == Some(target));
+
+        let (first, last) = if all_target {
+            // Toggle off: expand every list in the range back into plain paragraphs.
+            let drained: Vec<Paragraph> = self.tdoc.paragraphs.drain(s..=e).collect();
+            let expanded = tree_edit::lists_into_paragraphs(drained);
+            let last = s + expanded.len().saturating_sub(1);
+            self.tdoc.paragraphs.splice(s..s, expanded);
+            (TreePath::root(s), TreePath::root(last))
+        } else {
+            // Apply: also absorb any same-kind list sibling immediately adjacent to the range,
+            // so the outcome is one contiguous list (adjacent same-kind lists are a single node
+            // everywhere else — e.g. after a Markdown round-trip — so we keep that invariant).
+            while s > 0 && tree_edit::list_node_kind(&self.tdoc.paragraphs[s - 1]) == Some(target) {
+                s -= 1;
+            }
+            while e + 1 < self.tdoc.paragraphs.len()
+                && tree_edit::list_node_kind(&self.tdoc.paragraphs[e + 1]) == Some(target)
+            {
+                e += 1;
+            }
+            let drained: Vec<Paragraph> = self.tdoc.paragraphs.drain(s..=e).collect();
+            let new_node = tree_edit::paragraphs_into_list(drained, target);
+            let item_count = list_item_count(&new_node);
+            self.tdoc.paragraphs.insert(s, new_node);
+            let leaf = |item: usize| match target {
+                tree_edit::ListKind::Checklist => {
+                    TreePath::root(s).child(PathSegment::ChecklistItem(item))
+                }
+                _ => TreePath::root(s).child(PathSegment::ListEntry {
+                    entry: item,
+                    para: 0,
+                }),
+            };
+            (leaf(0), leaf(item_count.saturating_sub(1)))
+        };
+
+        // Select the whole transformed region; the cursor rides its end. Endpoints are clamped
+        // to real leaves (`last` may address a list node in the delist case).
+        let start = tree_walk::clamp_position(&self.tdoc, &DocumentPosition::at(first, 0));
+        let end =
+            tree_walk::clamp_position_forward(&self.tdoc, &DocumentPosition::at(last, usize::MAX));
+        self.cursor = end.clone();
+        self.selection = Some((start, end));
+        self.normalize_cursor();
+        self.trigger_paragraph_change();
         Ok(())
     }
 
@@ -2904,6 +2990,26 @@ fn top_index(path: &TreePath) -> Option<usize> {
     match path.segments() {
         [PathSegment::Paragraph(i)] => Some(*i),
         _ => None,
+    }
+}
+
+/// The top-level paragraph index a path descends into, regardless of how deep the path goes
+/// (into a list item, quote child, …). Unlike [`top_index`], it does not require the path to
+/// address a bare top-level paragraph.
+fn top_para_index(path: &TreePath) -> Option<usize> {
+    match path.segments().first()? {
+        PathSegment::Paragraph(i) => Some(*i),
+        _ => None,
+    }
+}
+
+/// The number of items (list entries or checklist items) in a list/checklist node; `0` for any
+/// other paragraph.
+fn list_item_count(p: &Paragraph) -> usize {
+    match p {
+        Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries } => entries.len(),
+        Paragraph::Checklist { items } => items.len(),
+        _ => 0,
     }
 }
 
@@ -4471,6 +4577,148 @@ mod tests {
         ));
         editor.toggle_list().unwrap();
         assert_eq!(md(&editor), "item");
+    }
+
+    /// Toggle a list kind over a selection spanning a plain paragraph and a list, driving the
+    /// selection from either end (i.e. cursor in the text vs. cursor in the list). The result
+    /// must be identical either way — the whole range becomes one list of the target kind.
+    fn assert_range_toggle_reproducible(
+        markdown: &str,
+        a: TreePath,
+        b: TreePath,
+        toggle: impl Fn(&mut Editor),
+        expected: &str,
+    ) {
+        for (cursor_end, other) in [(a.clone(), b.clone()), (b.clone(), a.clone())] {
+            let mut editor = Editor::new();
+            editor.set_document(markdown_to_document(markdown));
+            editor.set_cursor(DocumentPosition::at(cursor_end.clone(), 0));
+            editor.set_selection(
+                DocumentPosition::at(other, 0),
+                DocumentPosition::at(cursor_end, 0),
+            );
+            toggle(&mut editor);
+            assert_eq!(
+                md(&editor),
+                expected,
+                "toggling over the range should not depend on selection direction"
+            );
+        }
+    }
+
+    #[test]
+    fn toggle_ordered_over_text_and_list_is_reproducible() {
+        // "first" (text) followed by an ordered list; selecting both and choosing Numbered
+        // List makes the whole range one ordered list — no matter which way the selection runs.
+        assert_range_toggle_reproducible(
+            "first\n\n1. second\n2. third",
+            TreePath::root(0),
+            list_item_path_at(1, 1),
+            |e| e.toggle_ordered_list().unwrap(),
+            "1. first\n2. second\n3. third",
+        );
+    }
+
+    #[test]
+    fn toggle_checklist_over_text_and_ordered_is_reproducible() {
+        assert_range_toggle_reproducible(
+            "first\n\n1. second\n2. third",
+            TreePath::root(0),
+            list_item_path_at(1, 1),
+            |e| e.toggle_checklist().unwrap(),
+            "- [ ] first\n- [ ] second\n- [ ] third",
+        );
+    }
+
+    #[test]
+    fn toggle_ordered_over_list_then_text_is_reproducible() {
+        // The mirror arrangement: list first, plain paragraph last.
+        assert_range_toggle_reproducible(
+            "1. first\n2. second\n\nthird",
+            list_item_path_at(0, 0),
+            TreePath::root(1),
+            |e| e.toggle_ordered_list().unwrap(),
+            "1. first\n2. second\n3. third",
+        );
+    }
+
+    #[test]
+    fn toggle_bullet_over_three_plain_paragraphs_is_one_list() {
+        assert_range_toggle_reproducible(
+            "one\n\ntwo\n\nthree",
+            TreePath::root(0),
+            TreePath::root(2),
+            |e| e.toggle_list().unwrap(),
+            "- one\n- two\n- three",
+        );
+        // ...and the resulting bullet list is a single node.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("one\n\ntwo\n\nthree"));
+        editor.set_cursor(DocumentPosition::at(TreePath::root(0), 0));
+        editor.set_selection(
+            DocumentPosition::at(TreePath::root(0), 0),
+            DocumentPosition::at(TreePath::root(2), 0),
+        );
+        editor.toggle_list().unwrap();
+        assert_eq!(editor.document().paragraphs.len(), 1);
+        assert!(matches!(
+            editor.document().paragraphs[0],
+            Paragraph::UnorderedList { .. }
+        ));
+    }
+
+    #[test]
+    fn toggle_ordered_over_mixed_list_kinds_unifies_them() {
+        // A bullet list, a plain paragraph, and a checklist, all selected and toggled ordered,
+        // collapse into one ordered list preserving every item's text in order.
+        assert_range_toggle_reproducible(
+            "- a\n- b\n\nmid\n\n- [ ] c\n- [ ] d",
+            list_item_path_at(0, 0),
+            TreePath::root(2).child(PathSegment::ChecklistItem(1)),
+            |e| e.toggle_ordered_list().unwrap(),
+            "1. a\n2. b\n3. mid\n4. c\n5. d",
+        );
+    }
+
+    #[test]
+    fn toggle_ordered_over_full_ordered_list_toggles_off() {
+        // Whole range already the target kind → toggling delists it back to plain paragraphs.
+        // (Two adjacent ordered-list nodes only arise programmatically; exercise it directly.)
+        let mut editor = Editor::new();
+        editor.set_document(Document {
+            paragraphs: vec![
+                Paragraph::new_ordered_list().with_entries(vec![vec![
+                    Paragraph::new_text().with_content(vec![Span::new_text("a")]),
+                ]]),
+                Paragraph::new_ordered_list().with_entries(vec![vec![
+                    Paragraph::new_text().with_content(vec![Span::new_text("b")]),
+                ]]),
+            ],
+            ..Default::default()
+        });
+        editor.set_cursor(DocumentPosition::at(list_item_path_at(1, 0), 0));
+        editor.set_selection(
+            DocumentPosition::at(list_item_path_at(0, 0), 0),
+            DocumentPosition::at(list_item_path_at(1, 0), 0),
+        );
+        editor.toggle_ordered_list().unwrap();
+        assert_eq!(md(&editor), "a\n\nb");
+    }
+
+    #[test]
+    fn range_toggle_leaves_selection_over_result() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("first\n\n1. second\n2. third"));
+        editor.set_cursor(DocumentPosition::at(TreePath::root(0), 0));
+        editor.set_selection(
+            DocumentPosition::at(TreePath::root(0), 0),
+            DocumentPosition::at(list_item_path_at(1, 1), 0),
+        );
+        editor.toggle_ordered_list().unwrap();
+        // A follow-up toggle sees the whole new list selected and delists all of it.
+        assert!(editor.selection().is_some());
+        editor.toggle_ordered_list().unwrap();
+        assert_eq!(md(&editor), "first\n\nsecond\n\nthird");
     }
 
     #[test]
