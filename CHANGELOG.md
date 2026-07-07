@@ -10,6 +10,19 @@ While pre-1.0, the minor version is bumped for breaking changes.
 
 ## [Unreleased] - ReleaseDate
 
+### Fixed
+
+- Rebuilding a tdoc span tree from the flat inline model no longer fragments an
+  outer style that fully contains a shorter differently-styled span (e.g.
+  `**bold and <u>nderlined</u>**`, or `**~~struck~~ and bold**`). `inline_to_spans`
+  previously nested styles in a *fixed* layer order, so an outer bold split into
+  two sibling spans around an inner underline/strike (`**bold and <u>nderlined</u>**`
+  → `**bold and **<u>**nderlined**</u>`), which tdoc serialized to a delimiter run
+  that no longer parsed as emphasis — editing and saving such text corrupted it. It
+  now factors out the style that spans the longest run first (ties broken by the
+  canonical layer order), so the outer style wraps the inner one regardless of their
+  source order and the round-trip stays stable. (#3)
+
 ## [0.3.1] - 2026-07-06
 
 ### Fixed
