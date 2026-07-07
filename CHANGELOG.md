@@ -29,6 +29,15 @@ While pre-1.0, the minor version is bumped for breaking changes.
   list item keep reordering within their sublist (Shift-Tab is still the way out
   of a nested sublist). `tree_edit::move_sibling` is superseded for this path by
   the new `tree_edit::move_block`. (#5)
+- Alt-Up/Down now also moves a **multi-block selection** as a group: when the
+  selection spans several sibling blocks (top-level paragraphs, list items,
+  checklist items, or quote children) they reorder together and, at their
+  container's edge, cross out of it together the same way a single block does —
+  a run of list items leaves the list as a same-kind list and merges into the
+  next one it reaches (checkboxes/numbering preserved), and a run of quote
+  children is lifted out. The moved run stays selected. New `tree_edit`
+  entry points: `move_block_range`, `rotate_children`, `container_child_count_at`.
+  (#6)
 
 ### Fixed
 
