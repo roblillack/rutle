@@ -1847,11 +1847,7 @@ impl Editor {
             BlockType::BlockQuote => self.toggle_quote(),
             BlockType::ListItem {
                 ordered, checkbox, ..
-            } => {
-                let r = self.toggle_list_kind(ordered, checkbox.is_some());
-                self.merge_lists_at_cursor();
-                r
-            }
+            } => self.toggle_list_kind(ordered, checkbox.is_some()),
             BlockType::Table { .. } => Ok(()),
         }
     }
@@ -2440,6 +2436,8 @@ impl Editor {
                 self.cursor = DocumentPosition::at(new_path, offset);
                 self.normalize_cursor();
                 self.trigger_paragraph_change();
+                // Converting the list may leave it adjacent to a same-kind sibling.
+                self.merge_lists_at_cursor();
             }
             return Ok(());
         }
@@ -2489,6 +2487,9 @@ impl Editor {
         self.cursor = DocumentPosition::at(TreePath::root(s).child(leaf_seg), offset);
         self.normalize_cursor();
         self.trigger_paragraph_change();
+        // The freshly wrapped list may abut a same-kind sibling (e.g. a paragraph turned
+        // into a checklist item next to an existing checklist) — fold them into one list.
+        self.merge_lists_at_cursor();
         Ok(())
     }
 
@@ -4463,6 +4464,98 @@ mod tests {
         editor.set_cursor(DocumentPosition::at(item, 0));
         assert_eq!(editor.toggle_current_checkmark(), Ok(true));
         assert_eq!(md(&editor), "- [x] task");
+    }
+
+    #[test]
+    fn convert_paragraph_above_checklist_merges_into_it() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("new\n\n- [ ] task"));
+        // Cursor in the fresh plain paragraph at the top.
+        editor.set_cursor(DocumentPosition::at(TreePath::root(0), 3));
+        editor.toggle_checklist().unwrap();
+        // The new item should merge into the following checklist, not form a second one.
+        assert_eq!(md(&editor), "- [ ] new\n- [ ] task");
+        assert!(matches!(
+            editor.document().paragraphs[0],
+            Paragraph::Checklist { .. }
+        ));
+        assert_eq!(editor.document().paragraphs.len(), 1);
+        // Cursor stays on the new (first) item.
+        assert_eq!(
+            editor.cursor().path,
+            TreePath::root(0).child(PathSegment::ChecklistItem(0))
+        );
+    }
+
+    #[test]
+    fn convert_paragraph_below_checklist_merges_into_it() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("- [ ] task\n\nnew"));
+        // Cursor in the fresh plain paragraph below the checklist.
+        editor.set_cursor(DocumentPosition::at(TreePath::root(1), 3));
+        editor.toggle_checklist().unwrap();
+        assert_eq!(md(&editor), "- [ ] task\n- [ ] new");
+        assert_eq!(editor.document().paragraphs.len(), 1);
+        assert_eq!(
+            editor.cursor().path,
+            TreePath::root(0).child(PathSegment::ChecklistItem(1))
+        );
+    }
+
+    #[test]
+    fn convert_paragraph_above_bullet_list_merges_into_it() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("new\n\n- task"));
+        editor.set_cursor(DocumentPosition::at(TreePath::root(0), 3));
+        editor.toggle_list().unwrap();
+        assert_eq!(md(&editor), "- new\n- task");
+        assert_eq!(editor.document().paragraphs.len(), 1);
+        assert_eq!(editor.cursor().path, list_item_path(0));
+    }
+
+    #[test]
+    fn convert_paragraph_below_bullet_list_merges_into_it() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("- task\n\nnew"));
+        editor.set_cursor(DocumentPosition::at(TreePath::root(1), 3));
+        editor.toggle_list().unwrap();
+        assert_eq!(md(&editor), "- task\n- new");
+        assert_eq!(editor.document().paragraphs.len(), 1);
+        assert_eq!(editor.cursor().path, list_item_path(1));
+    }
+
+    #[test]
+    fn convert_paragraph_above_ordered_list_merges_and_renumbers() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("new\n\n1. task"));
+        editor.set_cursor(DocumentPosition::at(TreePath::root(0), 3));
+        editor.toggle_ordered_list().unwrap();
+        assert_eq!(md(&editor), "1. new\n2. task");
+        assert_eq!(editor.document().paragraphs.len(), 1);
+        assert_eq!(editor.cursor().path, list_item_path(0));
+    }
+
+    #[test]
+    fn convert_paragraph_below_ordered_list_merges_and_renumbers() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("1. task\n\nnew"));
+        editor.set_cursor(DocumentPosition::at(TreePath::root(1), 3));
+        editor.toggle_ordered_list().unwrap();
+        assert_eq!(md(&editor), "1. task\n2. new");
+        assert_eq!(editor.document().paragraphs.len(), 1);
+        assert_eq!(editor.cursor().path, list_item_path(1));
+    }
+
+    #[test]
+    fn convert_paragraph_between_bullet_and_checklist_only_merges_own_kind() {
+        // A plain paragraph sitting between a bullet list and a checklist, turned into a
+        // bullet item, joins the bullet list above and leaves the checklist below intact.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("- a\n\nnew\n\n- [ ] task"));
+        editor.set_cursor(DocumentPosition::at(TreePath::root(1), 3));
+        editor.toggle_list().unwrap();
+        assert_eq!(md(&editor), "- a\n- new\n\n- [ ] task");
+        assert_eq!(editor.document().paragraphs.len(), 2);
     }
 
     #[test]
