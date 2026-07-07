@@ -188,7 +188,10 @@ impl Default for Theme {
             padding_horizontal: 25,
             line_height: 17,
             heading_top_margin: 15,
-            heading_bottom_margin: 10,
+            // The whole gap below a heading. Not topped up by `paragraph_spacing`
+            // (which layout adds only after paragraphs), so this carries the full
+            // margin on its own.
+            heading_bottom_margin: 15,
             paragraph_spacing: 12,
             list_item_spacing: 2,
             quote_spacing: 5,
