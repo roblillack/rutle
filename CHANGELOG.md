@@ -34,7 +34,7 @@ While pre-1.0, the minor version is bumped for breaking changes.
   end of the selection reached into a list. The range now folds into a single list
   of the requested kind (plain paragraphs become items, other-kind lists are
   remapped, an adjacent same-kind list is absorbed), or, when the whole range is
-  already that kind, delists back to plain paragraphs.
+  already that kind, delists back to plain paragraphs. (#9)
 - A leaf block-type change (`set_block_type` to Paragraph / Heading / Code) over a
   selection spanning more than one block now converts *every* selected block, not
   just the one the cursor sits in. Previously, when the cursor was inside a
@@ -43,7 +43,7 @@ While pre-1.0, the minor version is bumped for breaking changes.
   so, e.g., selecting three bullet items and pressing Heading 1 changed only one.
   Each selected block is now lifted out of its list/quote container and converted
   exactly as a single-block change would be, and a partial selection of a list's
-  items splits the list around the converted ones.
+  items splits the list around the converted ones. (#9)
 - A list now leaves proper trailing space before the following block instead of
   the tight inter-item `list_item_spacing`. Previously a list hugged the next
   paragraph even though it sat well clear of the preceding one; where a list
