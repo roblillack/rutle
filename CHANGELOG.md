@@ -19,7 +19,7 @@ While pre-1.0, the minor version is bumped for breaking changes.
   literal text, so links and emphasis were lost (e.g. `[label](url)` showed up
   verbatim). Each fragment paragraph is now inserted run-by-run and separated by
   a structural break, so pasting N copied list items yields N styled sibling
-  items rather than one block of escaped Markdown.
+  items rather than one block of escaped Markdown. (#7)
 
 ## [0.4.0] - 2026-07-07
 
