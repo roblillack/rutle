@@ -21,7 +21,7 @@ While pre-1.0, the minor version is bumped for breaking changes.
   `toggle_checklist` entry points (used by menus and shortcuts) skipped it; it now
   lives in `toggle_list_kind` itself, so every caller folds into the neighbouring
   list, ordered lists renumber correctly, and only a list of the *same* kind is
-  ever merged in.
+  ever merged in. (#4)
 
 ## [0.3.2] - 2026-07-07
 
