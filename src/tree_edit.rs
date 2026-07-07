@@ -800,6 +800,331 @@ fn sibling_target(idx: usize, len: usize, up: bool) -> Option<usize> {
     }
 }
 
+// ---- Cross-boundary block move (Alt-Up/Down) --------------------------------------
+
+/// Move the block at `path` one step up/down in reading order, crossing container
+/// boundaries. Within a list this reorders siblings ([`move_sibling`]); at a list's edge the
+/// item *leaves* the list carried as a same-kind single-item list (preserving its
+/// checkbox/bullet) and, in the same step, moves past the block beyond the list — so the
+/// item visibly advances rather than splitting off a same-position adjacent list. It then
+/// keeps hopping past neighboring blocks and merges into the next same-kind list it reaches.
+/// A plain text paragraph that meets a list/quote is drawn into it, and a quote child at the
+/// quote's edge is lifted out. Sublists nested inside a list item keep the old edge-is-no-op
+/// behavior (Shift-Tab remains the way out of those). Returns the moved block's new leaf
+/// path, or `None` when it cannot move — a top-level block already at the document's edge, a
+/// nested sublist item at its edge, or an invalid path.
+pub fn move_block(doc: &mut Document, path: &TreePath, up: bool) -> Option<TreePath> {
+    match path.0.last()? {
+        PathSegment::ListEntry { .. } | PathSegment::ChecklistItem(_) => {
+            move_list_item(doc, path, up)
+        }
+        PathSegment::Paragraph(_) | PathSegment::QuoteChild(_) => move_plain_block(doc, path, up),
+    }
+}
+
+/// Number of entries/items directly held by the list/checklist node at `list_path`.
+fn list_child_count(doc: &Document, list_path: &TreePath) -> Option<usize> {
+    Some(match node_at(doc, list_path)? {
+        NodeRef::Para(
+            Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
+        ) => entries.len(),
+        NodeRef::Para(Paragraph::Checklist { items }) => items.len(),
+        NodeRef::Check(item) => item.children.len(),
+        _ => return None,
+    })
+}
+
+/// Number of children of a container paragraph (quote children / list entries / checklist
+/// items); `0` for a non-container.
+fn container_child_count(p: &Paragraph) -> usize {
+    match p {
+        Paragraph::Quote { children } => children.len(),
+        Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries } => entries.len(),
+        Paragraph::Checklist { items } => items.len(),
+        _ => 0,
+    }
+}
+
+/// The path segment that selects child `idx` of container paragraph `p`, or `None` for a
+/// non-container. List/checklist children carry `para = 0`; callers restore `para` if needed.
+fn child_segment_for(p: &Paragraph, idx: usize) -> Option<PathSegment> {
+    match p {
+        Paragraph::Quote { .. } => Some(PathSegment::QuoteChild(idx)),
+        Paragraph::OrderedList { .. } | Paragraph::UnorderedList { .. } => {
+            Some(PathSegment::ListEntry {
+                entry: idx,
+                para: 0,
+            })
+        }
+        Paragraph::Checklist { .. } => Some(PathSegment::ChecklistItem(idx)),
+        _ => None,
+    }
+}
+
+/// Move a list/checklist item ([`PathSegment::ListEntry`]/[`ChecklistItem`] leaf) one step.
+/// Interior items reorder within the list; an item at the list's edge that lives in a
+/// top-level or quote-child list crosses out of it.
+fn move_list_item(doc: &mut Document, path: &TreePath, up: bool) -> Option<TreePath> {
+    let list_path = parent_path(path);
+    let len = list_child_count(doc, &list_path)?;
+    let idx = match path.0.last()? {
+        PathSegment::ListEntry { entry, .. } => *entry,
+        PathSegment::ChecklistItem(c) => *c,
+        _ => return None,
+    };
+    let at_boundary = if up { idx == 0 } else { idx + 1 >= len };
+    if !at_boundary {
+        // Interior: reorder among siblings, carrying the whole entry subtree.
+        return move_sibling(doc, path, up);
+    }
+    // At the list's edge. Only a list sitting directly in a `Vec<Paragraph>` (the document
+    // top level or a quote) can be crossed out of; a sublist nested in a list item stays put.
+    let (slice, li) = sibling_slice(doc, &list_path)?;
+    if len == 1 {
+        // The item *is* the whole list: move that single-item list as a block.
+        return move_lone_list(doc, path, &list_path, up);
+    }
+    // One of several items leaving its list. It must *move past* the block beyond its list
+    // (or out of an enclosing quote) in a single step — detaching it into a same-position
+    // adjacent list would only renumber without visibly moving anything. If there is nothing
+    // beyond the list in that direction, the item is already at the document's edge.
+    let has_neighbor = if up { li > 0 } else { li + 1 < slice.len() };
+    let in_quote = matches!(list_path.0.last(), Some(PathSegment::QuoteChild(_)));
+    if !has_neighbor && !in_quote {
+        return None;
+    }
+    let lone_leaf = detach_item_to_lone_list(doc, path, up)?;
+    let lone_list = parent_path(&lone_leaf);
+    move_lone_list(doc, &lone_leaf, &lone_list, up)
+}
+
+/// Split the boundary item at `path` out of its (multi-item) list into a fresh same-kind
+/// single-item list, inserted immediately before (`up`) or after the list in the list's
+/// container. The item keeps its kind, checkbox, continuation paragraphs and sublists. This
+/// is only the first half of a boundary move — the caller then hops the detached list past
+/// the neighbor block so the item actually advances (see [`move_list_item`]).
+fn detach_item_to_lone_list(doc: &mut Document, path: &TreePath, up: bool) -> Option<TreePath> {
+    let list_path = parent_path(path);
+    let last = path.0.last()?.clone();
+    let (lone, tail) = match last {
+        PathSegment::ListEntry { entry, para } => {
+            let ordered = match node_at_mut(doc, &list_path)? {
+                NodeMut::Para(p) => list_ordered(p)?,
+                _ => return None,
+            };
+            let removed = match node_at_mut(doc, &list_path)? {
+                NodeMut::Para(
+                    Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
+                ) => {
+                    if entry >= entries.len() {
+                        return None;
+                    }
+                    entries.remove(entry)
+                }
+                _ => return None,
+            };
+            (
+                new_list(ordered, vec![removed]),
+                PathSegment::ListEntry { entry: 0, para },
+            )
+        }
+        PathSegment::ChecklistItem(c) => {
+            let removed = match node_at_mut(doc, &list_path)? {
+                NodeMut::Para(Paragraph::Checklist { items }) => {
+                    if c >= items.len() {
+                        return None;
+                    }
+                    items.remove(c)
+                }
+                _ => return None,
+            };
+            (
+                Paragraph::new_checklist().with_checklist_items(vec![removed]),
+                PathSegment::ChecklistItem(0),
+            )
+        }
+        _ => return None,
+    };
+    let (vec, li) = sibling_vec_mut(doc, &list_path)?;
+    let insert_at = if up { li } else { li + 1 };
+    vec.insert(insert_at, lone);
+    Some(container_child_path(&list_path, insert_at).child(tail))
+}
+
+/// Move a single-item list (the item *is* the list) as one block within its container: it
+/// leaves a quote at the quote's edge, merges into an adjacent same-kind list, or otherwise
+/// swaps past its neighbor. The cursor follows the item into its new home.
+fn move_lone_list(
+    doc: &mut Document,
+    path: &TreePath,
+    list_path: &TreePath,
+    up: bool,
+) -> Option<TreePath> {
+    // The item's own leaf segment (its `para` for list entries) rides along with it.
+    let (is_checklist, para) = match path.0.last()? {
+        PathSegment::ListEntry { para, .. } => (false, *para),
+        PathSegment::ChecklistItem(_) => (true, 0),
+        _ => return None,
+    };
+    let child_seg = |idx: usize| {
+        if is_checklist {
+            PathSegment::ChecklistItem(idx)
+        } else {
+            PathSegment::ListEntry { entry: idx, para }
+        }
+    };
+
+    let (slice, li) = sibling_slice(doc, list_path)?;
+    let len = slice.len();
+    let at_boundary = if up { li == 0 } else { li + 1 >= len };
+    if at_boundary {
+        // At the container's edge: leave an enclosing quote, else the document edge stops us.
+        return match list_path.0.last()? {
+            PathSegment::QuoteChild(c) => {
+                let lifted = exit_quote_to_container(doc, &parent_path(list_path), *c)?;
+                Some(lifted.child(child_seg(0)))
+            }
+            _ => None,
+        };
+    }
+
+    let j = if up { li - 1 } else { li + 1 };
+    let my_kind = list_like_kind(&slice[li]);
+    // A same-kind list right next to us: merge straight in.
+    if my_kind.is_some() && list_like_kind(&slice[j]) == my_kind {
+        return merge_lone_into_list_at(doc, list_path, li, j, up, para);
+    }
+    // A plain (non-container) block with a same-kind list just beyond it: cross the block and
+    // merge into that list in one step, so we never leave two adjacent same-kind lists behind
+    // (which for ordered lists would show a stray restart at `1.`).
+    let beyond = if up { j.checked_sub(1) } else { Some(j + 1) };
+    if my_kind.is_some()
+        && !is_container_para(&slice[j])
+        && let Some(k) = beyond
+        && slice.get(k).and_then(list_like_kind) == my_kind
+    {
+        return merge_lone_into_list_at(doc, list_path, li, k, up, para);
+    }
+    // Otherwise hop the whole single-item list past its neighbor.
+    let (vec, _) = sibling_vec_mut(doc, list_path)?;
+    vec.swap(li, j);
+    Some(container_child_path(list_path, j).child(child_seg(0)))
+}
+
+/// Merge the single-item list at index `li` into the same-kind list at index `k` in the same
+/// container, then drop the now-empty lone list. The item joins `k`'s end when moving up (so it
+/// lands just past `li`) or `k`'s start when moving down; `k` may be the immediate neighbor or
+/// one block beyond a plain leaf we're crossing. Returns the merged item's new leaf path.
+fn merge_lone_into_list_at(
+    doc: &mut Document,
+    list_path: &TreePath,
+    li: usize,
+    k: usize,
+    up: bool,
+    para: usize,
+) -> Option<TreePath> {
+    let (vec, _) = sibling_vec_mut(doc, list_path)?;
+    let is_checklist = matches!(vec[li], Paragraph::Checklist { .. });
+    // Take the lone list's sole entry/item and splice it into the target list: at its end when
+    // moving up (so the item lands just past `li`), its start when moving down.
+    let child_idx = if is_checklist {
+        let item = match &mut vec[li] {
+            Paragraph::Checklist { items } => items.pop()?,
+            _ => return None,
+        };
+        match &mut vec[k] {
+            Paragraph::Checklist { items } => {
+                if up {
+                    items.push(item);
+                    items.len() - 1
+                } else {
+                    items.insert(0, item);
+                    0
+                }
+            }
+            _ => return None,
+        }
+    } else {
+        let entry = match &mut vec[li] {
+            Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries } => {
+                entries.pop()?
+            }
+            _ => return None,
+        };
+        match &mut vec[k] {
+            Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries } => {
+                if up {
+                    entries.push(entry);
+                    entries.len() - 1
+                } else {
+                    entries.insert(0, entry);
+                    0
+                }
+            }
+            _ => return None,
+        }
+    };
+    vec.remove(li);
+    // Removing the lone list at `li` shifts the target down by one if it sat after `li`.
+    let target = if li < k { k - 1 } else { k };
+    let tail = if is_checklist {
+        PathSegment::ChecklistItem(child_idx)
+    } else {
+        PathSegment::ListEntry {
+            entry: child_idx,
+            para,
+        }
+    };
+    Some(container_child_path(list_path, target).child(tail))
+}
+
+/// Move a plain leaf paragraph (a top-level or quote-child Text/heading/code/table) one step:
+/// a text paragraph is drawn into an adjacent list/quote/checklist; at a quote's edge it is
+/// lifted out; otherwise it hops past its neighbor. Top-level blocks can't leave the document.
+fn move_plain_block(doc: &mut Document, path: &TreePath, up: bool) -> Option<TreePath> {
+    let (slice, i) = sibling_slice(doc, path)?;
+    let len = slice.len();
+    let at_boundary = if up { i == 0 } else { i + 1 >= len };
+    if at_boundary {
+        return match path.0.last()? {
+            PathSegment::QuoteChild(c) => exit_quote_to_container(doc, &parent_path(path), *c),
+            _ => None,
+        };
+    }
+    let j = if up { i - 1 } else { i + 1 };
+    let me_is_text = matches!(
+        node_at(doc, path),
+        Some(NodeRef::Para(Paragraph::Text { .. }))
+    );
+    if me_is_text && is_container_para(&slice[j]) {
+        return collapse_into_neighbor(doc, path, up);
+    }
+    let (vec, _) = sibling_vec_mut(doc, path)?;
+    vec.swap(i, j);
+    Some(container_child_path(path, j))
+}
+
+/// Draw the text paragraph at `path` into its adjacent container neighbor — at the neighbor's
+/// start when moving down, its end when moving up — as a new list entry / checklist item /
+/// quote child. Returns the path of the drawn-in leaf.
+fn collapse_into_neighbor(doc: &mut Document, path: &TreePath, up: bool) -> Option<TreePath> {
+    let (slice, i) = sibling_slice(doc, path)?;
+    let j = if up { i - 1 } else { i + 1 };
+    let at_start = !up;
+    let landed = if at_start {
+        0
+    } else {
+        container_child_count(&slice[j])
+    };
+    let (vec, i) = sibling_vec_mut(doc, path)?;
+    let me = vec.remove(i);
+    // After removing the paragraph at `i`, a following neighbor shifts down by one.
+    let nj = if i < j { j - 1 } else { j };
+    add_paragraphs_to_container(&mut vec[nj], vec![me], at_start);
+    let seg = child_segment_for(&vec[nj], landed)?;
+    Some(container_child_path(path, nj).child(seg))
+}
+
 // ---- Container conversion / dissolve / merge --------------------------------------
 
 /// The four convertible container kinds (a superset of [`ListKind`] that adds quotes).
