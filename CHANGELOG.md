@@ -21,7 +21,7 @@ While pre-1.0, the minor version is bumped for breaking changes.
   that no longer parsed as emphasis — editing and saving such text corrupted it. It
   now factors out the style that spans the longest run first (ties broken by the
   canonical layer order), so the outer style wraps the inner one regardless of their
-  source order and the round-trip stays stable.
+  source order and the round-trip stays stable. (#3)
 
 ## [0.3.1] - 2026-07-06
 
