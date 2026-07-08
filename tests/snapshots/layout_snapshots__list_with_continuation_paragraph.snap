@@ -1,0 +1,6 @@
+---
+source: tests/layout_snapshots.rs
+expression: "common::list_with_continuation_paragraph(MODE)"
+extension: svg
+snapshot_kind: binary
+---
