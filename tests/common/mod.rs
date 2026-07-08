@@ -607,6 +607,23 @@ pub fn selection_across_blocks(mode: FontMode) -> Vec<u8> {
     render(display, mode, w, h)
 }
 
+pub fn list_with_continuation_paragraph(mode: FontMode) -> Vec<u8> {
+    // A list whose second item holds two paragraphs (a continuation paragraph).
+    // The break *between* the item's two paragraphs must read as a paragraph
+    // break (the fuller `paragraph_spacing`), while the gap *after* the
+    // continuation, before the next item, must stay the tight inter-item spacing
+    // — not an extra paragraph gap. The other items keep the tight spacing too.
+    let md = "Anfang\n\n\
+        - first item\n\
+        - second item. A new paragraph:\n\n  \
+        And here it is.\n\
+        - third item\n\
+        - fourth item\n\n\
+        Ende";
+    let (w, h) = (400, 340);
+    render(display_for(md, w, h), mode, w, h)
+}
+
 pub fn list_then_paragraph(mode: FontMode) -> Vec<u8> {
     // A paragraph, a list, then another paragraph. The gap *before* the list
     // (the leading paragraph's trailing space) and the gap *after* it (before
