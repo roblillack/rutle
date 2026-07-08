@@ -10,6 +10,8 @@ While pre-1.0, the minor version is bumped for breaking changes.
 
 ## [Unreleased] - ReleaseDate
 
+## [0.5.0] - 2026-07-08
+
 ### Changed
 
 - The default theme's `paragraph_spacing` is now `12` (was `5`). At the default
@@ -313,7 +315,8 @@ across multiple tools.
   metric regimes, plus layout/edit performance benchmarks.
 
 <!-- next-url -->
-[Unreleased]: https://github.com/roblillack/rutle/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/roblillack/rutle/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/roblillack/rutle/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/roblillack/rutle/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/roblillack/rutle/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/roblillack/rutle/compare/v0.3.1...v0.3.2
