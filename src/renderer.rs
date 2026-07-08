@@ -1521,6 +1521,34 @@ impl Renderer {
         bars
     }
 
+    /// Vertical gap to leave *below* the in-list block at `block_idx` (i.e. before
+    /// the next block). Items sit tight (`list_item_spacing`), but a paragraph break
+    /// *within* an item — a further paragraph leaf still inside the list — reads as a
+    /// real paragraph and takes the fuller `paragraph_spacing`; where the list ends
+    /// and normal text resumes it likewise gets `paragraph_spacing`, so the list is
+    /// set off from what follows as clearly as from what precedes. Only meaningful for
+    /// a block that is itself inside a list (a list item or a continuation paragraph).
+    fn list_interior_trailing(
+        &self,
+        blocks: &[Block],
+        leaves: &[tree_walk::LeafInfo],
+        block_idx: usize,
+    ) -> i32 {
+        match (leaves.get(block_idx + 1), blocks.get(block_idx + 1)) {
+            // Next leaf is another paragraph still inside the list → it opens a new
+            // paragraph of the same item; separate them the way paragraphs are.
+            (Some(next), Some(nb))
+                if next.list_levels > 0 && matches!(nb.block_type, BlockType::Paragraph) =>
+            {
+                self.theme.paragraph_spacing
+            }
+            // Next leaf is a further item/marker still inside the list → tight gap.
+            (Some(next), _) if next.list_levels > 0 => self.theme.list_item_spacing,
+            // The list ends (or nothing follows) → full paragraph gap.
+            _ => self.theme.paragraph_spacing,
+        }
+    }
+
     /// Layout a single block. `blocks`/`leaves` are the full frame slices (for sibling
     /// scans such as ordered-list run detection); `block_idx` indexes them.
     /// `quote_depth`/`list_levels` come from the leaf and drive indentation independently of
@@ -1566,7 +1594,7 @@ impl Renderer {
 
         match &block.block_type {
             BlockType::Paragraph => {
-                self.layout_inline_block(
+                let y_after = self.layout_inline_block(
                     block,
                     block_idx,
                     y,
@@ -1574,7 +1602,18 @@ impl Renderer {
                     interior_width,
                     default_line_height,
                     ctx,
-                ) + self.theme.paragraph_spacing
+                );
+                // A continuation paragraph inside a list item (a paragraph leaf that
+                // still carries list depth) must trail like list content, not like a
+                // free paragraph: tight before the next item marker, but a full gap
+                // before another paragraph of the same item or where the list ends.
+                // A plain top-level paragraph keeps the ordinary paragraph gap.
+                let trailing = if list_levels > 0 {
+                    self.list_interior_trailing(blocks, leaves, block_idx)
+                } else {
+                    self.theme.paragraph_spacing
+                };
+                y_after + trailing
             }
             BlockType::Heading { level } => {
                 let header_font = match level {
@@ -1959,19 +1998,13 @@ impl Renderer {
                     current_y += default_line_height;
                 }
 
-                // Trailing space below this item. Between items — and before any
-                // continuation content that stays inside the list — the tight
-                // `list_item_spacing` is right. But where the list ends and normal
-                // text resumes, that gap is far too cramped: the list would hug
-                // the following paragraph while sitting well clear of the
-                // preceding one. When the next block leaves the list entirely,
-                // give the list the same trailing gap a paragraph gets, so a list
-                // is separated from what follows as clearly as from what precedes.
-                let trailing = match leaves.get(block_idx + 1) {
-                    Some(next) if next.list_levels > 0 => self.theme.list_item_spacing,
-                    _ => self.theme.paragraph_spacing,
-                };
-                current_y + trailing
+                // Trailing space below this item. Between items the tight
+                // `list_item_spacing` is right, but a paragraph break within the
+                // item (a continuation paragraph following) reads as a paragraph and
+                // takes `paragraph_spacing`; where the list ends and normal text
+                // resumes it likewise gets the fuller gap, so the list is set off
+                // from what follows as clearly as from what precedes.
+                current_y + self.list_interior_trailing(blocks, leaves, block_idx)
             }
             BlockType::Table { rows } => self.layout_table(block_idx, rows, y, start_x, width, ctx),
         }

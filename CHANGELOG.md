@@ -49,9 +49,17 @@ While pre-1.0, the minor version is bumped for breaking changes.
   paragraph even though it sat well clear of the preceding one; where a list
   ends and non-list content resumes, the list is now separated by
   `paragraph_spacing`, matching the gap that precedes it. Spacing *between* list
-  items (and before continuation content that stays inside the list) is
-  unchanged. Only affects the additive spacing model (the GUI); the classic
-  cell-backend model, which zeroes these fields, is untouched. (#8)
+  items is unchanged. Only affects the additive spacing model (the GUI); the
+  classic cell-backend model, which zeroes these fields, is untouched. (#8)
+- A continuation paragraph inside a list item now renders with correct vertical
+  spacing. The break *between* an item's paragraphs now uses the full
+  `paragraph_spacing`, so a multi-paragraph item reads as paragraphs rather than
+  hugging like a wrapped line; and the gap *after* the item's last continuation
+  paragraph, before the next item, is now the tight `list_item_spacing` instead
+  of an extra paragraph gap. Previously the two gaps were swapped — the paragraph
+  break was cramped while a stray paragraph-sized gap opened before the next
+  item. Both the item's marker line and its continuation paragraphs now derive
+  their trailing gap from the same list-aware rule. (#10)
 
 ## [0.4.1] - 2026-07-07
 

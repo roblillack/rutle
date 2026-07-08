@@ -61,3 +61,8 @@ fn selection_across_blocks() {
 fn list_then_paragraph() {
     insta::assert_binary_snapshot!(".svg", common::list_then_paragraph(MODE));
 }
+
+#[test]
+fn list_with_continuation_paragraph() {
+    insta::assert_binary_snapshot!(".svg", common::list_with_continuation_paragraph(MODE));
+}
