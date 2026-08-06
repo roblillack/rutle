@@ -13,6 +13,37 @@ pub enum FontStyle {
     BoldItalic,
 }
 
+/// Which end of a styled span a reveal-codes tag marks. The pointed end of the
+/// drawn tag faces the text the style applies to: right for `Open`, left for
+/// `Close`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevealTagKind {
+    /// A style starts here (`[Bold>`).
+    Open,
+    /// A style ends here (`<Bold]`).
+    Close,
+}
+
+/// Geometry and colors of one reveal-codes tag, handed to
+/// [`RenderContext::draw_reveal_tag`]. The label is drawn by the engine on top
+/// of the shape, inset by `point` on the pointed side.
+#[derive(Debug, Clone, Copy)]
+pub struct RevealTag {
+    /// Top-left of the tag's bounding box.
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    /// Width of the pointed end (right for `Open`, left for `Close`), included
+    /// in `width`.
+    pub point: i32,
+    pub kind: RevealTagKind,
+    /// Interior fill (`Theme::reveal_tag_bg`).
+    pub fill: u32,
+    /// Outline (`Theme::reveal_tag_border`).
+    pub border: u32,
+}
+
 /// Which way a caret leans to signal inline-style affinity at a boundary. The
 /// *rendering* of the lean is up to the backend (see [`RenderContext::draw_caret`]);
 /// this only says which side newly typed text will take.
@@ -89,6 +120,69 @@ pub trait RenderContext {
         let tick_w = tick_len + 2;
         self.draw_rect_filled(tick_x, y, tick_w, tick_h); // head tick
         self.draw_rect_filled(tick_x, y + height - tick_h, tick_w, tick_h); // foot tick
+    }
+
+    /// Draw the shape of one reveal-codes tag: a filled, outlined box with one
+    /// pointed end, the way WordPerfect (and classic Pure) drew its codes. The
+    /// engine draws the label on top afterwards, so this only paints the shape.
+    ///
+    /// The default builds it from the basic primitives — the body and the point
+    /// filled scanline by scanline, the outline from lines — which is right for
+    /// any pixel canvas. A backend with a polygon primitive can override this to
+    /// get an antialiased shape (see piki's FLTK context); a character-cell
+    /// backend never sees this call, because it sets `Theme::reveal_tag_text`
+    /// and gets the classic `[Bold>` text form instead.
+    fn draw_reveal_tag(&mut self, tag: RevealTag) {
+        if tag.width <= 0 || tag.height <= 0 {
+            return;
+        }
+        // Horizontal inset of the pointed side at row `dy`: zero at the tip
+        // (vertical center), the full point width at the top and bottom edges.
+        let last = (tag.height - 1).max(1);
+        let center = last as f32 / 2.0;
+        let inset = |dy: i32| -> i32 {
+            let d = ((dy as f32 - center).abs() / center).min(1.0);
+            (tag.point as f32 * d).round() as i32
+        };
+
+        self.set_color(tag.fill);
+        for dy in 0..tag.height {
+            let cut = inset(dy);
+            let w = tag.width - cut;
+            if w <= 0 {
+                continue;
+            }
+            let x = match tag.kind {
+                RevealTagKind::Open => tag.x,
+                RevealTagKind::Close => tag.x + cut,
+            };
+            self.draw_rect_filled(x, tag.y + dy, w, 1);
+        }
+
+        // Outline: the two flat edges, the blunt side, and the two slants
+        // meeting at the tip.
+        self.set_color(tag.border);
+        let (top, bottom) = (tag.y, tag.y + tag.height - 1);
+        let tip_y = tag.y + (tag.height - 1) / 2;
+        let (blunt, tip, flat_near, flat_far) = match tag.kind {
+            RevealTagKind::Open => (
+                tag.x,
+                tag.x + tag.width - 1,
+                tag.x,
+                tag.x + tag.width - 1 - tag.point,
+            ),
+            RevealTagKind::Close => (
+                tag.x + tag.width - 1,
+                tag.x,
+                tag.x + tag.point,
+                tag.x + tag.width - 1,
+            ),
+        };
+        self.draw_line(flat_near, top, flat_far, top);
+        self.draw_line(flat_near, bottom, flat_far, bottom);
+        self.draw_line(blunt, top, blunt, bottom);
+        self.draw_line(flat_far, top, tip, tip_y);
+        self.draw_line(flat_far, bottom, tip, tip_y);
     }
 
     /// Draw a checklist checkbox of `size` at (x, y) in the active color.

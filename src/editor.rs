@@ -158,9 +158,9 @@ pub struct Editor {
     last_edit_kind: Option<UndoKind>,
     last_edit_time: Option<Instant>,
     /// Whether reveal-codes mode is active. When on, inline-style boundaries are
-    /// shown as `[Bold>` / `<Bold]` tags by the display, and backspace/delete next
+    /// shown as opening/closing tags by the display, and backspace/delete next
     /// to such a tag removes the style instead of editing text. Off by default, so
-    /// frontends that never enable it (the GUI) are wholly unaffected.
+    /// frontends that never enable it are wholly unaffected.
     reveal_codes: bool,
     /// While reveal codes is on, how many of the inline-style tags rendered at
     /// the cursor's byte offset the caret sits *past* (0 = before all of them).
