@@ -113,6 +113,27 @@ mod tests {
     }
 
     #[test]
+    fn thematic_break_parses_to_a_horizontal_rule() {
+        for md in ["A\n\n---\n\nB", "A\n\n***\n\nB", "A\n\n___\n\nB"] {
+            let doc = markdown_to_document(md);
+            assert!(
+                doc.paragraphs
+                    .iter()
+                    .any(|p| matches!(p, Paragraph::HorizontalRule)),
+                "expected a horizontal rule from {md:?}: {doc:?}"
+            );
+            assert_eq!(document_to_markdown(&doc).trim(), "A\n\n---\n\nB");
+        }
+    }
+
+    #[test]
+    fn horizontal_rule_survives_the_html_flavor() {
+        let doc = markdown_to_document("A\n\n---\n\nB");
+        let html = document_to_html(&doc);
+        assert!(html.contains("<hr />"), "html was: {html}");
+    }
+
+    #[test]
     fn ordered_list_round_trips_with_numbering() {
         let md = "1. First\n2. Second";
         let doc = markdown_to_document(md);

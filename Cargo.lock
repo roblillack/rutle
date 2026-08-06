@@ -767,9 +767,8 @@ dependencies = [
 
 [[package]]
 name = "tdoc"
-version = "0.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88268176fed9b33fb19d1235391b030dbbe5540792f3cb2959f4e53fa8f31205"
+version = "0.11.2"
+source = "git+https://github.com/roblillack/tdoc?rev=dd58f93018db2f6a86fe7c413c9cba91946faf05#dd58f93018db2f6a86fe7c413c9cba91946faf05"
 dependencies = [
  "atty",
  "clap",

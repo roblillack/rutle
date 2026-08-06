@@ -519,7 +519,7 @@ impl Editor {
             return false;
         }
         let path = self.cursor.path.clone();
-        if self.is_table_leaf(&path) {
+        if self.is_atomic_leaf(&path) {
             return false;
         }
         let runs = tree_walk::leaf_inline(&self.tdoc, &path);
@@ -559,8 +559,20 @@ impl Editor {
             .unwrap_or(BlockType::Paragraph)
     }
 
-    fn is_table_leaf(&self, path: &TreePath) -> bool {
-        matches!(self.block_type_at(path), BlockType::Table { .. })
+    /// Whether the leaf at `path` is *atomic*: one indivisible unit with no
+    /// editable inline content — a table or a horizontal rule. The caret can rest
+    /// on such a leaf, but typing, splitting and merging all skip it. Mirrors the
+    /// leaves [`tree_walk::leaf_spans`] answers `None` for.
+    fn is_atomic_leaf(&self, path: &TreePath) -> bool {
+        matches!(
+            self.block_type_at(path),
+            BlockType::Table { .. } | BlockType::HorizontalRule
+        )
+    }
+
+    /// Whether the leaf at `path` is a horizontal rule.
+    fn is_rule_leaf(&self, path: &TreePath) -> bool {
+        matches!(self.block_type_at(path), BlockType::HorizontalRule)
     }
 
     /// Edit the inline runs of the leaf at `path` in place. The closure receives the
@@ -820,7 +832,7 @@ impl Editor {
 
         let path = self.cursor.path.clone();
         // Tables are read-only.
-        if self.is_table_leaf(&path) {
+        if self.is_atomic_leaf(&path) {
             return Ok(());
         }
 
@@ -846,7 +858,7 @@ impl Editor {
         }
 
         let path = self.cursor.path.clone();
-        if self.is_table_leaf(&path) {
+        if self.is_atomic_leaf(&path) {
             return Ok(());
         }
         let offset = self.cursor.offset;
@@ -876,7 +888,7 @@ impl Editor {
             self.delete_selection()?;
         }
         let path = self.cursor.path.clone();
-        if self.is_table_leaf(&path) {
+        if self.is_atomic_leaf(&path) {
             return Ok(());
         }
         // Enter in an empty block promotes it up one structural level rather than inserting
@@ -923,7 +935,7 @@ impl Editor {
             self.delete_selection()?;
         }
         let path = self.cursor.path.clone();
-        if self.is_table_leaf(&path) {
+        if self.is_atomic_leaf(&path) {
             return Ok(());
         }
         // On an empty item there is nothing to continue; fall back to newline (which
@@ -936,6 +948,106 @@ impl Editor {
             self.cursor = DocumentPosition::at(new_path, 0);
         }
         self.normalize_cursor();
+        Ok(())
+    }
+
+    /// Insert a horizontal rule (thematic break) at the cursor.
+    ///
+    /// The rule always becomes a *top-level* block, which is what a thematic break
+    /// means — a section break in the document, not a break inside one list item.
+    /// A top-level paragraph is split around it when the caret sits inside its
+    /// text; at a leaf boundary the rule slots in on the caret's side of it. From
+    /// anywhere else (inside a list or quote, or on a table/rule) the rule follows
+    /// the whole top-level block the caret sits in.
+    ///
+    /// The caret ends up at the start of the block *after* the rule, so typing
+    /// continues below it; an empty paragraph is appended when the rule would
+    /// otherwise be the document's last block.
+    pub fn insert_horizontal_rule(&mut self) -> EditResult {
+        if self.selection.is_some() {
+            self.delete_selection()?;
+        }
+        if self.leaf_count() == 0 {
+            self.tdoc.add_paragraph(Paragraph::new_horizontal_rule());
+            self.tdoc.add_paragraph(Paragraph::new_text());
+            self.cursor = DocumentPosition::at(TreePath::root(1), 0);
+            self.normalize_cursor();
+            self.trigger_paragraph_change();
+            return Ok(());
+        }
+
+        let path = self.cursor.path.clone();
+        let offset = self.cursor.offset;
+        let index = match top_index(&path) {
+            Some(i) if !self.is_atomic_leaf(&path) => {
+                let len = self.leaf_text_len(&path);
+                if offset == 0 {
+                    i
+                } else {
+                    if offset < len {
+                        tree_edit::split_leaf(&mut self.tdoc, &path, offset);
+                    }
+                    i + 1
+                }
+            }
+            _ => top_para_index(&path).map_or(self.tdoc.paragraphs.len(), |i| i + 1),
+        };
+
+        self.tdoc
+            .paragraphs
+            .insert(index, Paragraph::new_horizontal_rule());
+        if index + 1 >= self.tdoc.paragraphs.len() {
+            self.tdoc.add_paragraph(Paragraph::new_text());
+        }
+
+        let rule_path = TreePath::root(index);
+        let after = tree_walk::next_leaf_path(&self.tdoc, &rule_path)
+            .unwrap_or_else(|| TreePath::root(index + 1));
+        self.cursor = DocumentPosition::at(after, 0);
+        self.selection = None;
+        self.normalize_cursor();
+        self.trigger_paragraph_change();
+        Ok(())
+    }
+
+    /// Remove the horizontal rule at `path` and park the caret on a neighboring
+    /// leaf — the start of the following one when `land_after`, otherwise the end
+    /// of the preceding one, each falling back to the other side when the rule was
+    /// the document's first or last leaf.
+    ///
+    /// Removal shifts sibling indices, so the caret is re-derived from leaf
+    /// *ordinals*: the leaf that followed the rule inherits the rule's own
+    /// ordinal, and the one before it keeps `ordinal - 1`.
+    fn remove_rule_at(&mut self, path: &TreePath, land_after: bool) -> EditResult {
+        let Some(ordinal) = self.leaf_index(path) else {
+            return Ok(());
+        };
+        tree_edit::remove_node_at(&mut self.tdoc, path);
+
+        // Landing on the follower means its start, on the predecessor its end —
+        // either way, the edge nearest where the rule was.
+        let paths = self.leaf_paths();
+        let at_start = paths
+            .get(ordinal)
+            .cloned()
+            .map(|p| DocumentPosition::at(p, 0));
+        let at_end = ordinal
+            .checked_sub(1)
+            .and_then(|i| paths.get(i))
+            .cloned()
+            .map(|p| {
+                let end = self.leaf_text_len(&p);
+                DocumentPosition::at(p, end)
+            });
+        self.cursor = if land_after {
+            at_start.or(at_end)
+        } else {
+            at_end.or(at_start)
+        }
+        .unwrap_or_else(DocumentPosition::start);
+        self.selection = None;
+        self.normalize_cursor();
+        self.trigger_paragraph_change();
         Ok(())
     }
 
@@ -957,7 +1069,22 @@ impl Editor {
         let path = self.cursor.path.clone();
         let offset = self.cursor.offset;
 
-        if self.is_table_leaf(&path) {
+        // A rule holds no text, so Backspace deletes the rule itself. The same
+        // press one block below — at the very start of the leaf that follows a
+        // rule — deletes it too, which is how a thematic break is normally
+        // removed; without it the caret would just stall against an unmergeable
+        // neighbor.
+        if self.is_rule_leaf(&path) {
+            return self.remove_rule_at(&path, false);
+        }
+        if offset == 0
+            && let Some(prev) = tree_walk::prev_leaf_path(&self.tdoc, &path)
+            && self.is_rule_leaf(&prev)
+        {
+            return self.remove_rule_at(&prev, true);
+        }
+
+        if self.is_atomic_leaf(&path) {
             return Ok(());
         }
         if offset == 0 {
@@ -1043,13 +1170,25 @@ impl Editor {
         let offset = self.cursor.offset;
         let len = self.leaf_text_len(&path);
 
-        if self.is_table_leaf(&path) {
+        // The forward mirror of Backspace's rule handling: Delete on a rule, or at
+        // the end of the leaf just above one, removes the rule.
+        if self.is_rule_leaf(&path) {
+            return self.remove_rule_at(&path, true);
+        }
+        if offset >= len
+            && let Some(next) = tree_walk::next_leaf_path(&self.tdoc, &path)
+            && self.is_rule_leaf(&next)
+        {
+            return self.remove_rule_at(&next, false);
+        }
+
+        if self.is_atomic_leaf(&path) {
             return Ok(());
         }
         if offset >= len {
             // Merge the following leaf into this one (cursor stays at the join point).
             if let Some(next_path) = tree_walk::next_leaf_path(&self.tdoc, &path)
-                && !self.is_table_leaf(&next_path)
+                && !self.is_atomic_leaf(&next_path)
             {
                 tree_edit::merge_with_previous(&mut self.tdoc, &next_path);
                 self.cursor = DocumentPosition::at(path, len);
@@ -1082,7 +1221,7 @@ impl Editor {
         if self.selection.is_some() {
             return self.delete_selection();
         }
-        if self.is_table_leaf(&self.cursor.path.clone()) {
+        if self.is_atomic_leaf(&self.cursor.path.clone()) {
             return self.delete_backward();
         }
         let from = self.cursor.clone();
@@ -1105,7 +1244,7 @@ impl Editor {
         if self.selection.is_some() {
             return self.delete_selection();
         }
-        if self.is_table_leaf(&self.cursor.path.clone()) {
+        if self.is_atomic_leaf(&self.cursor.path.clone()) {
             return self.delete_forward();
         }
         let from = self.cursor.clone();
@@ -1496,6 +1635,15 @@ impl Editor {
             if *path < start.path || *path > end.path {
                 continue;
             }
+            if self.is_rule_leaf(path) {
+                // A rule carries no text, so the offset arithmetic below would
+                // drop it. Keep it whenever the selection covers more than the
+                // rule itself (a selection confined to one rule is empty).
+                if start.path != end.path {
+                    paragraphs.push(Paragraph::new_horizontal_rule());
+                }
+                continue;
+            }
             let content = tree_walk::leaf_inline(&self.tdoc, path);
             let len: usize = content.iter().map(|c| c.text_len()).sum();
             let from = if *path == start.path {
@@ -1586,7 +1734,7 @@ impl Editor {
             self.delete_selection()?;
         }
         let path = self.cursor.path.clone();
-        if self.is_table_leaf(&path) {
+        if self.is_atomic_leaf(&path) {
             return Ok(());
         }
         let offset = self.cursor.offset;
@@ -1637,7 +1785,7 @@ impl Editor {
             return self.replace_selection_with_link(destination, &text);
         }
         let path = start.path.clone();
-        if self.is_table_leaf(&path) {
+        if self.is_atomic_leaf(&path) {
             return Ok(());
         }
         let (from, to) = (start.offset, end.offset);
@@ -1861,7 +2009,11 @@ impl Editor {
             BlockType::ListItem {
                 ordered, checkbox, ..
             } => self.toggle_list_kind(ordered, checkbox.is_some()),
-            BlockType::Table { .. } => Ok(()),
+            // Neither is a style a block can be *converted* to: a table has no
+            // inline form to convert from, and turning a paragraph into a rule
+            // would silently drop its text. Rules are inserted as their own block
+            // via [`Self::insert_horizontal_rule`].
+            BlockType::Table { .. } | BlockType::HorizontalRule => Ok(()),
         }
     }
 
@@ -1930,7 +2082,7 @@ impl Editor {
                 self.convert_container_at(&container_path, kind);
                 Ok(())
             }
-            BlockType::Table { .. } => Ok(()),
+            BlockType::Table { .. } | BlockType::HorizontalRule => Ok(()),
         }
     }
 
@@ -6020,5 +6172,215 @@ mod tests {
         );
         e.toggle_highlight().unwrap();
         assert_eq!(md(&e), "[Build <mark>Status</mark>](https://x/actions)");
+    }
+
+    // ----- Horizontal rules ----------------------------------------------------------
+
+    /// The block types of every leaf, in document order.
+    fn block_types(e: &Editor) -> Vec<BlockType> {
+        e.leaves()
+            .iter()
+            .map(|info| tree_walk::leaf_block_type(&e.tdoc, info))
+            .collect()
+    }
+
+    #[test]
+    fn markdown_thematic_break_becomes_a_rule_leaf() {
+        let mut e = Editor::new();
+        e.set_document(markdown_to_document("A\n\n---\n\nB"));
+        assert_eq!(
+            block_types(&e),
+            vec![
+                BlockType::Paragraph,
+                BlockType::HorizontalRule,
+                BlockType::Paragraph
+            ]
+        );
+        // A rule is a caret stop with no editable content.
+        let rule = TreePath::root(1);
+        assert_eq!(tree_walk::leaf_spans(&e.tdoc, &rule), None);
+        assert_eq!(e.leaf_text_len(&rule), 0);
+        assert_eq!(md(&e), "A\n\n---\n\nB");
+    }
+
+    #[test]
+    fn rule_is_not_editable() {
+        let mut e = Editor::new();
+        e.set_document(markdown_to_document("A\n\n---\n\nB"));
+        e.set_cursor(DocumentPosition::at(TreePath::root(1), 0));
+        e.insert_text("x").unwrap();
+        e.insert_newline().unwrap();
+        e.insert_hard_break().unwrap();
+        assert_eq!(md(&e), "A\n\n---\n\nB", "a rule must absorb no input");
+    }
+
+    #[test]
+    fn insert_rule_mid_paragraph_splits_around_it() {
+        let mut e = Editor::new();
+        e.set_document(markdown_to_document("onetwo"));
+        e.set_cursor(DocumentPosition::at(TreePath::root(0), 3));
+        e.insert_horizontal_rule().unwrap();
+        assert_eq!(md(&e), "one\n\n---\n\ntwo");
+        // The caret continues below the rule, in the right-hand half.
+        assert_eq!(e.cursor().path, TreePath::root(2));
+        assert_eq!(e.cursor().offset, 0);
+    }
+
+    #[test]
+    fn insert_rule_at_block_edges_does_not_split() {
+        // At the start of a block the rule goes above it...
+        let mut e = Editor::new();
+        e.set_document(markdown_to_document("A\n\nB"));
+        e.set_cursor(DocumentPosition::at(TreePath::root(1), 0));
+        e.insert_horizontal_rule().unwrap();
+        assert_eq!(md(&e), "A\n\n---\n\nB");
+
+        // ...and at the end of one, below it — with an empty paragraph appended
+        // so the caret has somewhere to land.
+        let mut e = Editor::new();
+        e.set_document(markdown_to_document("A"));
+        e.set_cursor(DocumentPosition::at(TreePath::root(0), 1));
+        e.insert_horizontal_rule().unwrap();
+        assert_eq!(
+            block_types(&e),
+            vec![
+                BlockType::Paragraph,
+                BlockType::HorizontalRule,
+                BlockType::Paragraph
+            ]
+        );
+        assert_eq!(e.cursor().path, TreePath::root(2));
+        e.insert_text("B").unwrap();
+        assert_eq!(md(&e), "A\n\n---\n\nB");
+    }
+
+    #[test]
+    fn insert_rule_from_inside_a_list_follows_the_whole_list() {
+        // A thematic break is a document-level break, so it lands after the list
+        // rather than inside the item the caret sits in.
+        let mut e = Editor::new();
+        e.set_document(markdown_to_document("- one\n- two"));
+        e.set_cursor(DocumentPosition::at(
+            TreePath::root(0).child(PathSegment::ListEntry { entry: 0, para: 0 }),
+            2,
+        ));
+        e.insert_horizontal_rule().unwrap();
+        assert_eq!(
+            block_types(&e),
+            vec![
+                BlockType::ListItem {
+                    ordered: false,
+                    number: None,
+                    checkbox: None,
+                    depth: 0
+                },
+                BlockType::ListItem {
+                    ordered: false,
+                    number: None,
+                    checkbox: None,
+                    depth: 0
+                },
+                BlockType::HorizontalRule,
+                BlockType::Paragraph,
+            ]
+        );
+    }
+
+    #[test]
+    fn backspace_on_a_rule_removes_it() {
+        let mut e = Editor::new();
+        e.set_document(markdown_to_document("A\n\n---\n\nB"));
+        e.set_cursor(DocumentPosition::at(TreePath::root(1), 0));
+        e.delete_backward().unwrap();
+        assert_eq!(md(&e), "A\n\nB");
+        // The caret falls back to the end of the block above.
+        assert_eq!(e.cursor().path, TreePath::root(0));
+        assert_eq!(e.cursor().offset, 1);
+    }
+
+    #[test]
+    fn backspace_at_start_of_block_below_a_rule_removes_it() {
+        let mut e = Editor::new();
+        e.set_document(markdown_to_document("A\n\n---\n\nB"));
+        e.set_cursor(DocumentPosition::at(TreePath::root(2), 0));
+        e.delete_backward().unwrap();
+        assert_eq!(md(&e), "A\n\nB");
+        // The caret stays put on "B", which has slid up one slot.
+        assert_eq!(e.cursor().path, TreePath::root(1));
+        assert_eq!(e.cursor().offset, 0);
+        // A second press then merges the two paragraphs as usual.
+        e.delete_backward().unwrap();
+        assert_eq!(md(&e), "AB");
+    }
+
+    #[test]
+    fn delete_forward_removes_a_following_rule() {
+        let mut e = Editor::new();
+        e.set_document(markdown_to_document("A\n\n---\n\nB"));
+        e.set_cursor(DocumentPosition::at(TreePath::root(0), 1));
+        e.delete_forward().unwrap();
+        assert_eq!(md(&e), "A\n\nB");
+        assert_eq!(e.cursor().path, TreePath::root(0));
+        assert_eq!(e.cursor().offset, 1);
+
+        // On the rule itself, Delete removes it and lands below.
+        let mut e = Editor::new();
+        e.set_document(markdown_to_document("A\n\n---\n\nB"));
+        e.set_cursor(DocumentPosition::at(TreePath::root(1), 0));
+        e.delete_forward().unwrap();
+        assert_eq!(md(&e), "A\n\nB");
+        assert_eq!(e.cursor().path, TreePath::root(1));
+        assert_eq!(e.cursor().offset, 0);
+    }
+
+    #[test]
+    fn backspace_removes_a_leading_rule() {
+        // A rule as the document's first block has nothing above it to fall back
+        // to, so the caret lands at the start of what followed it.
+        let mut e = Editor::new();
+        e.set_document(markdown_to_document("---\n\nA"));
+        e.set_cursor(DocumentPosition::at(TreePath::root(0), 0));
+        e.delete_backward().unwrap();
+        assert_eq!(md(&e), "A");
+        assert_eq!(e.cursor().path, TreePath::root(0));
+        assert_eq!(e.cursor().offset, 0);
+    }
+
+    #[test]
+    fn selection_across_a_rule_deletes_it() {
+        let mut e = Editor::new();
+        e.set_document(markdown_to_document("A\n\n---\n\nB"));
+        e.set_selection(
+            DocumentPosition::at(TreePath::root(0), 1),
+            DocumentPosition::at(TreePath::root(2), 1),
+        );
+        e.delete_selection().unwrap();
+        assert_eq!(md(&e), "A");
+    }
+
+    #[test]
+    fn copying_across_a_rule_keeps_it() {
+        let mut e = Editor::new();
+        e.set_document(markdown_to_document("A\n\n---\n\nB"));
+        e.select_all();
+        let doc = e.get_selection_document().expect("non-empty selection");
+        assert_eq!(document_to_markdown(&doc), "A\n\n---\n\nB\n");
+    }
+
+    #[test]
+    fn set_block_type_never_turns_a_paragraph_into_a_rule() {
+        // A rule has no inline form, so converting to one would drop the text.
+        let mut e = Editor::new();
+        e.set_document(markdown_to_document("keep me"));
+        e.set_block_type(BlockType::HorizontalRule).unwrap();
+        assert_eq!(md(&e), "keep me");
+    }
+
+    #[test]
+    fn insert_rule_into_an_empty_document() {
+        let mut e = Editor::new();
+        e.insert_horizontal_rule().unwrap();
+        e.insert_text("after").unwrap();
+        assert_eq!(md(&e), "---\n\nafter");
     }
 }

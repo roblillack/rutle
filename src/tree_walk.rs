@@ -2,7 +2,7 @@
 //
 // The tdoc tree is authoritative; this module is the read/navigate layer over it. It
 // enumerates leaves (paragraphs, headings, code blocks, list-item paragraphs, checklist
-// items, and read-only tables) in the order they render, computing for each its
+// items, read-only tables, and horizontal rules) in the order they render, computing for each its
 // `TreePath`, intrinsic kind, list marker, and nesting depths. It also resolves a path
 // back to the leaf's inline spans (immutably and mutably) and provides
 // previous/next/first/last navigation that replaces the old flat `block_index ± 1`.
@@ -24,6 +24,8 @@ pub enum ParaKind {
     CodeBlock,
     /// A read-only table leaf; carries no editable spans.
     Table,
+    /// A horizontal rule / thematic break; carries no spans at all.
+    HorizontalRule,
 }
 
 /// Marker shown at the start of a leaf that begins a list/checklist entry.
@@ -119,6 +121,14 @@ fn walk_para(
         Paragraph::Table { .. } => {
             push_leaf(out, path, ParaKind::Table, marker, list_depth, quote_depth)
         }
+        Paragraph::HorizontalRule => push_leaf(
+            out,
+            path,
+            ParaKind::HorizontalRule,
+            marker,
+            list_depth,
+            quote_depth,
+        ),
         Paragraph::Quote { children } => {
             for (c, child) in children.iter().enumerate() {
                 walk_para(
@@ -261,16 +271,23 @@ fn resolve<'a>(doc: &'a Document, path: &TreePath) -> Option<LeafRef<'a>> {
     })
 }
 
-/// The inline spans of the leaf at `path`, or `None` for tables / invalid paths.
+/// The inline spans of the leaf at `path`, or `None` for tables, horizontal rules
+/// and invalid paths.
+///
+/// `None` is what marks a leaf *non-editable* across the engine (splits, merges and
+/// inline edits all bail on it), so a rule must answer `None` rather than the empty
+/// slice `tdoc`'s `Paragraph::content()` hands back for it — an empty slice would
+/// read as an ordinary empty paragraph.
 pub fn leaf_spans<'a>(doc: &'a Document, path: &TreePath) -> Option<&'a [Span]> {
     match resolve(doc, path)? {
-        LeafRef::Para(Paragraph::Table { .. }) => None,
+        LeafRef::Para(Paragraph::Table { .. } | Paragraph::HorizontalRule) => None,
         LeafRef::Para(p) => Some(p.content()),
         LeafRef::Check(item) => Some(&item.content),
     }
 }
 
-/// Mutable inline spans of the leaf at `path`, or `None` for tables / invalid paths.
+/// Mutable inline spans of the leaf at `path`, or `None` for tables, horizontal
+/// rules and invalid paths.
 pub fn leaf_spans_mut<'a>(doc: &'a mut Document, path: &TreePath) -> Option<&'a mut Vec<Span>> {
     let mut segs = path.0.iter();
     let PathSegment::Paragraph(i) = segs.next()? else {
@@ -367,7 +384,13 @@ pub fn set_leaf_inline(doc: &mut Document, path: &TreePath, content: &[InlineCon
 /// Build the presentation `BlockType` for a leaf (the transient descriptor the display
 /// and menus consume). Resolves table rows when the leaf is a table.
 pub fn leaf_block_type(doc: &Document, info: &LeafInfo) -> BlockType {
-    if let Some(marker) = &info.marker {
+    // A rule outranks any list marker around it. A `ListItem` block carries its
+    // content inline, and a rule has none, so reporting one as a list item would
+    // render an empty bullet and drop the rule entirely; losing the bullet is the
+    // lesser of the two.
+    if info.kind != ParaKind::HorizontalRule
+        && let Some(marker) = &info.marker
+    {
         return BlockType::ListItem {
             ordered: marker.ordered,
             number: marker.ordinal,
@@ -388,6 +411,7 @@ pub fn leaf_block_type(doc: &Document, info: &LeafInfo) -> BlockType {
         ParaKind::Table => BlockType::Table {
             rows: table_rows_at(doc, &info.path),
         },
+        ParaKind::HorizontalRule => BlockType::HorizontalRule,
     }
 }
 
@@ -429,6 +453,7 @@ fn para_intrinsic_block_type(doc: &Document, path: &TreePath, p: &Paragraph) -> 
         Paragraph::Table { .. } => BlockType::Table {
             rows: table_rows_at(doc, path),
         },
+        Paragraph::HorizontalRule => BlockType::HorizontalRule,
         // Container nodes are never leaves; fall back to a plain paragraph.
         _ => BlockType::Paragraph,
     }
@@ -893,6 +918,62 @@ mod tests {
         assert_eq!(prev_leaf_path(&doc, &paths[1]).as_ref(), Some(&paths[0]));
         assert_eq!(prev_leaf_path(&doc, &paths[0]), None);
         assert_eq!(next_leaf_path(&doc, &paths[2]), None);
+    }
+
+    #[test]
+    fn horizontal_rule_is_a_contentless_leaf() {
+        let doc = parse("A\n\n---\n\nB");
+        let leaves = enumerate_leaves(&doc);
+        assert_eq!(
+            leaves.iter().map(|l| l.kind.clone()).collect::<Vec<_>>(),
+            vec![
+                ParaKind::Paragraph,
+                ParaKind::HorizontalRule,
+                ParaKind::Paragraph
+            ]
+        );
+
+        let rule = &leaves[1];
+        // `None`, not `Some(&[])`: that is what marks the leaf non-editable.
+        assert_eq!(leaf_spans(&doc, &rule.path), None);
+        assert_eq!(leaf_text_len(&doc, &rule.path), 0);
+        assert!(leaf_inline(&doc, &rule.path).is_empty());
+        assert_eq!(leaf_block_type(&doc, rule), BlockType::HorizontalRule);
+        assert_eq!(
+            effective_block_type(&doc, &rule.path),
+            BlockType::HorizontalRule
+        );
+        assert!(!cursor_in_collapsed_container(&doc, &rule.path));
+    }
+
+    #[test]
+    fn quoted_rule_reports_itself_not_the_quote() {
+        // A rule is never plain text, so a single-rule quote must not collapse to
+        // a "Quote" pseudo-leaf the way a single-text one does.
+        let mut doc = parse("x");
+        doc.paragraphs =
+            vec![Paragraph::new_quote().with_children(vec![Paragraph::new_horizontal_rule()])];
+        let path = TreePath::root(0).child(PathSegment::QuoteChild(0));
+        assert_eq!(effective_block_type(&doc, &path), BlockType::HorizontalRule);
+        assert_eq!(
+            block_breadcrumb(&doc, &path),
+            vec![BlockType::BlockQuote, BlockType::HorizontalRule]
+        );
+    }
+
+    #[test]
+    fn rule_in_a_list_entry_outranks_the_bullet() {
+        // A `ListItem` block carries its content inline and a rule has none, so
+        // reporting the marker would render an empty bullet and drop the rule.
+        let mut doc = parse("x");
+        doc.paragraphs = vec![
+            Paragraph::new_unordered_list()
+                .with_entries(vec![vec![Paragraph::new_horizontal_rule()]]),
+        ];
+        let leaves = enumerate_leaves(&doc);
+        assert_eq!(leaves.len(), 1);
+        assert!(leaves[0].marker.is_some(), "the tree still says list item");
+        assert_eq!(leaf_block_type(&doc, &leaves[0]), BlockType::HorizontalRule);
     }
 
     #[test]

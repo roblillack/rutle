@@ -139,6 +139,49 @@ fn indent_then_outdent_round_trips() {
     assert_eq!(md(&e), before, "outdent should restore the original");
 }
 
+// ----- horizontal rules ----------------------------------------------------------
+
+#[test]
+fn insert_horizontal_rule_between_paragraphs() {
+    let mut e = editor_with("above\n\nbelow\n");
+    e.move_cursor_to_line_end(); // end of "above"
+    e.insert_horizontal_rule().unwrap();
+    assert_eq!(md(&e).trim_end(), "above\n\n---\n\nbelow", "{}", md(&e));
+    // The caret continues below the rule.
+    assert!(
+        matches!(e.current_block_type(), BlockType::Paragraph),
+        "{:?}",
+        e.current_block_type()
+    );
+    e.insert_text("X").unwrap();
+    assert!(md(&e).contains("Xbelow"), "{}", md(&e));
+}
+
+#[test]
+fn cursor_reports_a_rule_as_its_own_block_type() {
+    let mut e = editor_with("A\n\n---\n\nB\n");
+    e.move_cursor_down();
+    assert!(
+        matches!(e.current_block_type(), BlockType::HorizontalRule),
+        "{:?}",
+        e.current_block_type()
+    );
+}
+
+#[test]
+fn backspace_removes_a_rule() {
+    let mut e = editor_with("A\n\n---\n\nB\n");
+    e.move_cursor_down(); // onto the rule
+    e.delete_backward().unwrap();
+    assert_eq!(md(&e).trim_end(), "A\n\nB", "{}", md(&e));
+}
+
+#[test]
+fn rule_survives_a_markdown_round_trip() {
+    let e = editor_with("# Title\n\nA\n\n---\n\nB\n");
+    assert_eq!(md(&e).trim_end(), "# Title\n\nA\n\n---\n\nB", "{}", md(&e));
+}
+
 // ----- inline styles & links -----------------------------------------------------
 
 #[test]

@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="440" height="200" viewBox="0 0 440 200">
+<style>
+            @font-face { font-family: 'SnapshotSans'; font-weight: 500; font-style: normal; src: url('../NotoSans-Medium.ttf') format('truetype'); }
+            @font-face { font-family: 'SnapshotSans'; font-weight: 700; font-style: normal; src: url('../NotoSans-Bold.ttf') format('truetype'); }
+            @font-face { font-family: 'SnapshotSans'; font-weight: 500; font-style: italic; src: url('../NotoSans-MediumItalic.ttf') format('truetype'); }
+            @font-face { font-family: 'SnapshotSans'; font-weight: 700; font-style: italic; src: url('../NotoSans-BoldItalic.ttf') format('truetype'); }
+            </style>
+  <rect width="440" height="200" fill="#ffffff"/>
+  <rect x="0" y="0" width="440" height="200" fill="#fffff5"/>
+  <defs>
+    <clipPath id="clip-0-0-440-200">
+      <rect x="0" y="0" width="440" height="200"/>
+    </clipPath>
+  </defs>
+  <text x="171" y="59" fill="#cccccc" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-200)">───── • ─────</text>
+  <text x="25" y="24" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-200)">A </text>
+  <text x="38" y="24" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-200)">paragraph </text>
+  <text x="114" y="24" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-200)">above </text>
+  <text x="159" y="24" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-200)">the </text>
+  <text x="185" y="24" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-200)">rule.</text>
+  <text x="25" y="94" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-200)">A </text>
+  <text x="38" y="94" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-200)">paragraph </text>
+  <text x="114" y="94" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-200)">below </text>
+  <text x="159" y="94" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-200)">the </text>
+  <text x="185" y="94" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-200)">rule.</text>
+  <rect x="25" y="10" width="2" height="17" fill="#000000" clip-path="url(#clip-0-0-440-200)"/>
+</svg>

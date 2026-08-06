@@ -20,6 +20,13 @@ pub struct Theme {
     pub table_border_color: u32,
     pub table_header_background: u32,
 
+    /// Color of a horizontal rule (thematic break), in both its drawn-line and
+    /// its text form (see `horizontal_rule_as_text`).
+    pub horizontal_rule_color: u32,
+    /// Thickness of the drawn horizontal rule, in pixels. Ignored when
+    /// `horizontal_rule_as_text` is on.
+    pub horizontal_rule_thickness: i32,
+
     pub link_color: u32,
     pub link_hover_background: u32,
     pub link_hover_color: u32,
@@ -52,6 +59,12 @@ pub struct Theme {
     pub list_item_spacing: i32,
     pub quote_spacing: i32,
     pub code_block_padding: i32,
+
+    /// Extra breathing room above and below a horizontal rule, on top of the
+    /// ordinary inter-block gap, so the rule reads as a section break rather than
+    /// as another line of the surrounding text. Pixel value for the GUI; a cell
+    /// backend sets this to 0 and lets `classic_block_spacing` carry the gap.
+    pub horizontal_rule_spacing: i32,
 
     /// Horizontal indent per quote nesting level, and the x-offset of the quote
     /// bar within that indent. Pixel values for the GUI; small for a cell grid.
@@ -113,6 +126,13 @@ pub struct Theme {
     /// its solid bar; a cell backend turns this on.
     pub quote_bar_as_text: bool,
 
+    /// Render a horizontal rule as a centered run of box-drawing glyphs around a
+    /// spaced bullet (`───── • ─────`) instead of a drawn line — the same
+    /// ornament `tdoc`'s terminal formatter emits. Off by default (the GUI draws
+    /// a full-width line); a cell backend, which cannot draw sub-cell rules,
+    /// turns this on.
+    pub horizontal_rule_as_text: bool,
+
     /// Color used for decorative rules drawn by the engine — heading underlines
     /// and code-block fences. Only consulted when `heading_underline` /
     /// `code_block_fence` are on (i.e. cell backends); defaults to the plain
@@ -168,21 +188,23 @@ pub struct Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            background_color: 0xFFFFF5FF,               // Off-white background
-            selection_color: 0xB4D5FEFF,                // Light blue selection color
-            cursor_color: 0x000000FF,                   // Black cursor
-            quote_bar_color: 0xCCCCCCFF,                // Light gray quote bar
-            quote_bar_width: 4,                         // Width of the quote bar
-            table_border_color: 0xBBBBBBFF,             // Gray table grid lines
-            table_header_background: 0xEEEEE5FF,        // Subtle header row fill
-            link_color: 0x0000EEFF,                     // Standard blue link color
-            link_hover_background: 0xDDDDDDFF,          // Light gray hover background
-            link_hover_color: 0x0000AAFF,               // Darker blue link color
-            highlight_color: 0xFFFF00FF,                // Yellow highlight color
-            search_highlight_color: 0xFFE4B5FF,         // Light orange for search matches
+            background_color: 0xFFFFF5FF,        // Off-white background
+            selection_color: 0xB4D5FEFF,         // Light blue selection color
+            cursor_color: 0x000000FF,            // Black cursor
+            quote_bar_color: 0xCCCCCCFF,         // Light gray quote bar
+            quote_bar_width: 4,                  // Width of the quote bar
+            table_border_color: 0xBBBBBBFF,      // Gray table grid lines
+            table_header_background: 0xEEEEE5FF, // Subtle header row fill
+            horizontal_rule_color: 0xCCCCCCFF,   // Light gray thematic break
+            horizontal_rule_thickness: 1,
+            link_color: 0x0000EEFF,             // Standard blue link color
+            link_hover_background: 0xDDDDDDFF,  // Light gray hover background
+            link_hover_color: 0x0000AAFF,       // Darker blue link color
+            highlight_color: 0xFFFF00FF,        // Yellow highlight color
+            search_highlight_color: 0xFFE4B5FF, // Light orange for search matches
             search_current_highlight_color: 0xFFA500FF, // Orange for current match
-            reveal_tag_fg: 0x000000FF,                  // Black tag text (GUI: unused)
-            reveal_tag_bg: 0xCCCCCCFF,                  // Light gray tag fill (GUI: unused)
+            reveal_tag_fg: 0x000000FF,          // Black tag text (GUI: unused)
+            reveal_tag_bg: 0xCCCCCCFF,          // Light gray tag fill (GUI: unused)
 
             padding_vertical: 10,
             padding_horizontal: 25,
@@ -196,6 +218,10 @@ impl Default for Theme {
             list_item_spacing: 2,
             quote_spacing: 5,
             code_block_padding: 5,
+            // Added above and below the rule row. With the default 12px paragraph
+            // spacing this puts an even 18px of air on both sides of a rule that
+            // separates two paragraphs.
+            horizontal_rule_spacing: 6,
             quote_indent: 20,
             quote_bar_offset: 12,
             list_indent: 0,
@@ -207,6 +233,7 @@ impl Default for Theme {
             checkbox_text: false,
             heading_underline: false,
             quote_bar_as_text: false,
+            horizontal_rule_as_text: false,
             structural_color: 0x000000FF,
             code_block_fence: false,
             checkmark_color: 0x000000FF,

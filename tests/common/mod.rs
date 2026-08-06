@@ -624,6 +624,35 @@ pub fn list_with_continuation_paragraph(mode: FontMode) -> Vec<u8> {
     render(display_for(md, w, h), mode, w, h)
 }
 
+pub fn horizontal_rule(mode: FontMode) -> Vec<u8> {
+    // Markdown `---` between two sections. The rule must read as a section break:
+    // an even gap above and below, and a line spanning the whole content column
+    // rather than hugging either neighbor.
+    let md = "## Before the break\n\n\
+        A paragraph above the rule.\n\n\
+        ---\n\n\
+        A paragraph below the rule.\n\n\
+        - and a list item\n\
+        - to check the rule clears block content on both sides";
+    let (w, h) = (440, 300);
+    render(display_for(md, w, h), mode, w, h)
+}
+
+pub fn horizontal_rule_as_text(mode: FontMode) -> Vec<u8> {
+    // The same rule with `horizontal_rule_as_text` on: a cell backend can't draw
+    // a sub-cell line, so the rule becomes the centered `───── • ─────` ornament
+    // tdoc's terminal formatter prints. Everything else is unchanged.
+    let md = "A paragraph above the rule.\n\n---\n\nA paragraph below the rule.";
+    let (w, h) = (440, 200);
+    let mut display = display_for(md, w, h);
+    let theme = rutle::Theme {
+        horizontal_rule_as_text: true,
+        ..Default::default()
+    };
+    display.set_theme(theme);
+    render(display, mode, w, h)
+}
+
 pub fn list_then_paragraph(mode: FontMode) -> Vec<u8> {
     // A paragraph, a list, then another paragraph. The gap *before* the list
     // (the leading paragraph's trailing space) and the gap *after* it (before

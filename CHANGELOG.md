@@ -10,6 +10,40 @@ While pre-1.0, the minor version is bumped for breaking changes.
 
 ## [Unreleased] - ReleaseDate
 
+### Added
+
+- Support for horizontal rules (thematic breaks), matching `tdoc`'s
+  `Paragraph::HorizontalRule` (tdoc#49). A rule is a **non-editable leaf** like a
+  table: the caret can rest on it, but there is nothing in it to type into.
+  - `BlockType::HorizontalRule` and `tree_walk::ParaKind::HorizontalRule`.
+    `tree_walk::leaf_spans` answers `None` for a rule — the marker the whole
+    engine uses for "not editable" — so splits, merges and inline edits skip it.
+  - `Editor::insert_horizontal_rule()` inserts a rule as a top-level block: a
+    top-level paragraph is split around it when the caret sits inside its text,
+    at a block edge the rule slots in above or below, and from inside a
+    list/quote it follows the whole top-level block. The caret lands in the
+    block after the rule (an empty paragraph is appended if there is none).
+  - Backspace and Delete remove a rule — on the rule itself, and from the edge
+    of the block just below or above it. Rules inside a selection are removed
+    with it, and copying across one keeps it in the clipboard document.
+  - `set_block_type(BlockType::HorizontalRule)` is a deliberate no-op: a rule has
+    no inline form, so converting a paragraph into one would drop its text.
+  - Layout gives the rule one contentless row — so it is a hit-testable caret
+    stop — and paints a line across the block's content column, or the centered
+    `───── • ─────` ornament `tdoc`'s terminal formatter uses when
+    `Theme::horizontal_rule_as_text` is on.
+  - New theme knobs: `horizontal_rule_color`, `horizontal_rule_thickness`,
+    `horizontal_rule_spacing` and `horizontal_rule_as_text`. Under
+    `classic_block_spacing`, a rule carries (2, 2) line margins, matching tdoc.
+
+### Changed
+
+- **Breaking:** `BlockType` gained a `HorizontalRule` variant, so exhaustive
+  matches over it in frontends need a new arm.
+- The `tdoc` dependency is temporarily pinned to a git revision, because
+  horizontal-rule support is not in a published tdoc release yet. It must go back
+  to a plain version requirement before rutle can be published again.
+
 ## [0.5.0] - 2026-07-08
 
 ### Changed

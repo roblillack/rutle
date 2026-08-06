@@ -26,7 +26,11 @@ include = [
 ]
 
 [dependencies]
-tdoc = { version = "0.11.1", default-features = false }
+# Pinned to a git revision because horizontal-rule support (`Paragraph::HorizontalRule`)
+# is not in a published tdoc release yet. Swap this back to a plain
+# `version = "0.11.3"` (or whatever release carries tdoc#49) before publishing —
+# `cargo publish` rejects a bare git dependency, which is the intended tripwire.
+tdoc = { git = "https://github.com/roblillack/tdoc", rev = "dd58f93018db2f6a86fe7c413c9cba91946faf05", default-features = false }
 unicode-segmentation = "1.10"
 
 [dev-dependencies]

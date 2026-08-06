@@ -190,6 +190,11 @@ pub enum BlockType {
     Table {
         rows: Vec<TableRow>,
     },
+    /// A horizontal rule / thematic break. Carries no content at all: the block's
+    /// `content` stays empty and the renderer paints the rule from the block's
+    /// geometry alone. Like a table it is a non-editable leaf — the caret can rest
+    /// on it and it can be deleted, but there is nothing in it to type into.
+    HorizontalRule,
 }
 
 /// A block of content
