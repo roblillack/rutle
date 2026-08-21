@@ -934,6 +934,7 @@ impl Renderer {
                 block_idx,
                 leaves[block_idx].quote_depth,
                 leaves[block_idx].list_levels,
+                leaves[block_idx].definition_depth,
                 current_y,
                 content_width,
                 ctx,
@@ -1525,6 +1526,7 @@ impl Renderer {
 
         let mut quotes = 0i32;
         let mut lists = 0i32;
+        let mut defs = 0i32;
         let mut bars = Vec::with_capacity(info.quote_depth);
         for seg in info.path.segments() {
             match seg {
@@ -1533,12 +1535,16 @@ impl Renderer {
                         self.theme.padding_horizontal
                             + quotes * self.theme.quote_indent
                             + list_part(lists)
+                            + defs * self.theme.definition_indent
                             + self.theme.quote_bar_offset,
                     );
                     quotes += 1;
                 }
                 PathSegment::ListEntry { .. } | PathSegment::ChecklistItem(_) => lists += 1,
-                PathSegment::Paragraph(_) => {}
+                // A definition body indents its contents; a term does not (it heads
+                // the body rather than sitting inside it), matching `definition_depth`.
+                PathSegment::DefinitionPara { .. } => defs += 1,
+                PathSegment::Paragraph(_) | PathSegment::DefinitionTerm { .. } => {}
             }
         }
         bars
@@ -1574,8 +1580,8 @@ impl Renderer {
 
     /// Layout a single block. `blocks`/`leaves` are the full frame slices (for sibling
     /// scans such as ordered-list run detection); `block_idx` indexes them.
-    /// `quote_depth`/`list_levels` come from the leaf and drive indentation independently of
-    /// the (flat) block type.
+    /// `quote_depth`/`list_levels`/`definition_depth` come from the leaf and drive
+    /// indentation independently of the (flat) block type.
     #[allow(clippy::too_many_arguments)]
     fn layout_block(
         &mut self,
@@ -1585,6 +1591,7 @@ impl Renderer {
         block_idx: usize,
         quote_depth: usize,
         list_levels: usize,
+        definition_depth: usize,
         y: i32,
         width: i32,
         ctx: &mut dyn RenderContext,
@@ -1592,9 +1599,12 @@ impl Renderer {
         // Indentation is driven by the leaf's tree depths, not its (flat) block type: a
         // continuation paragraph, code block, or list item nested inside a quote keeps both
         // its quote indent and its list indent even though its `BlockType` records only one.
+        // A definition body indents the same way, so a heading or nested list inside a
+        // `<dd>` sits under its term just as a plain paragraph does.
         let quote_indent = quote_depth as i32 * self.theme.quote_indent;
-        let start_x = self.theme.padding_horizontal + quote_indent;
-        let width = width - quote_indent;
+        let definition_indent = definition_depth as i32 * self.theme.definition_indent;
+        let start_x = self.theme.padding_horizontal + quote_indent + definition_indent;
+        let width = width - quote_indent - definition_indent;
         let default_line_height = self.theme.line_height;
 
         // Content that lives inside a list but is not itself a marker line (continuation
@@ -2033,6 +2043,21 @@ impl Renderer {
             BlockType::HorizontalRule => {
                 self.layout_horizontal_rule(block_idx, y, interior_x, interior_width)
             }
+            // A term lays out like a paragraph in the term font; its own indentation is
+            // already in `interior_x` (a term carries no definition indent of its own,
+            // and `definition_indent` sets the definition below it apart). The gap that
+            // follows is tight so the term stays visually attached to that definition.
+            BlockType::DefinitionTerm { .. } => {
+                self.layout_inline_block(
+                    block,
+                    block_idx,
+                    y,
+                    interior_x,
+                    interior_width,
+                    default_line_height,
+                    ctx,
+                ) + self.theme.definition_term_spacing
+            }
         }
     }
 
@@ -2424,6 +2449,7 @@ impl Renderer {
             },
             BlockType::BlockQuote => self.theme.quote_text,
             BlockType::CodeBlock { .. } => self.theme.code_text,
+            BlockType::DefinitionTerm { .. } => self.theme.definition_term,
             _ => self.theme.plain_text,
         };
 
@@ -3848,7 +3874,8 @@ mod tests {
     use crate::tree_walk;
     use tdoc::Document;
     use tdoc::paragraph::{
-        ChecklistItem, Paragraph, TableCell as TdocTableCell, TableRow as TdocTableRow,
+        ChecklistItem, DefinitionItem, Paragraph, TableCell as TdocTableCell,
+        TableRow as TdocTableRow,
     };
 
     /// Build a single tdoc paragraph from a transient `Block` (test convenience).
@@ -3894,6 +3921,9 @@ mod tests {
                     .collect(),
             },
             BlockType::HorizontalRule => Paragraph::new_horizontal_rule(),
+            BlockType::DefinitionTerm { .. } => Paragraph::DefinitionList {
+                items: vec![DefinitionItem::new().with_terms(vec![spans])],
+            },
         }
     }
 

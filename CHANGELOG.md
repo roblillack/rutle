@@ -35,14 +35,101 @@ While pre-1.0, the minor version is bumped for breaking changes.
   - New theme knobs: `horizontal_rule_color`, `horizontal_rule_thickness`,
     `horizontal_rule_spacing` and `horizontal_rule_as_text`. Under
     `classic_block_spacing`, a rule carries (2, 2) line margins, matching tdoc.
+- Support for definition lists, matching `tdoc`'s `Paragraph::DefinitionList`.
+  Unlike a table or a rule, a definition list is **fully editable**: both halves
+  of an item — its terms (`<dt>`) and the paragraphs of its definition (`<dd>`)
+  — are ordinary leaves that the caret, typing, styling and selection reach the
+  same way they reach any other text.
+  - New path segments `PathSegment::DefinitionTerm { item, term }` and
+    `PathSegment::DefinitionPara { item, para }`. They are siblings under one
+    item but distinct variants, so `TreePath` ordering gained a tie-break that
+    keeps an item's terms ahead of its definition.
+  - `BlockType::DefinitionTerm { depth }` and
+    `tree_walk::ParaKind::DefinitionTerm` for terms. A definition's *body* has no
+    block type of its own: its paragraphs keep their intrinsic type (paragraph,
+    heading, nested list, …) and indent from the new
+    `tree_walk::LeafInfo::definition_depth`, exactly as continuation paragraphs
+    inside a list item stay `Paragraph` and indent from their list depth.
+  - Enter walks the list one half at a time, so a glossary is written straight
+    through: in a term it splits into two terms of the same item, but at the
+    *end* of a term whose item has no definition yet it opens that definition
+    and moves in; in a definition it starts the **next item**, taking the right
+    half as that item's term and the paragraphs below it as its definition —
+    the same shape as Enter in a list item starting the next item. Enter on an
+    empty term or definition *leaves* the list, splitting it around the new
+    paragraph, exactly as Enter on an empty list item leaves a list. So
+    term → Enter → definition → Enter → term → … → Enter twice ends the list.
+  - `insert_continuation` (Ctrl+P in Pure) keeps its meaning inside a
+    definition: another paragraph of the *same* definition. With Enter now
+    moving on to the next term, this and Tab are the ways to grow one.
+  - **Tab / Shift-Tab switch a line between the two halves.** `Editor::outdent`
+    — a new counterpart to `Editor::indent` — turns a definition paragraph into
+    the next item's term, taking the paragraphs that followed it in the old
+    definition along as its own definition. Tab on a term does the inverse: the
+    term becomes the last paragraph of the definition above it, and if it was
+    its item's only term that item's definition follows it there and the empty
+    item is dropped. The two are exact inverses, so a line can be moved between
+    the halves and back. A term of a multi-term item moves alone, leaving the
+    others in place, and the list's very first term has nothing above it to join.
+    `cursor_can_indent` / `cursor_can_unnest` report both, so a frontend's
+    indent/outdent affordances light up without extra work.
+  - Backspace merges across the term/definition boundary and prunes an item left
+    with nothing, then the list left with no items.
+  - `set_block_type(BlockType::DefinitionTerm { .. })` toggles: outside a
+    definition list it wraps the selected top-level paragraphs into one, a term
+    per paragraph; inside one it dissolves the list back into plain paragraphs.
+    Both directions preserve leaf order and count.
+  - `set_block_type` with any *other* target lifts the leaf out of the list first
+    and applies the type to what that leaves behind — a term and a definition are
+    the two halves of an item, not blocks that can become a heading where they
+    stand. Everything around the converted leaf keeps its place:
+    - A **term** (`tree_edit::lift_definition_term`) leaves on its own. Terms
+      before it stay in a list above; terms after it stay in a list below, keeping
+      the definition they head. Only when no term is left to head the definition —
+      the converted term was the item's last — does the definition come out with
+      it, so a one-term item yields the term and its definition as two plain
+      paragraphs and nothing is ever orphaned above a term that no longer exists.
+    - A **definition** (`tree_edit::lift_definition_para`) takes only its own
+      content out, to just below the list, keeping the term a term with an empty
+      definition to type into. The paragraphs that followed it inside the
+      definition come along keeping their own types.
+
+    Because the lift feeds the ordinary block-type path, container targets (quote,
+    list, checklist) work through it unchanged, and the caret stays in the same
+    text.
+  - **Definition lists split and rejoin automatically.** A leaf leaves its list by
+    splitting it, so the halves are put back together whenever the paragraph
+    between them stops separating them:
+    `tree_edit::merge_adjacent_definition_lists` runs when a paragraph is turned
+    into a definition list (matching how the list toggles already merge with an
+    adjacent same-kind list), and `remove_node_at` rejoins the lists a deleted
+    paragraph leaves touching. Two adjacent lists render exactly like one but
+    serialize with a separator between them, so without this a term that left the
+    list and came back would leave a permanent seam in the saved file.
+  - A lone-text definition deliberately does **not** collapse onto its container
+    the way a single-text quote or list item does, so retyping a one-paragraph
+    definition affects that paragraph alone rather than the whole list.
+  - Layout draws terms in the new `Theme::definition_term` font (bold by
+    default — a term has no marker, so weight is what sets it apart) and indents
+    each definition by `Theme::definition_indent`, including across paragraph
+    breaks and nested definition lists. `Theme::definition_term_spacing` keeps a
+    term tight against the definition it heads.
 
 ### Changed
 
-- **Breaking:** `BlockType` gained a `HorizontalRule` variant, so exhaustive
-  matches over it in frontends need a new arm.
-- The `tdoc` dependency is temporarily pinned to a git revision, because
-  horizontal-rule support is not in a published tdoc release yet. It must go back
-  to a plain version requirement before rutle can be published again.
+- **Breaking:** `BlockType` gained `HorizontalRule` and `DefinitionTerm`
+  variants, and `PathSegment` gained `DefinitionTerm`/`DefinitionPara`, so
+  exhaustive matches over either in frontends need new arms.
+- **Breaking:** `Theme` gained `definition_indent`, `definition_term_spacing` and
+  `definition_term`; `tree_walk::LeafInfo` gained `definition_depth`. Frontends
+  that construct either struct literally (rather than via `..Default::default()`)
+  need the new fields.
+- `Editor::outdent` is the new entry point for Shift-Tab, replacing direct calls
+  to `outdent_list_item`. It routes a definition paragraph to the definition-list
+  move and everything else to `outdent_list_item` unchanged, mirroring how
+  `indent` already routed list items and adjacent-container nesting.
+- The `tdoc` dependency is now `0.12`, which carries both horizontal rules and
+  definition lists. This replaces the temporary git pin.
 
 ## [0.5.0] - 2026-07-08
 

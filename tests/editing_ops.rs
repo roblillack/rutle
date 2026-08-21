@@ -182,6 +182,70 @@ fn rule_survives_a_markdown_round_trip() {
     assert_eq!(md(&e).trim_end(), "# Title\n\nA\n\n---\n\nB", "{}", md(&e));
 }
 
+// ----- definition lists ----------------------------------------------------------
+
+#[test]
+fn cursor_reports_a_term_and_its_definition_separately() {
+    let mut e = editor_with("Coffee\n: Black hot drink\n");
+    assert!(
+        matches!(
+            e.current_block_type(),
+            BlockType::DefinitionTerm { depth: 0 }
+        ),
+        "{:?}",
+        e.current_block_type()
+    );
+    e.move_cursor_down(); // into the definition
+    assert!(
+        matches!(e.current_block_type(), BlockType::Paragraph),
+        "{:?}",
+        e.current_block_type()
+    );
+}
+
+#[test]
+fn typing_in_a_term_and_a_definition_reaches_the_document() {
+    let mut e = editor_with("Coffee\n: Black hot drink\n");
+    e.move_cursor_to_line_end();
+    e.insert_text(" beans").unwrap();
+    e.move_cursor_down();
+    e.move_cursor_to_line_end();
+    e.insert_text(", strong").unwrap();
+    assert_eq!(
+        md(&e).trim_end(),
+        "Coffee beans\n: Black hot drink, strong",
+        "{}",
+        md(&e)
+    );
+}
+
+#[test]
+fn definition_list_survives_a_markdown_round_trip() {
+    let e = editor_with("# Title\n\nCoffee\n: Black hot drink\n\nTea\n: A leaf infusion\n");
+    assert_eq!(
+        md(&e).trim_end(),
+        "# Title\n\nCoffee\n: Black hot drink\n\nTea\n: A leaf infusion",
+        "{}",
+        md(&e)
+    );
+}
+
+#[test]
+fn copying_a_definition_list_keeps_its_text() {
+    // Like lists and quotes, a definition list's *grouping* is not reconstructed by
+    // the structure-preserving clipboard yet (see `get_selection_document`); its
+    // terms and definitions come across as plain paragraphs. The text must survive.
+    let mut e = editor_with("Coffee\n: Black hot drink\n");
+    e.select_all();
+    let doc = e.get_selection_document().expect("non-empty selection");
+    let out = document_to_markdown(&doc);
+    assert!(out.contains("Coffee"), "term text lost:\n{out}");
+    assert!(
+        out.contains("Black hot drink"),
+        "definition text lost:\n{out}"
+    );
+}
+
 // ----- inline styles & links -----------------------------------------------------
 
 #[test]

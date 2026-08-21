@@ -76,3 +76,8 @@ fn horizontal_rule() {
 fn horizontal_rule_as_text() {
     insta::assert_binary_snapshot!(".svg", common::horizontal_rule_as_text(MODE));
 }
+
+#[test]
+fn definition_list() {
+    insta::assert_binary_snapshot!(".svg", common::definition_list(MODE));
+}

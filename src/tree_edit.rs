@@ -7,7 +7,7 @@
 
 use tdoc::Document;
 use tdoc::inline::Span;
-use tdoc::paragraph::{ChecklistItem, Paragraph};
+use tdoc::paragraph::{ChecklistItem, DefinitionItem, Paragraph};
 
 use super::inline_convert::inline_to_spans;
 use super::structured_document::{Block, InlineContent};
@@ -44,6 +44,13 @@ fn node_at_mut<'a>(doc: &'a mut Document, path: &TreePath) -> Option<NodeMut<'a>
             (NodeMut::Check(item), PathSegment::ChecklistItem(c)) => {
                 NodeMut::Check(item.children.get_mut(*c)?)
             }
+            // A definition's paragraphs are ordinary blocks and resolve as nodes; a
+            // *term* is a bare `Vec<Span>`, not a node, so it never resolves here —
+            // its content is reached through `tree_walk::leaf_spans*` instead.
+            (
+                NodeMut::Para(Paragraph::DefinitionList { items }),
+                PathSegment::DefinitionPara { item, para },
+            ) => NodeMut::Para(items.get_mut(*item)?.definition.get_mut(*para)?),
             _ => return None,
         };
     }
@@ -80,6 +87,10 @@ fn node_at<'a>(doc: &'a Document, path: &TreePath) -> Option<NodeRef<'a>> {
             (NodeRef::Check(item), PathSegment::ChecklistItem(c)) => {
                 NodeRef::Check(item.children.get(*c)?)
             }
+            (
+                NodeRef::Para(Paragraph::DefinitionList { items }),
+                PathSegment::DefinitionPara { item, para },
+            ) => NodeRef::Para(items.get(*item)?.definition.get(*para)?),
             _ => return None,
         };
     }
@@ -219,21 +230,84 @@ pub fn split_leaf(doc: &mut Document, path: &TreePath, offset: usize) -> Option<
             }
             Some(pp.child(PathSegment::ChecklistItem(c + 1)))
         }
+        // A term splits into a further term of the same item, so Enter mid-term gives
+        // the two halves as two `<dt>`s sharing one definition — the way consecutive
+        // terms are authored in HTML and Markdown alike.
+        //
+        // The exception is Enter at the *end* of a term whose item has no definition
+        // yet: an item with terms but no definition has nowhere to type the definition,
+        // so that keystroke opens one and moves into it. (With a definition already
+        // there, the same keystroke adds a second term, which is how `<dt>`s are
+        // stacked.) This mirrors the empty-continuation rule in `same_kind_paragraph`,
+        // where Enter at the end of a heading drops you into body text.
+        PathSegment::DefinitionTerm { item, term } => {
+            let NodeMut::Para(Paragraph::DefinitionList { items }) = node_at_mut(doc, &pp)? else {
+                return None;
+            };
+            let it = items.get_mut(item)?;
+            if term >= it.terms.len() {
+                return None;
+            }
+            let carries_text = right.iter().any(|c| c.text_len() > 0);
+            if !carries_text && it.definition.is_empty() {
+                it.definition.push(Paragraph::new_text());
+                return Some(pp.child(PathSegment::DefinitionPara { item, para: 0 }));
+            }
+            it.terms.insert(term + 1, inline_to_spans(&right));
+            Some(pp.child(PathSegment::DefinitionTerm {
+                item,
+                term: term + 1,
+            }))
+        }
+        // A definition's paragraphs split like a list's entries: the right half starts the
+        // *next item*, as its term, and any paragraphs after the split move into that new
+        // item's definition. So Enter in a definition moves on to the next term rather than
+        // stacking another paragraph inside the current definition — the same shape as Enter
+        // in a list item starting the next item. (Ctrl+P still adds a paragraph to the
+        // current definition; see `split_leaf_continuation`.)
+        PathSegment::DefinitionPara { item, para } => {
+            let NodeMut::Para(Paragraph::DefinitionList { items }) = node_at_mut(doc, &pp)? else {
+                return None;
+            };
+            let it = items.get_mut(item)?;
+            if para >= it.definition.len() {
+                return None;
+            }
+            // The paragraphs *after* the split one follow the right half into the new item.
+            let following = it.definition.split_off(para + 1);
+            items.insert(
+                item + 1,
+                DefinitionItem::new()
+                    .with_terms(vec![inline_to_spans(&right)])
+                    .with_definition(following),
+            );
+            Some(pp.child(PathSegment::DefinitionTerm {
+                item: item + 1,
+                term: 0,
+            }))
+        }
     }
 }
 
-/// Like [`split_leaf`], but inside a list item the right half becomes a *continuation
-/// paragraph* within the same entry (a new plain paragraph after the current one) rather
-/// than starting a new list item. Elsewhere — top level, quotes, checklists — it behaves
-/// exactly like `split_leaf` (a quote already splits into a sibling paragraph).
+/// Like [`split_leaf`], but inside a list item or a definition the right half becomes a
+/// *continuation paragraph* of the same item (a new plain paragraph after the current one)
+/// rather than starting the next item. Elsewhere — top level, quotes, checklists — it
+/// behaves exactly like `split_leaf` (a quote already splits into a sibling paragraph).
+///
+/// For a definition this is the only way to grow one past a single paragraph, since Enter
+/// there moves on to the next term.
 pub fn split_leaf_continuation(
     doc: &mut Document,
     path: &TreePath,
     offset: usize,
 ) -> Option<TreePath> {
-    let PathSegment::ListEntry { entry, para } = path.0.last()?.clone() else {
+    let last = path.0.last()?.clone();
+    if !matches!(
+        last,
+        PathSegment::ListEntry { .. } | PathSegment::DefinitionPara { .. }
+    ) {
         return split_leaf(doc, path, offset);
-    };
+    }
     // Reject tables / invalid leaves, then split the inline runs.
     tree_walk::leaf_spans(doc, path)?;
     let runs = tree_walk::leaf_inline(doc, path);
@@ -241,21 +315,36 @@ pub fn split_leaf_continuation(
     tree_walk::set_leaf_inline(doc, path, &left);
 
     let pp = parent_path(path);
-    if let NodeMut::Para(
-        Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
-    ) = node_at_mut(doc, &pp)?
-    {
-        let e = entries.get_mut(entry)?;
-        e.insert(
-            para + 1,
-            Paragraph::new_text().with_content(inline_to_spans(&right)),
-        );
-        Some(pp.child(PathSegment::ListEntry {
-            entry,
-            para: para + 1,
-        }))
-    } else {
-        None
+    match (last, node_at_mut(doc, &pp)?) {
+        (
+            PathSegment::ListEntry { entry, para },
+            NodeMut::Para(
+                Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
+            ),
+        ) => {
+            let e = entries.get_mut(entry)?;
+            e.insert(
+                para + 1,
+                Paragraph::new_text().with_content(inline_to_spans(&right)),
+            );
+            Some(pp.child(PathSegment::ListEntry {
+                entry,
+                para: para + 1,
+            }))
+        }
+        (
+            PathSegment::DefinitionPara { item, para },
+            NodeMut::Para(Paragraph::DefinitionList { items }),
+        ) => {
+            let it = items.get_mut(item)?;
+            let new = same_kind_paragraph(it.definition.get(para)?, &right);
+            it.definition.insert(para + 1, new);
+            Some(pp.child(PathSegment::DefinitionPara {
+                item,
+                para: para + 1,
+            }))
+        }
+        _ => None,
     }
 }
 
@@ -314,6 +403,24 @@ pub fn merge_with_previous(doc: &mut Document, path: &TreePath) -> Option<(TreeP
     Some((prev, prev_len))
 }
 
+/// After removing the node at `idx` from `vec`, join the definition lists that removal left
+/// touching. Two adjacent definition lists render exactly like one but serialize with a
+/// separator between them, so a list stays whole when the paragraph that had split it goes
+/// away. The later list is absorbed into the earlier one and its items are appended, so both
+/// the sibling indices at or below it and any path already resolved into the earlier list
+/// stay valid — which is what lets [`merge_with_previous`] call through here safely.
+fn join_definition_lists_at(vec: &mut Vec<Paragraph>, idx: usize) {
+    if idx == 0 || idx >= vec.len() {
+        return;
+    }
+    if matches!(vec[idx - 1], Paragraph::DefinitionList { .. })
+        && matches!(vec[idx], Paragraph::DefinitionList { .. })
+    {
+        let moved = vec.remove(idx);
+        append_definition_items(&mut vec[idx - 1], moved);
+    }
+}
+
 /// Remove the node at `path` from its parent container, pruning containers that become
 /// empty as a result (e.g. removing a list's last entry removes the list).
 pub fn remove_node_at(doc: &mut Document, path: &TreePath) {
@@ -325,6 +432,7 @@ pub fn remove_node_at(doc: &mut Document, path: &TreePath) {
         PathSegment::Paragraph(i) => {
             if i < doc.paragraphs.len() {
                 doc.paragraphs.remove(i);
+                join_definition_lists_at(&mut doc.paragraphs, i);
             }
         }
         PathSegment::QuoteChild(c) => {
@@ -332,6 +440,7 @@ pub fn remove_node_at(doc: &mut Document, path: &TreePath) {
             if let Some(NodeMut::Para(Paragraph::Quote { children })) = node_at_mut(doc, &pp) {
                 if c < children.len() {
                     children.remove(c);
+                    join_definition_lists_at(children, c);
                 }
                 empty = children.is_empty();
             }
@@ -377,7 +486,358 @@ pub fn remove_node_at(doc: &mut Document, path: &TreePath) {
                 remove_node_at(doc, &pp);
             }
         }
+        // Removing a term or a definition paragraph prunes upwards the same way a list
+        // does: an item with neither terms nor definition left is dropped, and a
+        // definition list with no items left goes with it.
+        PathSegment::DefinitionTerm { item, term } => {
+            remove_definition_part(doc, &pp, item, |it| {
+                if term < it.terms.len() {
+                    it.terms.remove(term);
+                }
+            });
+        }
+        PathSegment::DefinitionPara { item, para } => {
+            remove_definition_part(doc, &pp, item, |it| {
+                if para < it.definition.len() {
+                    it.definition.remove(para);
+                }
+            });
+        }
     }
+}
+
+/// Apply `remove` to `items[item]` of the definition list at `list_path`, then prune the
+/// item if it is left with nothing at all, and the list if it is left with no items.
+fn remove_definition_part(
+    doc: &mut Document,
+    list_path: &TreePath,
+    item: usize,
+    remove: impl FnOnce(&mut DefinitionItem),
+) {
+    let mut empty = false;
+    if let Some(NodeMut::Para(Paragraph::DefinitionList { items })) = node_at_mut(doc, list_path) {
+        if let Some(it) = items.get_mut(item) {
+            remove(it);
+            if it.terms.is_empty() && it.definition.is_empty() {
+                items.remove(item);
+            }
+        }
+        empty = items.is_empty();
+    }
+    if empty {
+        remove_node_at(doc, list_path);
+    }
+}
+
+/// The inline spans of a paragraph that can stand as a definition *term*, or `None` for one
+/// that cannot. A term is a bare `Vec<Span>`, so only a paragraph that owns inline content
+/// has a term form — the same test [`paragraphs_into_definition_list`] applies. A nested
+/// list, table or rule keeps its place as a definition paragraph instead.
+fn term_spans_of(p: &Paragraph) -> Option<Vec<Span>> {
+    match p {
+        Paragraph::Text { content }
+        | Paragraph::Header1 { content }
+        | Paragraph::Header2 { content }
+        | Paragraph::Header3 { content }
+        | Paragraph::CodeBlock { content } => Some(content.clone()),
+        _ => None,
+    }
+}
+
+/// Outdent a definition paragraph (Shift-Tab): it stops being part of its definition and
+/// becomes the *term* of a new item right below, taking the paragraphs that followed it in
+/// the old definition along as its own definition.
+///
+/// ```text
+///   Coffee            Coffee
+///   : hot        ->   : hot
+///   : black           Black
+///   : opaque          : opaque
+/// ```
+///
+/// Returns the new item's term path. `None` when the paragraph has no term form (a nested
+/// list, table or rule — see [`term_spans_of`]) or the path is not a definition paragraph.
+pub fn outdent_definition_para(doc: &mut Document, path: &TreePath) -> Option<TreePath> {
+    let PathSegment::DefinitionPara { item, para } = path.0.last()?.clone() else {
+        return None;
+    };
+    let pp = parent_path(path);
+    let NodeMut::Para(Paragraph::DefinitionList { items }) = node_at_mut(doc, &pp)? else {
+        return None;
+    };
+    let it = items.get_mut(item)?;
+    let spans = term_spans_of(it.definition.get(para)?)?;
+    it.definition.remove(para);
+    // Everything that followed it stays below it, now as the new item's definition.
+    let following = it.definition.split_off(para);
+    items.insert(
+        item + 1,
+        DefinitionItem::new()
+            .with_terms(vec![spans])
+            .with_definition(following),
+    );
+    Some(pp.child(PathSegment::DefinitionTerm {
+        item: item + 1,
+        term: 0,
+    }))
+}
+
+/// Indent a definition term (Tab): it stops heading its own item and becomes the last
+/// paragraph of the definition above it — the inverse of [`outdent_definition_para`].
+///
+/// If the term is its item's only one, the whole item is absorbed: its definition follows
+/// the term into the one above, and the empty item is dropped. If the item has further
+/// terms, only this one moves and the rest stay as an item of their own, so nothing is
+/// reordered. A term that is not preceded by another item (the first term of the first
+/// item) has nowhere to go and returns `None`.
+pub fn indent_definition_term(doc: &mut Document, path: &TreePath) -> Option<TreePath> {
+    let PathSegment::DefinitionTerm { item, term } = path.0.last()?.clone() else {
+        return None;
+    };
+    let pp = parent_path(path);
+    let NodeMut::Para(Paragraph::DefinitionList { items }) = node_at_mut(doc, &pp)? else {
+        return None;
+    };
+    if items.get(item)?.terms.len() <= term {
+        return None;
+    }
+
+    // A later term of an item first splits that item in two, so the terms before it keep
+    // their place above; the split half is then the leading term of its own item, which is
+    // the case handled below.
+    let (item, term) = if term > 0 {
+        let tail_terms = items[item].terms.split_off(term);
+        let definition = std::mem::take(&mut items[item].definition);
+        items.insert(
+            item + 1,
+            DefinitionItem::new()
+                .with_terms(tail_terms)
+                .with_definition(definition),
+        );
+        (item + 1, 0)
+    } else {
+        (item, term)
+    };
+    if item == 0 {
+        return None;
+    }
+
+    let spans = items[item].terms.remove(term);
+    let absorbed = if items[item].terms.is_empty() {
+        // Nothing is left to head the item, so its definition joins the term above it and
+        // the item goes away — exactly undoing `outdent_definition_para`.
+        let rest = std::mem::take(&mut items[item].definition);
+        items.remove(item);
+        rest
+    } else {
+        Vec::new()
+    };
+
+    let target = items.get_mut(item - 1)?;
+    let para = target.definition.len();
+    target
+        .definition
+        .push(Paragraph::new_text().with_content(spans));
+    target.definition.extend(absorbed);
+    Some(pp.child(PathSegment::DefinitionPara {
+        item: item - 1,
+        para,
+    }))
+}
+
+/// Leave a definition list from an empty leaf inside it (Enter on an empty term or an empty
+/// definition paragraph), the way Enter on an empty list item leaves a list: the empty leaf
+/// becomes a plain paragraph in the list's own container, and the list splits around it so
+/// whatever followed stays a definition list below. Returns the new paragraph's path.
+///
+/// `part` addresses the empty leaf within `items[item]` — a term or a definition paragraph.
+pub fn exit_definition_list(doc: &mut Document, path: &TreePath) -> Option<TreePath> {
+    #[derive(Clone, Copy)]
+    enum Part {
+        Term(usize),
+        Para(usize),
+    }
+    let (item, part) = match path.0.last()? {
+        PathSegment::DefinitionTerm { item, term } => (*item, Part::Term(*term)),
+        PathSegment::DefinitionPara { item, para } => (*item, Part::Para(*para)),
+        _ => return None,
+    };
+    let list_path = parent_path(path);
+
+    let mut before = match node_at_mut(doc, &list_path)? {
+        NodeMut::Para(Paragraph::DefinitionList { items }) => {
+            if item >= items.len() {
+                return None;
+            }
+            std::mem::take(items)
+        }
+        _ => return None,
+    };
+    let mut after = before.split_off(item + 1);
+    let mut cur = before.pop()?;
+
+    // Split the cursor's item around the empty leaf: what precedes it stays above the new
+    // paragraph, what follows it moves below. A tail with no term of its own becomes a
+    // term-less item, which is how a definition without a term is already represented.
+    let tail = match part {
+        Part::Term(t) => {
+            if t >= cur.terms.len() {
+                return None;
+            }
+            let mut tail_terms = cur.terms.split_off(t);
+            tail_terms.remove(0);
+            DefinitionItem::new()
+                .with_terms(tail_terms)
+                .with_definition(std::mem::take(&mut cur.definition))
+        }
+        Part::Para(p) => {
+            if p >= cur.definition.len() {
+                return None;
+            }
+            let mut tail_defs = cur.definition.split_off(p);
+            tail_defs.remove(0);
+            DefinitionItem::new().with_definition(tail_defs)
+        }
+    };
+    if !(cur.terms.is_empty() && cur.definition.is_empty()) {
+        before.push(cur);
+    }
+    if !(tail.terms.is_empty() && tail.definition.is_empty()) {
+        after.insert(0, tail);
+    }
+
+    let mut replacement: Vec<Paragraph> = Vec::new();
+    if !before.is_empty() {
+        replacement.push(Paragraph::DefinitionList { items: before });
+    }
+    let moved = replacement.len();
+    replacement.push(Paragraph::new_text());
+    if !after.is_empty() {
+        replacement.push(Paragraph::DefinitionList { items: after });
+    }
+
+    let base = container_splice(doc, &list_path, replacement)?;
+    Some(container_child_path(&list_path, base + moved))
+}
+
+/// Lift a definition term out of its list as a plain paragraph, splitting the list around it.
+/// Used when a term is retyped: it stops being a term, and the caller applies the new type to
+/// every paragraph this produced.
+///
+/// **The item's other halves keep their place.** Terms before the lifted one stay in a list
+/// above it; terms after it stay in a list below, keeping the definition they head. Only when
+/// no term is left to head the definition — the lifted term was the item's last — does the
+/// definition come out with it, so a one-term item yields the term and its definition as two
+/// plain paragraphs and nothing is ever orphaned above a term that no longer exists.
+///
+/// Returns the first lifted paragraph's path and how many were lifted.
+pub fn lift_definition_term(doc: &mut Document, path: &TreePath) -> Option<(TreePath, usize)> {
+    let PathSegment::DefinitionTerm { item, term } = path.0.last()?.clone() else {
+        return None;
+    };
+    let list_path = parent_path(path);
+    let mut before = take_definition_items(doc, &list_path, item)?;
+    let mut after = before.split_off(item + 1);
+    let mut cur = before.pop()?;
+    if term >= cur.terms.len() {
+        return None;
+    }
+
+    let mut trailing_terms = cur.terms.split_off(term);
+    let spans = trailing_terms.remove(0);
+    let leading_terms = std::mem::take(&mut cur.terms);
+    let mut lifted = vec![Paragraph::new_text().with_content(spans)];
+
+    if !leading_terms.is_empty() {
+        before.push(DefinitionItem::new().with_terms(leading_terms));
+    }
+    if trailing_terms.is_empty() {
+        // Nothing below it still heads the definition, so it follows the term out.
+        lifted.extend(cur.definition);
+    } else {
+        after.insert(
+            0,
+            DefinitionItem::new()
+                .with_terms(trailing_terms)
+                .with_definition(cur.definition),
+        );
+    }
+    splice_around_definition_list(doc, &list_path, before, lifted, after)
+}
+
+/// Lift a definition paragraph out of its list to just below it, taking the paragraphs that
+/// followed it in the same definition along so nothing is reordered. The item keeps its
+/// terms and, if that emptied its definition, a fresh empty one to type into; the list splits
+/// when items follow. Used when a *definition* is retyped: the content leaves the list but
+/// the term it defined stays a term.
+///
+/// Returns the lifted paragraph's path and how many paragraphs moved with it.
+pub fn lift_definition_para(doc: &mut Document, path: &TreePath) -> Option<(TreePath, usize)> {
+    let PathSegment::DefinitionPara { item, para } = path.0.last()?.clone() else {
+        return None;
+    };
+    let list_path = parent_path(path);
+    let mut before = take_definition_items(doc, &list_path, item)?;
+    let after = before.split_off(item + 1);
+    let mut cur = before.pop()?;
+    if para >= cur.definition.len() {
+        return None;
+    }
+    let lifted = cur.definition.split_off(para);
+
+    // A term with nothing left under it keeps an empty definition to type into. An item with
+    // no term to keep — a term-less item holding only this paragraph — simply goes away.
+    if !cur.terms.is_empty() {
+        if cur.definition.is_empty() {
+            cur.definition.push(Paragraph::new_text());
+        }
+        before.push(cur);
+    } else if !cur.definition.is_empty() {
+        before.push(cur);
+    }
+    splice_around_definition_list(doc, &list_path, before, lifted, after)
+}
+
+/// Take the items out of the definition list at `list_path`, checking `item` is in range.
+fn take_definition_items(
+    doc: &mut Document,
+    list_path: &TreePath,
+    item: usize,
+) -> Option<Vec<DefinitionItem>> {
+    match node_at_mut(doc, list_path)? {
+        NodeMut::Para(Paragraph::DefinitionList { items }) => {
+            if item >= items.len() {
+                return None;
+            }
+            Some(std::mem::take(items))
+        }
+        _ => None,
+    }
+}
+
+/// Replace the definition list at `list_path` with `lifted` sandwiched between the items
+/// that stay above and below it, each half kept as a list of its own (and dropped when
+/// empty). Returns the first lifted paragraph's path and how many were lifted.
+fn splice_around_definition_list(
+    doc: &mut Document,
+    list_path: &TreePath,
+    before: Vec<DefinitionItem>,
+    lifted: Vec<Paragraph>,
+    after: Vec<DefinitionItem>,
+) -> Option<(TreePath, usize)> {
+    let count = lifted.len();
+    let mut replacement: Vec<Paragraph> = Vec::new();
+    if !before.is_empty() {
+        replacement.push(Paragraph::DefinitionList { items: before });
+    }
+    let start = replacement.len();
+    replacement.extend(lifted);
+    if !after.is_empty() {
+        replacement.push(Paragraph::DefinitionList { items: after });
+    }
+
+    let base = container_splice(doc, list_path, replacement)?;
+    Some((container_child_path(list_path, base + start), count))
 }
 
 fn list_ordered(p: &Paragraph) -> Option<bool> {
@@ -548,6 +1008,43 @@ pub fn lists_into_paragraphs(paragraphs: Vec<Paragraph>) -> Vec<Paragraph> {
             }
             other => out.push(other),
         }
+    }
+    out
+}
+
+/// Wrap a run of paragraphs into a single definition list: each paragraph becomes one
+/// item, mirroring how [`paragraphs_into_list`] gives each paragraph its own list item.
+/// A paragraph that owns inline content becomes that item's *term*, with the definition
+/// left empty for the author to fill in (Enter at the end of a term opens it — see
+/// [`split_leaf`]). A paragraph that owns none — a nested list, table or rule — has no
+/// sensible term form, so it becomes a term-less item holding that paragraph as its
+/// definition rather than being flattened away. Either way one paragraph yields one
+/// leaf, so the leaf order and count are preserved.
+pub fn paragraphs_into_definition_list(paragraphs: Vec<Paragraph>) -> Paragraph {
+    let items = paragraphs
+        .into_iter()
+        .map(|p| match p {
+            Paragraph::Text { content }
+            | Paragraph::Header1 { content }
+            | Paragraph::Header2 { content }
+            | Paragraph::Header3 { content }
+            | Paragraph::CodeBlock { content } => DefinitionItem::new().with_terms(vec![content]),
+            other => DefinitionItem::new().with_definition(vec![other]),
+        })
+        .collect();
+    Paragraph::DefinitionList { items }
+}
+
+/// Expand definition-list items back into plain paragraphs: one text paragraph per term,
+/// followed by the definition's own paragraphs unchanged. The inverse of
+/// [`paragraphs_into_definition_list`]; preserves leaf order and count.
+pub fn definition_list_into_paragraphs(items: Vec<DefinitionItem>) -> Vec<Paragraph> {
+    let mut out = Vec::new();
+    for item in items {
+        for term in item.terms {
+            out.push(Paragraph::new_text().with_content(term));
+        }
+        out.extend(item.definition);
     }
     out
 }
@@ -869,6 +1366,29 @@ pub fn move_sibling(doc: &mut Document, path: &TreePath, up: bool) -> Option<Tre
             items.swap(c, target);
             Some(parent.child(PathSegment::ChecklistItem(target)))
         }
+        // Terms reorder among the terms of their item, definition paragraphs among the
+        // paragraphs of theirs; neither crosses into the other, so the two halves of an
+        // item keep their shape.
+        PathSegment::DefinitionTerm { item, term } => {
+            let NodeMut::Para(Paragraph::DefinitionList { items }) = node_at_mut(doc, &parent)?
+            else {
+                return None;
+            };
+            let terms = &mut items.get_mut(item)?.terms;
+            let target = sibling_target(term, terms.len(), up)?;
+            terms.swap(term, target);
+            Some(parent.child(PathSegment::DefinitionTerm { item, term: target }))
+        }
+        PathSegment::DefinitionPara { item, para } => {
+            let NodeMut::Para(Paragraph::DefinitionList { items }) = node_at_mut(doc, &parent)?
+            else {
+                return None;
+            };
+            let definition = &mut items.get_mut(item)?.definition;
+            let target = sibling_target(para, definition.len(), up)?;
+            definition.swap(para, target);
+            Some(parent.child(PathSegment::DefinitionPara { item, para: target }))
+        }
     }
 }
 
@@ -905,6 +1425,12 @@ pub fn move_block(doc: &mut Document, path: &TreePath, up: bool) -> Option<TreeP
             move_list_item(doc, path, up)
         }
         PathSegment::Paragraph(_) | PathSegment::QuoteChild(_) => move_plain_block(doc, path, up),
+        // Inside a definition list the move stays within the item: there is no
+        // "carry it out as a lone list" analogue for a term or a definition, so the
+        // edges of the item are simply where the move stops.
+        PathSegment::DefinitionTerm { .. } | PathSegment::DefinitionPara { .. } => {
+            move_sibling(doc, path, up)
+        }
     }
 }
 
@@ -1607,6 +2133,9 @@ pub fn dissolve_container(doc: &mut Document, container_path: &TreePath) -> Opti
             }
             out
         }
+        NodeMut::Para(Paragraph::DefinitionList { items }) => {
+            definition_list_into_paragraphs(std::mem::take(items))
+        }
         _ => return None,
     };
     container_splice(doc, container_path, paras)
@@ -1914,6 +2443,38 @@ pub fn merge_adjacent_lists(doc: &mut Document, list_path: &TreePath) -> TreePat
         cur -= 1;
     }
     with_last_index(list_path, cur)
+}
+
+/// Merge the definition list at `list_path` with any definition lists directly before or
+/// after it, the way [`merge_adjacent_lists`] joins same-kind lists. Splitting a list is how
+/// a term or a definition leaves it, so without this a leaf that leaves and comes back would
+/// leave the list permanently in pieces. Returns the merged list's path.
+pub fn merge_adjacent_definition_lists(doc: &mut Document, list_path: &TreePath) -> TreePath {
+    let Some((vec, idx)) = sibling_vec_mut(doc, list_path) else {
+        return list_path.clone();
+    };
+    if !matches!(vec.get(idx), Some(Paragraph::DefinitionList { .. })) {
+        return list_path.clone();
+    }
+    let mut cur = idx;
+    while cur + 1 < vec.len() && matches!(vec[cur + 1], Paragraph::DefinitionList { .. }) {
+        let next = vec.remove(cur + 1);
+        append_definition_items(&mut vec[cur], next);
+    }
+    while cur > 0 && matches!(vec[cur - 1], Paragraph::DefinitionList { .. }) {
+        let moved = vec.remove(cur);
+        append_definition_items(&mut vec[cur - 1], moved);
+        cur -= 1;
+    }
+    with_last_index(list_path, cur)
+}
+
+fn append_definition_items(dst: &mut Paragraph, src: Paragraph) {
+    if let (Paragraph::DefinitionList { items }, Paragraph::DefinitionList { items: from }) =
+        (dst, src)
+    {
+        items.extend(from);
+    }
 }
 
 /// Indent the list/checklist item at `path` beneath its previous sibling (nesting it in a

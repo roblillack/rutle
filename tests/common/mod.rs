@@ -653,6 +653,25 @@ pub fn horizontal_rule_as_text(mode: FontMode) -> Vec<u8> {
     render(display, mode, w, h)
 }
 
+pub fn definition_list(mode: FontMode) -> Vec<u8> {
+    // A definition list between two paragraphs. A term must read as the label for
+    // the definition beneath it — bold, flush with the surrounding text, and sitting
+    // tight against its definition — while the definition indents clear of it. The
+    // last item carries two definition paragraphs, so the indent has to hold across
+    // a paragraph break rather than only under the term.
+    let md = "Text before the list.\n\n\
+        Coffee\n\
+        : A black hot drink, and a long enough definition that it wraps.\n\n\
+        Tea\n\
+        : A leaf infusion.\n\n\
+        Water\n\
+        : The plain one.\n\
+        : Also the wet one.\n\n\
+        Text after the list.";
+    let (w, h) = (400, 400);
+    render(display_for(md, w, h), mode, w, h)
+}
+
 pub fn list_then_paragraph(mode: FontMode) -> Vec<u8> {
     // A paragraph, a list, then another paragraph. The gap *before* the list
     // (the leading paragraph's trailing space) and the gap *after* it (before

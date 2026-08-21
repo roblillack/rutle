@@ -77,6 +77,18 @@ pub struct Theme {
     /// value so nested list items still indent.
     pub list_indent: i32,
 
+    /// Horizontal indent of a definition (`<dd>`) past the term it defines, per
+    /// nesting level. This *is* the visual cue that separates a definition list's
+    /// two halves — the terms carry no marker — so a backend that zeroes it should
+    /// distinguish the term some other way (see `definition_term`). Pixel value for
+    /// the GUI; small for a cell grid.
+    pub definition_indent: i32,
+
+    /// Trailing space below a definition term. Tight by default so a term reads as
+    /// attached to the definition beneath it rather than floating between items;
+    /// the fuller `paragraph_spacing` follows the definition itself.
+    pub definition_term_spacing: i32,
+
     /// Padding inside table cells (horizontal and vertical). Pixel values for
     /// the GUI; a cell backend uses tight values so rows/columns aren't huge.
     pub table_cell_padding_h: i32,
@@ -183,6 +195,10 @@ pub struct Theme {
     pub plain_text: FontSettings,
     pub quote_text: FontSettings,
     pub code_text: FontSettings,
+    /// Font for a definition list's terms. Bold by default: a term is a label for
+    /// the definition under it, and — unlike a list item — it has no marker of its
+    /// own, so weight is what sets it apart from ordinary text.
+    pub definition_term: FontSettings,
 }
 
 impl Default for Theme {
@@ -225,6 +241,10 @@ impl Default for Theme {
             quote_indent: 20,
             quote_bar_offset: 12,
             list_indent: 0,
+            // A definition sits one quote-indent's worth right of its term, so the
+            // two halves read as a pair without needing a marker between them.
+            definition_indent: 20,
+            definition_term_spacing: 2,
             table_cell_padding_h: 6,
             table_cell_padding_v: 3,
             text_decoration_lines: true,
@@ -282,6 +302,13 @@ impl Default for Theme {
                 font_style: FontStyle::Regular,
                 font_size: 14,
                 font_color: 0x0064C8FF,
+                background_color: None,
+            },
+            definition_term: FontSettings {
+                font_type: FontType::Content,
+                font_style: FontStyle::Bold,
+                font_size: 14,
+                font_color: 0x000000FF,
                 background_color: None,
             },
         }

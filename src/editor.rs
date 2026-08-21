@@ -915,6 +915,19 @@ impl Editor {
                 // plain quote paragraph, not a lifted-out list), so delist rather than unnest.
                 return self.outdent_list_item_delisting();
             }
+            // The same rule inside a definition list: an empty term or definition leaves the
+            // list as a plain paragraph. This is the way out of the alternating term/definition
+            // flow — Enter on the empty term a definition just opened ends the list.
+            if matches!(
+                path.last(),
+                Some(PathSegment::DefinitionTerm { .. } | PathSegment::DefinitionPara { .. })
+            ) && let Some(new_path) = tree_edit::exit_definition_list(&mut self.tdoc, &path)
+            {
+                self.cursor = DocumentPosition::at(new_path, 0);
+                self.normalize_cursor();
+                self.trigger_paragraph_change();
+                return Ok(());
+            }
         }
         let offset = self.cursor.offset;
         if let Some(new_path) = tree_edit::split_leaf(&mut self.tdoc, &path, offset) {
@@ -1621,11 +1634,11 @@ impl Editor {
     /// blocks — so copying e.g. a heading no longer degrades it to body text
     /// (this also improves the GUI's markdown/HTML clipboard fidelity).
     ///
-    /// TODO(phase2): reconstruct list/checklist/quote *grouping* across a
-    /// multi-leaf selection. Such leaves are still emitted as plain paragraphs
-    /// here because faithfully regrouping them into standalone lists/quotes is a
-    /// larger structural operation (this matches the gap with Pure's
-    /// `selection_fragment`, which clones whole root paragraphs).
+    /// TODO(phase2): reconstruct list/checklist/quote/definition-list *grouping*
+    /// across a multi-leaf selection. Such leaves are still emitted as plain
+    /// paragraphs here because faithfully regrouping them into standalone
+    /// lists/quotes is a larger structural operation (this matches the gap with
+    /// Pure's `selection_fragment`, which clones whole root paragraphs).
     pub fn get_selection_document(&self) -> Option<Document> {
         let (a, b) = self.selection.clone()?;
         let (start, end) = if a <= b { (a, b) } else { (b, a) };
@@ -1986,6 +1999,17 @@ impl Editor {
             return self.set_leaf_block_type_over_selection(i0, i1, block_type);
         }
         let path = self.cursor.path.clone();
+        // Retyping a leaf of a definition list takes it out of the list first: a term's whole
+        // item stops being one, a definition's content moves below the list. See
+        // [`Self::set_definition_leaf_block_type`].
+        if !matches!(block_type, BlockType::DefinitionTerm { .. })
+            && matches!(
+                path.last(),
+                Some(PathSegment::DefinitionTerm { .. } | PathSegment::DefinitionPara { .. })
+            )
+        {
+            return self.set_definition_leaf_block_type(&path, block_type);
+        }
         if tree_walk::cursor_in_collapsed_container(&self.tdoc, &path) {
             return self.set_collapsed_container_block_type(&path, block_type);
         }
@@ -2009,12 +2033,79 @@ impl Editor {
             BlockType::ListItem {
                 ordered, checkbox, ..
             } => self.toggle_list_kind(ordered, checkbox.is_some()),
+            BlockType::DefinitionTerm { .. } => self.toggle_definition_list(),
             // Neither is a style a block can be *converted* to: a table has no
             // inline form to convert from, and turning a paragraph into a rule
             // would silently drop its text. Rules are inserted as their own block
             // via [`Self::insert_horizontal_rule`].
             BlockType::Table { .. } | BlockType::HorizontalRule => Ok(()),
         }
+    }
+
+    /// Retype a leaf of a definition list. A term and a definition are the two halves of an
+    /// item rather than blocks of their own, so neither can simply *become* a heading in
+    /// place; each is lifted out of the list first and the new type applied to what that
+    /// leaves behind.
+    ///
+    /// - A **term** takes its whole item out: the term and its definition become two plain
+    ///   paragraphs, and the new type applies to both. Retyping the head of an item means
+    ///   the item stops being one.
+    /// - A **definition** takes only its own content out, to just below the list, keeping
+    ///   the term a term with an empty definition to type into. The paragraphs that followed
+    ///   it inside the definition come along (keeping their own types) so nothing is
+    ///   reordered, and the list splits when items follow.
+    ///
+    /// The lift preserves leaf order and count, so the caret is restored by flat leaf index
+    /// and stays in the same text.
+    fn set_definition_leaf_block_type(
+        &mut self,
+        path: &TreePath,
+        block_type: BlockType,
+    ) -> EditResult {
+        let on_term = matches!(path.last(), Some(PathSegment::DefinitionTerm { .. }));
+        let offset = self.cursor.offset;
+        let lifted = if on_term {
+            tree_edit::lift_definition_term(&mut self.tdoc, path)
+        } else {
+            tree_edit::lift_definition_para(&mut self.tdoc, path)
+        };
+        let Some((first, count)) = lifted else {
+            return Ok(());
+        };
+        let Some(first_idx) = self.leaf_index(&first) else {
+            return Ok(());
+        };
+
+        // A term retypes its definition along with itself; a definition retypes only itself,
+        // leaving the paragraphs that came out with it as they were.
+        let last_idx = if on_term {
+            first_idx + count.saturating_sub(1)
+        } else {
+            first_idx
+        };
+        let leaves = self.leaf_paths();
+        self.cursor = DocumentPosition::at(leaves.get(first_idx).cloned().unwrap_or_default(), 0);
+        self.selection = (last_idx > first_idx).then(|| {
+            let end = leaves.get(last_idx).cloned().unwrap_or_default();
+            let end_len = self.leaf_text_len(&end);
+            (
+                DocumentPosition::at(leaves[first_idx].clone(), 0),
+                DocumentPosition::at(end, end_len),
+            )
+        });
+
+        // The cursor is a plain paragraph now, so this cannot re-enter here.
+        self.set_block_type(block_type)?;
+
+        // Leave the caret where the author was typing rather than on a converted range.
+        let leaves = self.leaf_paths();
+        if let Some(p) = leaves.get(first_idx) {
+            self.cursor = DocumentPosition::at(p.clone(), offset);
+        }
+        self.selection = None;
+        self.normalize_cursor();
+        self.trigger_paragraph_change();
+        Ok(())
     }
 
     /// Apply a block-type change when the cursor sits in a collapsed single-text container
@@ -2081,6 +2172,19 @@ impl Editor {
                 };
                 self.convert_container_at(&container_path, kind);
                 Ok(())
+            }
+            // A collapsed quote/list item becomes a one-item definition list; the
+            // toggle below lifts it out of its container first, exactly as the leaf
+            // targets above do.
+            BlockType::DefinitionTerm { .. } => {
+                if is_quote {
+                    if !self.dissolve_container_at(&container_path) {
+                        return Ok(());
+                    }
+                } else if !self.delist_cursor_item() {
+                    return Ok(());
+                }
+                self.toggle_definition_list()
             }
             BlockType::Table { .. } | BlockType::HorizontalRule => Ok(()),
         }
@@ -2464,21 +2568,33 @@ impl Editor {
         tree_walk::block_breadcrumb(&self.tdoc, &self.cursor.path)
     }
 
-    /// Whether the cursor's leaf can be lifted out of its container one level (`[`).
+    /// Whether the cursor's leaf can be lifted out of its container one level (`[`), or —
+    /// inside a definition list — turned from a definition into the next term.
     pub fn cursor_can_unnest(&self) -> bool {
-        matches!(
-            self.cursor.path.last(),
+        match self.cursor.path.last() {
             Some(
                 PathSegment::ListEntry { .. }
-                    | PathSegment::ChecklistItem(_)
-                    | PathSegment::QuoteChild(_)
-            )
-        )
+                | PathSegment::ChecklistItem(_)
+                | PathSegment::QuoteChild(_),
+            ) => true,
+            // Only a definition paragraph with a term form can become one; a nested list or
+            // table inside a definition has nowhere to go.
+            Some(PathSegment::DefinitionPara { .. }) => {
+                tree_walk::leaf_spans(&self.tdoc, &self.cursor.path).is_some()
+            }
+            _ => false,
+        }
     }
 
-    /// Whether `]` / Tab can indent here: a list/checklist item (nest deeper), or a
-    /// top-level paragraph or selection adjacent to a container (nest into it).
+    /// Whether `]` / Tab can indent here: a list/checklist item (nest deeper), a definition
+    /// term (become a paragraph of the definition above), or a top-level paragraph or
+    /// selection adjacent to a container (nest into it).
     pub fn cursor_can_indent(&self) -> bool {
+        if let Some(PathSegment::DefinitionTerm { item, term }) = self.cursor.path.last() {
+            // Only the list's very first term has nothing above it to join; a later term of
+            // the first item splits that item and joins the half left above it.
+            return *item > 0 || *term > 0;
+        }
         self.cursor_is_list_item() || self.can_nest_selection_into_adjacent()
     }
 
@@ -2516,11 +2632,48 @@ impl Editor {
     pub fn indent(&mut self) -> EditResult {
         if self.cursor_is_list_item() {
             self.indent_list_item()
+        } else if matches!(
+            self.cursor.path.last(),
+            Some(PathSegment::DefinitionTerm { .. })
+        ) {
+            self.shift_definition_leaf(tree_edit::indent_definition_term)
         } else if self.can_nest_selection_into_adjacent() {
             self.nest_selection_into_adjacent()
         } else {
             Ok(())
         }
+    }
+
+    /// Outdent (`[` / Shift-Tab): the counterpart to [`Self::indent`]. Inside a definition
+    /// list a definition paragraph becomes the next term; everywhere else this lifts a
+    /// list/checklist/quote leaf out one level.
+    pub fn outdent(&mut self) -> EditResult {
+        if matches!(
+            self.cursor.path.last(),
+            Some(PathSegment::DefinitionPara { .. })
+        ) {
+            self.shift_definition_leaf(tree_edit::outdent_definition_para)
+        } else {
+            self.outdent_list_item()
+        }
+    }
+
+    /// Apply a definition-list Tab/Shift-Tab move at the cursor, keeping the caret on the
+    /// same text (which has changed role, not position — the leaf order is unchanged).
+    fn shift_definition_leaf(
+        &mut self,
+        op: impl Fn(&mut Document, &TreePath) -> Option<TreePath>,
+    ) -> EditResult {
+        let path = self.cursor.path.clone();
+        let offset = self.cursor.offset;
+        let Some(new_path) = op(&mut self.tdoc, &path) else {
+            return Ok(());
+        };
+        self.cursor = DocumentPosition::at(new_path, offset);
+        self.selection = None;
+        self.normalize_cursor();
+        self.trigger_paragraph_change();
+        Ok(())
     }
 
     /// Move the selected paragraph(s) into an adjacent container: appended to a container
@@ -2742,6 +2895,86 @@ impl Editor {
         // The freshly wrapped list may abut a same-kind sibling (e.g. a paragraph turned
         // into a checklist item next to an existing checklist) — fold them into one list.
         self.merge_lists_at_cursor();
+        Ok(())
+    }
+
+    /// The path of the definition list the cursor sits in (the node holding the term or
+    /// definition paragraph it is on), or `None` when the cursor is outside one. Only the
+    /// *innermost* enclosing list is reported, so a nested definition list toggles on its
+    /// own rather than dissolving its parent.
+    fn cursor_definition_list_path(&self) -> Option<TreePath> {
+        let segs = self.cursor.path.segments();
+        let last = segs.len().checked_sub(1)?;
+        matches!(
+            segs[last],
+            PathSegment::DefinitionTerm { .. } | PathSegment::DefinitionPara { .. }
+        )
+        .then(|| TreePath(segs[..last].to_vec()))
+    }
+
+    /// Toggle the cursor's block(s) between plain paragraphs and a definition list.
+    ///
+    /// Inside a definition list this dissolves it, lifting every term and definition
+    /// paragraph back out as plain paragraphs. Outside one it wraps the selected
+    /// top-level paragraphs into a single definition list, one item each, and leaves the
+    /// cursor on the item it started in. Unlike the list toggles this does not merge with
+    /// an adjacent definition list: consecutive `<dl>`s are meaningfully distinct (each
+    /// groups its own terms), so folding them together would change the document.
+    fn toggle_definition_list(&mut self) -> EditResult {
+        if let Some(list_path) = self.cursor_definition_list_path() {
+            self.dissolve_container_at(&list_path);
+            return Ok(());
+        }
+
+        let (start, end) = self.selection_or_cursor_range();
+        let (Some(s), Some(e)) = (top_index(&start.path), top_index(&end.path)) else {
+            return Ok(());
+        };
+        if s > e || e >= self.tdoc.paragraphs.len() {
+            return Ok(());
+        }
+        let cursor_rel = self
+            .cursor_top_index()
+            .map(|ci| ci.saturating_sub(s))
+            .unwrap_or(0);
+        let offset = self.cursor.offset;
+        let drained: Vec<Paragraph> = self.tdoc.paragraphs.drain(s..=e).collect();
+        self.tdoc
+            .paragraphs
+            .insert(s, tree_edit::paragraphs_into_definition_list(drained));
+
+        // A definition list next to the new one joins it, so a term that left the list (which
+        // splits it) and is turned back into one puts the pieces together again rather than
+        // leaving a seam. Count what the lists above contribute before merging: the new items
+        // shift down by exactly that many.
+        let items_above: usize = self.tdoc.paragraphs[..s]
+            .iter()
+            .rev()
+            .take_while(|p| matches!(p, Paragraph::DefinitionList { .. }))
+            .map(|p| p.definition_items().len())
+            .sum();
+        let list_path =
+            tree_edit::merge_adjacent_definition_lists(&mut self.tdoc, &TreePath::root(s));
+
+        // Each source paragraph became one item, so the cursor's item index is unchanged
+        // apart from that shift. It lands on that item's term, or — for a paragraph that had
+        // no term form — on its definition's first paragraph.
+        let cursor_rel = items_above + cursor_rel;
+        let term = list_path.child(PathSegment::DefinitionTerm {
+            item: cursor_rel,
+            term: 0,
+        });
+        let landing = if tree_walk::leaf_spans(&self.tdoc, &term).is_some() {
+            term
+        } else {
+            list_path.child(PathSegment::DefinitionPara {
+                item: cursor_rel,
+                para: 0,
+            })
+        };
+        self.cursor = DocumentPosition::at(landing, offset);
+        self.normalize_cursor();
+        self.trigger_paragraph_change();
         Ok(())
     }
 
@@ -3263,6 +3496,10 @@ fn child_index(seg: &PathSegment) -> usize {
         PathSegment::QuoteChild(c) => *c,
         PathSegment::ListEntry { entry, .. } => *entry,
         PathSegment::ChecklistItem(c) => *c,
+        // Both halves of a definition item address the same child of the list.
+        PathSegment::DefinitionTerm { item, .. } | PathSegment::DefinitionPara { item, .. } => {
+            *item
+        }
     }
 }
 
@@ -6382,5 +6619,715 @@ mod tests {
         e.insert_horizontal_rule().unwrap();
         e.insert_text("after").unwrap();
         assert_eq!(md(&e), "---\n\nafter");
+    }
+
+    // ----- Definition lists ----------------------------------------------------------
+
+    fn term_path(item: usize, term: usize) -> TreePath {
+        TreePath::root(0).child(PathSegment::DefinitionTerm { item, term })
+    }
+
+    fn definition_path(item: usize, para: usize) -> TreePath {
+        TreePath::root(0).child(PathSegment::DefinitionPara { item, para })
+    }
+
+    /// The flattened plain text of one leaf.
+    fn leaf_text(e: &Editor, path: &TreePath) -> String {
+        tree_walk::leaf_plain_text(&e.tdoc, path)
+    }
+
+    fn definition_editor() -> Editor {
+        let mut e = Editor::new();
+        e.set_document(markdown_to_document("Coffee\n: Black hot drink"));
+        e
+    }
+
+    #[test]
+    fn markdown_definition_list_becomes_term_and_definition_leaves() {
+        let e = definition_editor();
+        assert_eq!(
+            block_types(&e),
+            vec![BlockType::DefinitionTerm { depth: 0 }, BlockType::Paragraph]
+        );
+        assert_eq!(md(&e), "Coffee\n: Black hot drink");
+    }
+
+    #[test]
+    fn typing_edits_a_term_in_place() {
+        let mut e = definition_editor();
+        e.set_cursor(DocumentPosition::at(term_path(0, 0), 6));
+        e.insert_text(" beans").unwrap();
+        assert_eq!(md(&e), "Coffee beans\n: Black hot drink");
+    }
+
+    #[test]
+    fn typing_edits_a_definition_in_place() {
+        let mut e = definition_editor();
+        e.set_cursor(DocumentPosition::at(definition_path(0, 0), 5));
+        e.insert_text(", very").unwrap();
+        assert_eq!(md(&e), "Coffee\n: Black, very hot drink");
+    }
+
+    #[test]
+    fn enter_mid_term_splits_it_into_two_terms() {
+        // Both halves stay terms of the same item, sharing the one definition.
+        let mut e = definition_editor();
+        e.set_cursor(DocumentPosition::at(term_path(0, 0), 3));
+        e.insert_newline().unwrap();
+        assert_eq!(
+            block_types(&e),
+            vec![
+                BlockType::DefinitionTerm { depth: 0 },
+                BlockType::DefinitionTerm { depth: 0 },
+                BlockType::Paragraph
+            ]
+        );
+        assert_eq!(e.cursor().path, term_path(0, 1));
+        assert_eq!(leaf_text(&e, &term_path(0, 0)), "Cof");
+        assert_eq!(leaf_text(&e, &term_path(0, 1)), "fee");
+    }
+
+    #[test]
+    fn enter_at_end_of_a_definitionless_term_opens_its_definition() {
+        // A term with no definition has nowhere to type one, so Enter creates it.
+        let mut e = Editor::new();
+        e.set_document(markdown_to_document("Solo"));
+        e.set_block_type(BlockType::DefinitionTerm { depth: 0 })
+            .unwrap();
+        e.set_cursor(DocumentPosition::at(term_path(0, 0), 4));
+        e.insert_newline().unwrap();
+        assert_eq!(e.cursor().path, definition_path(0, 0));
+        e.insert_text("the definition").unwrap();
+        assert_eq!(md(&e), "Solo\n: the definition");
+    }
+
+    #[test]
+    fn enter_at_end_of_a_defined_term_adds_a_second_term() {
+        // With a definition already there, the same keystroke stacks another `<dt>`.
+        let mut e = definition_editor();
+        e.set_cursor(DocumentPosition::at(term_path(0, 0), 6));
+        e.insert_newline().unwrap();
+        assert_eq!(e.cursor().path, term_path(0, 1));
+        e.insert_text("Java").unwrap();
+        assert_eq!(leaf_text(&e, &term_path(0, 1)), "Java");
+        assert_eq!(leaf_text(&e, &definition_path(0, 0)), "Black hot drink");
+    }
+
+    #[test]
+    fn enter_at_the_end_of_a_definition_starts_the_next_term() {
+        let mut e = definition_editor();
+        let len = e.leaf_text_len(&definition_path(0, 0));
+        e.set_cursor(DocumentPosition::at(definition_path(0, 0), len));
+        e.insert_newline().unwrap();
+        // A definition ends its item, so Enter moves on to the next item's term — the way
+        // Enter in a list item starts the next item.
+        assert_eq!(e.cursor().path, term_path(1, 0));
+        e.insert_text("Tea").unwrap();
+        assert_eq!(
+            block_types(&e),
+            vec![
+                BlockType::DefinitionTerm { depth: 0 },
+                BlockType::Paragraph,
+                BlockType::DefinitionTerm { depth: 0 },
+            ]
+        );
+        assert_eq!(md(&e), "Coffee\n: Black hot drink\n\nTea");
+    }
+
+    #[test]
+    fn enter_mid_definition_carries_the_rest_into_the_new_term() {
+        let mut e = definition_editor();
+        e.set_cursor(DocumentPosition::at(definition_path(0, 0), 5)); // "Black| hot drink"
+        e.insert_newline().unwrap();
+        assert_eq!(leaf_text(&e, &definition_path(0, 0)), "Black");
+        assert_eq!(leaf_text(&e, &term_path(1, 0)), " hot drink");
+    }
+
+    /// The paragraphs after the split follow the right half into the new item, exactly as a
+    /// list item's continuation paragraphs follow it into the next entry.
+    #[test]
+    fn enter_in_a_definition_takes_the_paragraphs_below_it_along() {
+        let mut e = definition_editor();
+        let len = e.leaf_text_len(&definition_path(0, 0));
+        e.set_cursor(DocumentPosition::at(definition_path(0, 0), len));
+        e.insert_continuation().unwrap(); // a second paragraph in the same definition
+        e.insert_text("Also bitter").unwrap();
+
+        e.set_cursor(DocumentPosition::at(definition_path(0, 0), len));
+        e.insert_newline().unwrap();
+        assert_eq!(leaf_text(&e, &term_path(1, 0)), "");
+        assert_eq!(leaf_text(&e, &definition_path(1, 0)), "Also bitter");
+        assert_eq!(leaf_text(&e, &definition_path(0, 0)), "Black hot drink");
+    }
+
+    /// Ctrl+P keeps its meaning inside a definition: another paragraph of the *same*
+    /// definition. With Enter now starting the next term, this is the only way to grow one.
+    #[test]
+    fn continuation_adds_a_paragraph_to_the_same_definition() {
+        let mut e = definition_editor();
+        let len = e.leaf_text_len(&definition_path(0, 0));
+        e.set_cursor(DocumentPosition::at(definition_path(0, 0), len));
+        e.insert_continuation().unwrap();
+        assert_eq!(e.cursor().path, definition_path(0, 1));
+        e.insert_text("Second paragraph").unwrap();
+        assert_eq!(
+            block_types(&e),
+            vec![
+                BlockType::DefinitionTerm { depth: 0 },
+                BlockType::Paragraph,
+                BlockType::Paragraph
+            ]
+        );
+    }
+
+    /// Enter on an empty leaf leaves the list, the way it leaves a list or a quote. This is
+    /// what ends the alternating term → definition → term flow.
+    #[test]
+    fn enter_on_the_empty_term_a_definition_opened_leaves_the_list() {
+        let mut e = definition_editor();
+        let len = e.leaf_text_len(&definition_path(0, 0));
+        e.set_cursor(DocumentPosition::at(definition_path(0, 0), len));
+        e.insert_newline().unwrap(); // -> empty term of a new item
+        e.insert_newline().unwrap(); // -> out of the list
+        assert_eq!(
+            block_types(&e),
+            vec![
+                BlockType::DefinitionTerm { depth: 0 },
+                BlockType::Paragraph,
+                BlockType::Paragraph,
+            ]
+        );
+        e.insert_text("After the list").unwrap();
+        assert_eq!(md(&e), "Coffee\n: Black hot drink\n\nAfter the list");
+    }
+
+    #[test]
+    fn enter_on_an_empty_definition_leaves_the_list() {
+        let mut e = definition_editor();
+        let len = e.leaf_text_len(&definition_path(0, 0));
+        e.set_selection(
+            DocumentPosition::at(definition_path(0, 0), 0),
+            DocumentPosition::at(definition_path(0, 0), len),
+        );
+        e.delete_selection().unwrap();
+        e.insert_newline().unwrap();
+        e.insert_text("Plain").unwrap();
+        assert_eq!(md(&e), "Coffee\n\nPlain");
+    }
+
+    /// The list splits around the leaf that leaves it, so what followed stays a list below —
+    /// the same shape as Enter on an empty item in the middle of a bullet list.
+    #[test]
+    fn leaving_from_the_middle_splits_the_list() {
+        let mut e = Editor::new();
+        e.set_document(markdown_to_document("A\n: one\n\nB\n: two"));
+        e.set_selection(
+            DocumentPosition::at(term_path(1, 0), 0),
+            DocumentPosition::at(term_path(1, 0), 1),
+        );
+        e.delete_selection().unwrap();
+        e.insert_newline().unwrap();
+        e.insert_text("Between").unwrap();
+        // One list, then the new paragraph, then a second list holding what followed. The
+        // orphaned definition keeps its place below rather than being dropped or dragged out.
+        assert_eq!(
+            e.document()
+                .paragraphs
+                .iter()
+                .map(|p| p.paragraph_type())
+                .collect::<Vec<_>>(),
+            vec![
+                tdoc::ParagraphType::DefinitionList,
+                tdoc::ParagraphType::Text,
+                tdoc::ParagraphType::DefinitionList,
+            ]
+        );
+        assert_eq!(leaf_text(&e, &term_path(0, 0)), "A");
+        assert_eq!(leaf_text(&e, &definition_path(0, 0)), "one");
+        assert_eq!(leaf_text(&e, &TreePath::root(1)), "Between");
+        assert_eq!(
+            leaf_text(
+                &e,
+                &TreePath::root(2).child(PathSegment::DefinitionPara { item: 0, para: 0 })
+            ),
+            "two"
+        );
+    }
+
+    // ----- Tab / Shift-Tab between the two halves ---------------------------------------
+
+    #[test]
+    fn shift_tab_turns_a_definition_into_the_next_term() {
+        let mut e = definition_editor();
+        e.set_cursor(DocumentPosition::at(definition_path(0, 0), 5));
+        e.outdent().unwrap();
+        assert_eq!(e.cursor().path, term_path(1, 0));
+        assert_eq!(e.cursor().offset, 5, "the caret stays in the same text");
+        assert_eq!(
+            block_types(&e),
+            vec![
+                BlockType::DefinitionTerm { depth: 0 },
+                BlockType::DefinitionTerm { depth: 0 },
+            ]
+        );
+        assert_eq!(md(&e), "Coffee\n\nBlack hot drink");
+    }
+
+    /// "Any following paragraph inside the old definition will be moved to the term."
+    #[test]
+    fn shift_tab_carries_the_paragraphs_below_it_into_the_new_item() {
+        let mut e = definition_editor();
+        let len = e.leaf_text_len(&definition_path(0, 0));
+        e.set_cursor(DocumentPosition::at(definition_path(0, 0), len));
+        e.insert_continuation().unwrap();
+        e.insert_text("Also bitter").unwrap();
+
+        // Outdent the *first* definition paragraph: it becomes a term and the second
+        // paragraph becomes that new term's definition.
+        e.set_cursor(DocumentPosition::at(definition_path(0, 0), 0));
+        e.outdent().unwrap();
+        assert_eq!(leaf_text(&e, &term_path(0, 0)), "Coffee");
+        assert_eq!(leaf_text(&e, &term_path(1, 0)), "Black hot drink");
+        assert_eq!(leaf_text(&e, &definition_path(1, 0)), "Also bitter");
+    }
+
+    #[test]
+    fn tab_turns_a_term_into_a_paragraph_of_the_definition_above() {
+        let mut e = Editor::new();
+        e.set_document(markdown_to_document("Coffee\n: hot\n\nBlack\n: opaque"));
+        e.set_cursor(DocumentPosition::at(term_path(1, 0), 2));
+        e.indent().unwrap();
+        assert_eq!(e.cursor().path, definition_path(0, 1));
+        assert_eq!(e.cursor().offset, 2);
+        // The absorbed item's own definition follows its term into the item above.
+        assert_eq!(leaf_text(&e, &definition_path(0, 0)), "hot");
+        assert_eq!(leaf_text(&e, &definition_path(0, 1)), "Black");
+        assert_eq!(leaf_text(&e, &definition_path(0, 2)), "opaque");
+        assert_eq!(
+            block_types(&e),
+            vec![
+                BlockType::DefinitionTerm { depth: 0 },
+                BlockType::Paragraph,
+                BlockType::Paragraph,
+                BlockType::Paragraph,
+            ]
+        );
+    }
+
+    /// Tab and Shift-Tab are inverses, so a term that is indented and outdented again lands
+    /// back where it started.
+    #[test]
+    fn tab_then_shift_tab_round_trips_a_term() {
+        let mut e = Editor::new();
+        e.set_document(markdown_to_document("Coffee\n: hot\n\nBlack\n: opaque"));
+        let before = md(&e);
+        e.set_cursor(DocumentPosition::at(term_path(1, 0), 0));
+        e.indent().unwrap();
+        e.outdent().unwrap();
+        assert_eq!(md(&e), before);
+        assert_eq!(e.cursor().path, term_path(1, 0));
+    }
+
+    #[test]
+    fn the_first_term_of_a_list_has_nothing_to_indent_into() {
+        let mut e = definition_editor();
+        let before = md(&e);
+        e.set_cursor(DocumentPosition::at(term_path(0, 0), 0));
+        e.indent().unwrap();
+        assert_eq!(md(&e), before, "no item above to absorb it");
+        assert_eq!(e.cursor().path, term_path(0, 0));
+    }
+
+    /// A term is already the outermost half of an item, so Shift-Tab there does nothing —
+    /// and a definition paragraph with no term form (a nested list) cannot become one.
+    #[test]
+    fn outdent_does_nothing_where_there_is_no_term_form() {
+        let mut e = definition_editor();
+        let before = md(&e);
+        e.set_cursor(DocumentPosition::at(term_path(0, 0), 0));
+        e.outdent().unwrap();
+        assert_eq!(md(&e), before);
+    }
+
+    /// The context menu's "Indent more" / "Unnest" entries are driven by these, so they have
+    /// to agree with what Tab and Shift-Tab actually do.
+    #[test]
+    fn indent_availability_matches_what_tab_does() {
+        let mut e = Editor::new();
+        e.set_document(markdown_to_document("Coffee\n: hot\n\nBlack\n: opaque"));
+
+        e.set_cursor(DocumentPosition::at(term_path(0, 0), 0));
+        assert!(
+            !e.cursor_can_indent(),
+            "the first term has nothing above it"
+        );
+        assert!(!e.cursor_can_unnest(), "a term is already the outer half");
+
+        e.set_cursor(DocumentPosition::at(term_path(1, 0), 0));
+        assert!(
+            e.cursor_can_indent(),
+            "a later term joins the definition above"
+        );
+
+        e.set_cursor(DocumentPosition::at(definition_path(0, 0), 0));
+        assert!(
+            e.cursor_can_unnest(),
+            "a definition can become the next term"
+        );
+    }
+
+    /// Only the cursor's term moves out of a multi-term item; the others keep their place
+    /// above it, so nothing is reordered.
+    #[test]
+    fn indenting_one_of_several_terms_leaves_the_others_alone() {
+        let mut e = Editor::new();
+        let doc = tdoc::Document {
+            paragraphs: vec![Paragraph::DefinitionList {
+                items: vec![tdoc::paragraph::DefinitionItem {
+                    terms: vec![
+                        vec![tdoc::Span::new_text("Tea")],
+                        vec![tdoc::Span::new_text("Chai")],
+                        vec![tdoc::Span::new_text("Cha")],
+                    ],
+                    definition: vec![
+                        Paragraph::new_text().with_content(vec![tdoc::Span::new_text("A leaf")]),
+                    ],
+                }],
+            }],
+            ..tdoc::Document::new()
+        };
+        e.set_document(doc);
+        e.set_cursor(DocumentPosition::at(term_path(0, 1), 0)); // "Chai"
+        e.indent().unwrap();
+        assert_eq!(leaf_text(&e, &term_path(0, 0)), "Tea");
+        assert_eq!(leaf_text(&e, &definition_path(0, 0)), "Chai");
+        assert_eq!(leaf_text(&e, &term_path(1, 0)), "Cha");
+        assert_eq!(leaf_text(&e, &definition_path(1, 0)), "A leaf");
+    }
+
+    #[test]
+    fn backspace_merges_a_definition_into_its_term() {
+        let mut e = definition_editor();
+        e.set_cursor(DocumentPosition::at(definition_path(0, 0), 0));
+        e.delete_backward().unwrap();
+        assert_eq!(leaf_text(&e, &term_path(0, 0)), "CoffeeBlack hot drink");
+        // The emptied definition is pruned, leaving a term-only item.
+        assert_eq!(
+            block_types(&e),
+            vec![BlockType::DefinitionTerm { depth: 0 }]
+        );
+    }
+
+    #[test]
+    fn toggle_wraps_paragraphs_into_a_definition_list_and_back() {
+        let mut e = Editor::new();
+        e.set_document(markdown_to_document("Coffee\n\nTea"));
+        e.select_all();
+        e.set_block_type(BlockType::DefinitionTerm { depth: 0 })
+            .unwrap();
+        assert_eq!(
+            block_types(&e),
+            vec![
+                BlockType::DefinitionTerm { depth: 0 },
+                BlockType::DefinitionTerm { depth: 0 }
+            ],
+            "each paragraph becomes one item's term"
+        );
+
+        // Toggling again on the same cursor dissolves the list back to paragraphs.
+        e.set_cursor(DocumentPosition::at(term_path(0, 0), 0));
+        e.set_block_type(BlockType::DefinitionTerm { depth: 0 })
+            .unwrap();
+        assert_eq!(
+            block_types(&e),
+            vec![BlockType::Paragraph, BlockType::Paragraph]
+        );
+        assert_eq!(md(&e), "Coffee\n\nTea");
+    }
+
+    #[test]
+    fn dissolving_a_definition_list_keeps_every_leaf() {
+        let mut e = Editor::new();
+        e.set_document(markdown_to_document(
+            "Coffee\n: Black hot drink\n: Also bitter\n\nTea\n: A leaf infusion",
+        ));
+        e.set_cursor(DocumentPosition::at(definition_path(0, 1), 0));
+        e.set_block_type(BlockType::DefinitionTerm { depth: 0 })
+            .unwrap();
+        assert_eq!(
+            md(&e),
+            "Coffee\n\nBlack hot drink\n\nAlso bitter\n\nTea\n\nA leaf infusion",
+            "terms and definition paragraphs all survive as paragraphs"
+        );
+    }
+
+    #[test]
+    fn retyping_a_term_makes_it_and_its_definition_two_paragraphs() {
+        let mut e = Editor::new();
+        e.set_document(markdown_to_document(
+            "Coffee\n: A hot drink\n\nTea\n: A leaf",
+        ));
+        e.set_cursor(DocumentPosition::at(term_path(0, 0), 2));
+        e.set_block_type(BlockType::Heading { level: 2 }).unwrap();
+        // Both halves of the item become headings; the items after it stay a list.
+        assert_eq!(md(&e), "## Coffee\n\n## A hot drink\n\nTea\n: A leaf");
+        assert_eq!(
+            block_types(&e),
+            vec![
+                BlockType::Heading { level: 2 },
+                BlockType::Heading { level: 2 },
+                BlockType::DefinitionTerm { depth: 0 },
+                BlockType::Paragraph,
+            ]
+        );
+        // The caret stays in the term's text, where the author was typing.
+        assert_eq!(e.cursor().path, TreePath::root(0));
+        assert_eq!(e.cursor().offset, 2);
+    }
+
+    /// Retyping the only item's term empties the list, so it goes away entirely.
+    #[test]
+    fn retyping_the_last_terms_item_removes_the_list() {
+        let mut e = definition_editor();
+        e.set_cursor(DocumentPosition::at(term_path(0, 0), 0));
+        e.set_block_type(BlockType::Paragraph).unwrap();
+        assert_eq!(md(&e), "Coffee\n\nBlack hot drink");
+        assert_eq!(
+            block_types(&e),
+            vec![BlockType::Paragraph, BlockType::Paragraph]
+        );
+    }
+
+    /// Every paragraph of a multi-paragraph definition comes out with the term, all retyped.
+    #[test]
+    fn retyping_a_term_carries_the_whole_definition_out() {
+        let mut e = definition_editor();
+        let len = e.leaf_text_len(&definition_path(0, 0));
+        e.set_cursor(DocumentPosition::at(definition_path(0, 0), len));
+        e.insert_continuation().unwrap();
+        e.insert_text("Also bitter").unwrap();
+
+        e.set_cursor(DocumentPosition::at(term_path(0, 0), 0));
+        e.set_block_type(BlockType::Heading { level: 3 }).unwrap();
+        assert_eq!(
+            block_types(&e),
+            vec![
+                BlockType::Heading { level: 3 },
+                BlockType::Heading { level: 3 },
+                BlockType::Heading { level: 3 },
+            ]
+        );
+    }
+
+    #[test]
+    fn retyping_a_definition_keeps_the_term_and_moves_it_below_the_list() {
+        let mut e = Editor::new();
+        e.set_document(markdown_to_document(
+            "Coffee\n: A hot drink\n\nTea\n: A leaf",
+        ));
+        e.set_cursor(DocumentPosition::at(definition_path(0, 0), 2));
+        e.set_block_type(BlockType::Heading { level: 2 }).unwrap();
+        // The term stays a term with an empty definition to type into; its old content is a
+        // heading below the list, which split so the remaining item stays below that.
+        assert_eq!(md(&e), "Coffee\n: \n\n## A hot drink\n\nTea\n: A leaf");
+        assert_eq!(
+            block_types(&e),
+            vec![
+                BlockType::DefinitionTerm { depth: 0 },
+                BlockType::Paragraph,
+                BlockType::Heading { level: 2 },
+                BlockType::DefinitionTerm { depth: 0 },
+                BlockType::Paragraph,
+            ]
+        );
+        assert_eq!(e.cursor().offset, 2);
+        assert_eq!(leaf_text(&e, &e.cursor().path), "A hot drink");
+    }
+
+    /// With no item after it there is nothing to split off, so the retyped paragraph simply
+    /// follows the list.
+    #[test]
+    fn retyping_the_last_definition_needs_no_split() {
+        let mut e = definition_editor();
+        e.set_cursor(DocumentPosition::at(definition_path(0, 0), 0));
+        e.set_block_type(BlockType::Heading { level: 3 }).unwrap();
+        assert_eq!(md(&e), "Coffee\n: \n\n### Black hot drink");
+    }
+
+    /// Only the retyped paragraph changes type; the ones that follow it out keep theirs, and
+    /// the ones above it stay in the definition.
+    #[test]
+    fn retyping_a_middle_definition_paragraph_leaves_its_neighbours_alone() {
+        let mut e = definition_editor();
+        let len = e.leaf_text_len(&definition_path(0, 0));
+        e.set_cursor(DocumentPosition::at(definition_path(0, 0), len));
+        e.insert_continuation().unwrap();
+        e.insert_text("Second").unwrap();
+        e.insert_continuation().unwrap();
+        e.insert_text("Third").unwrap();
+
+        e.set_cursor(DocumentPosition::at(definition_path(0, 1), 0));
+        e.set_block_type(BlockType::Heading { level: 2 }).unwrap();
+        assert_eq!(
+            block_types(&e),
+            vec![
+                BlockType::DefinitionTerm { depth: 0 },
+                BlockType::Paragraph, // the first definition paragraph stays put
+                BlockType::Heading { level: 2 }, // the retyped one
+                BlockType::Paragraph, // followed it out, unchanged
+            ]
+        );
+        assert_eq!(leaf_text(&e, &definition_path(0, 0)), "Black hot drink");
+        assert_eq!(leaf_text(&e, &TreePath::root(1)), "Second");
+        assert_eq!(leaf_text(&e, &TreePath::root(2)), "Third");
+    }
+
+    /// The lift feeds the ordinary block-type machinery, so container targets work too.
+    #[test]
+    fn retyping_a_definition_leaf_reaches_container_types() {
+        let mut e = definition_editor();
+        e.set_cursor(DocumentPosition::at(definition_path(0, 0), 0));
+        e.set_block_type(BlockType::ListItem {
+            ordered: false,
+            number: None,
+            checkbox: None,
+            depth: 0,
+        })
+        .unwrap();
+        assert_eq!(md(&e), "Coffee\n: \n\n- Black hot drink");
+
+        let mut e = definition_editor();
+        e.set_cursor(DocumentPosition::at(term_path(0, 0), 0));
+        e.set_block_type(BlockType::BlockQuote).unwrap();
+        assert_eq!(md(&e), "> Coffee\n> \n> Black hot drink");
+    }
+
+    /// A two-term item, so a term can be converted with a sibling term beside it.
+    fn multi_term_editor() -> Editor {
+        let mut e = Editor::new();
+        e.set_document(tdoc::Document {
+            paragraphs: vec![Paragraph::DefinitionList {
+                items: vec![tdoc::paragraph::DefinitionItem {
+                    terms: vec![
+                        vec![tdoc::Span::new_text("Tea")],
+                        vec![tdoc::Span::new_text("Chai")],
+                    ],
+                    definition: vec![
+                        Paragraph::new_text().with_content(vec![tdoc::Span::new_text("A leaf")]),
+                    ],
+                }],
+            }],
+            ..tdoc::Document::new()
+        });
+        e
+    }
+
+    /// With no selection, converting one term takes only that term out; the terms beside it
+    /// and the definition they head stay a list.
+    #[test]
+    fn converting_one_term_keeps_its_siblings_intact() {
+        let mut e = multi_term_editor();
+        e.set_cursor(DocumentPosition::at(term_path(0, 0), 0));
+        e.set_block_type(BlockType::Paragraph).unwrap();
+        assert_eq!(md(&e), "Tea\n\nChai\n: A leaf");
+        assert_eq!(
+            block_types(&e),
+            vec![
+                BlockType::Paragraph,
+                BlockType::DefinitionTerm { depth: 0 },
+                BlockType::Paragraph,
+            ]
+        );
+    }
+
+    /// The definition follows a term out only when no term is left to head it, so it is never
+    /// orphaned above a term that no longer exists.
+    #[test]
+    fn converting_an_items_last_term_takes_the_definition_along() {
+        let mut e = multi_term_editor();
+        e.set_cursor(DocumentPosition::at(term_path(0, 1), 0));
+        e.set_block_type(BlockType::Paragraph).unwrap();
+        assert_eq!(md(&e), "Tea\n\nChai\n\nA leaf");
+        assert_eq!(
+            block_types(&e),
+            vec![
+                BlockType::DefinitionTerm { depth: 0 },
+                BlockType::Paragraph,
+                BlockType::Paragraph,
+            ]
+        );
+    }
+
+    #[test]
+    fn converting_a_middle_term_splits_the_list_around_it() {
+        let mut e = Editor::new();
+        e.set_document(markdown_to_document("A\n: 1\n\nB\n: 2\n\nC\n: 3"));
+        e.set_cursor(DocumentPosition::at(term_path(1, 0), 0));
+        e.set_block_type(BlockType::Paragraph).unwrap();
+        assert_eq!(
+            e.document()
+                .paragraphs
+                .iter()
+                .map(|p| p.paragraph_type())
+                .collect::<Vec<_>>(),
+            vec![
+                tdoc::ParagraphType::DefinitionList,
+                tdoc::ParagraphType::Text,
+                tdoc::ParagraphType::Text,
+                tdoc::ParagraphType::DefinitionList,
+            ],
+            "the items either side stay lists of their own"
+        );
+        assert_eq!(md(&e), "A\n: 1\n\nB\n\n2\n\nC\n: 3");
+    }
+
+    /// Splitting is how a leaf leaves a definition list, so turning one back into a list has
+    /// to put the pieces together again — otherwise the seam is permanent (and visible, since
+    /// two adjacent lists serialize with a separator between them).
+    #[test]
+    fn turning_a_paragraph_into_a_definition_list_rejoins_its_neighbours() {
+        let mut e = Editor::new();
+        e.set_document(markdown_to_document("A\n: 1\n\nMiddle\n\nC\n: 3"));
+        e.set_cursor(DocumentPosition::at(TreePath::root(1), 0));
+        e.set_block_type(BlockType::DefinitionTerm { depth: 0 })
+            .unwrap();
+        assert_eq!(
+            e.document()
+                .paragraphs
+                .iter()
+                .map(|p| p.paragraph_type())
+                .collect::<Vec<_>>(),
+            vec![tdoc::ParagraphType::DefinitionList],
+            "one list, not three"
+        );
+        assert_eq!(md(&e), "A\n: 1\n\nMiddle\n\nC\n: 3");
+        // The cursor follows its item through the merge, which shifted it down by the items
+        // the list above contributed.
+        assert_eq!(e.cursor().path, term_path(1, 0));
+        assert_eq!(leaf_text(&e, &term_path(1, 0)), "Middle");
+    }
+
+    /// The other way a list ends up split in two: the paragraph between the halves is deleted.
+    #[test]
+    fn deleting_the_paragraph_between_two_definition_lists_rejoins_them() {
+        let mut e = Editor::new();
+        e.set_document(markdown_to_document("A\n: 1\n\nMiddle\n\nC\n: 3"));
+        let mid = TreePath::root(1);
+        let len = e.leaf_text_len(&mid);
+        e.set_selection(
+            DocumentPosition::at(mid.clone(), 0),
+            DocumentPosition::at(mid, len),
+        );
+        e.delete_selection().unwrap();
+        e.delete_backward().unwrap();
+        assert_eq!(
+            e.document()
+                .paragraphs
+                .iter()
+                .map(|p| p.paragraph_type())
+                .collect::<Vec<_>>(),
+            vec![tdoc::ParagraphType::DefinitionList]
+        );
+        assert_eq!(md(&e), "A\n: 1\n\nC\n: 3");
     }
 }
