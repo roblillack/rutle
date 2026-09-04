@@ -1950,13 +1950,75 @@ impl Editor {
     }
 
     pub fn toggle_quote(&mut self) -> EditResult {
-        // In a quote already → unwrap; otherwise convert the cursor's top-level block(s) to
-        // a quote (flattening to plain text, mirroring how lists convert).
-        if matches!(self.cursor.path.last(), Some(PathSegment::QuoteChild(_))) {
-            self.unwrap_quote()
-        } else {
-            self.convert_selection_to_quote()
+        // A selection spanning several top-level blocks toggles as one unit, the way the list
+        // toggles do: every block already a quote → all of them unquote; otherwise the whole
+        // range becomes one quote. Without this the cursor's own block decided for the range,
+        // so a selection ending inside a quote unquoted that one and left the rest alone.
+        if let Some((s, e)) = self.selected_top_level_range()
+            && s < e
+        {
+            return self.toggle_quote_over_range(s, e);
         }
+        // In a quote already → toggle it off, at whatever depth the caret sits: a list or a
+        // definition inside a quote is still inside it, and "Quote" there means "not quoted"
+        // rather than "quoted twice". Otherwise convert the cursor's block to a quote
+        // (flattening to plain text, mirroring how lists convert).
+        match self.cursor_quote_path() {
+            Some(quote_path) => {
+                self.dissolve_container_at(&quote_path);
+                Ok(())
+            }
+            None => self.convert_selection_to_quote(),
+        }
+    }
+
+    /// The path of the innermost quote the cursor sits in, or `None` outside one. A quote holds
+    /// paragraphs of any kind, so the caret can sit several levels below the quote it is in.
+    fn cursor_quote_path(&self) -> Option<TreePath> {
+        let segs = self.cursor.path.segments();
+        (0..segs.len())
+            .rev()
+            .find(|i| matches!(segs[*i], PathSegment::QuoteChild(_)))
+            .map(|i| TreePath(segs[..i].to_vec()))
+    }
+
+    /// Toggle a quote over the top-level blocks `s..=e` as one unit: every one already a quote
+    /// → lift their children back out; otherwise the whole range becomes a single quote. The
+    /// transformed region is re-selected so a follow-up toggle acts on the same span, exactly
+    /// as [`Self::toggle_list_kind_over_range`] does.
+    fn toggle_quote_over_range(&mut self, s: usize, e: usize) -> EditResult {
+        let all_quotes = self.tdoc.paragraphs[s..=e]
+            .iter()
+            .all(|p| matches!(p, Paragraph::Quote { .. }));
+        let replaced = if all_quotes {
+            let drained: Vec<Paragraph> = self.tdoc.paragraphs.drain(s..=e).collect();
+            let lifted: Vec<Paragraph> = drained
+                .into_iter()
+                .flat_map(|p| match p {
+                    Paragraph::Quote { children } => children,
+                    other => vec![other],
+                })
+                .collect();
+            let count = lifted.len();
+            self.tdoc.paragraphs.splice(s..s, lifted);
+            count
+        } else {
+            // One quote around the whole range; the selection still names it.
+            self.convert_selection_to_quote()?;
+            1
+        };
+
+        // Select the whole transformed region; the cursor rides its end.
+        let (first, last) = leaf_bounds_of_range(&self.tdoc, s, s + replaced.saturating_sub(1))
+            .unwrap_or_else(|| (TreePath::root(s), TreePath::root(s)));
+        let start = tree_walk::clamp_position(&self.tdoc, &DocumentPosition::at(first, 0));
+        let end =
+            tree_walk::clamp_position_forward(&self.tdoc, &DocumentPosition::at(last, usize::MAX));
+        self.cursor = end.clone();
+        self.selection = Some((start, end));
+        self.normalize_cursor();
+        self.trigger_paragraph_change();
+        Ok(())
     }
 
     pub fn toggle_code_block(&mut self) -> EditResult {
@@ -2796,6 +2858,10 @@ impl Editor {
     /// a different kind converts that list in place (preserving nesting); requesting the
     /// same kind toggles a top-level list off (unwrapping it to paragraphs) but is a no-op
     /// for a nested item — re-selecting the kind it already has should not move it.
+    ///
+    /// A caret below the top level still converts something: in a quote the list is built
+    /// inside that quote, and on a definition list's term or definition the leaf leaves the
+    /// list first (as `set_block_type` does for it) and the bullet applies to what is left.
     fn toggle_list_kind(&mut self, ordered: bool, checklist: bool) -> EditResult {
         let target = tree_edit::ListKind::from_flags(ordered, checklist);
         // A selection spanning several top-level paragraphs must convert the same way no matter
@@ -2834,10 +2900,33 @@ impl Editor {
             return Ok(());
         }
 
+        // A definition's term or paragraph is not a block that can *become* an item where it
+        // stands — the two halves of an item are not blocks of their own — so it leaves the
+        // list first and the type applies to what that leaves behind, exactly as
+        // `set_block_type` does for it.
+        let path = self.cursor.path.clone();
+        if matches!(
+            path.last(),
+            Some(PathSegment::DefinitionTerm { .. } | PathSegment::DefinitionPara { .. })
+        ) {
+            return self.set_definition_leaf_block_type(
+                &path,
+                BlockType::ListItem {
+                    ordered,
+                    number: None,
+                    checkbox: checklist.then_some(false),
+                    depth: 0,
+                },
+            );
+        }
+
         // Otherwise wrap the selected top-level paragraphs into one list.
         let (start, end) = self.selection_or_cursor_range();
         let (Some(s), Some(e)) = (top_index(&start.path), top_index(&end.path)) else {
-            return Ok(());
+            // The caret sits below the top level (a quote's paragraph): there is no top-level
+            // block of its own to convert, so the list is built inside that container instead
+            // of the toggle doing nothing at all.
+            return self.convert_container_children_to_list(target);
         };
         if s > e || e >= self.tdoc.paragraphs.len() {
             return Ok(());
@@ -3040,6 +3129,41 @@ impl Editor {
         self.selection = Some((start, end));
         self.normalize_cursor();
         self.trigger_paragraph_change();
+        Ok(())
+    }
+
+    /// Fold the run the selection covers *inside the cursor's own container* into a list of
+    /// `target` kind, in place — the counterpart to the top-level conversion for a caret that
+    /// sits below the top level, so "Bullet List" in a quote's paragraph makes a bullet inside
+    /// that quote. Only ends that share the cursor's container count; otherwise its own
+    /// paragraph converts alone. A no-op where the container holds no paragraph run of its own
+    /// (a table cell).
+    fn convert_container_children_to_list(&mut self, target: tree_edit::ListKind) -> EditResult {
+        let path = self.cursor.path.clone();
+        let depth = path.len().saturating_sub(1);
+        let container = &path.segments()[..depth];
+        let child_of = |p: &TreePath| -> Option<usize> {
+            let segs = p.segments();
+            (segs.len() > depth && segs[..depth] == *container).then(|| child_index(&segs[depth]))
+        };
+        let Some(own) = child_of(&path) else {
+            return Ok(());
+        };
+        let (start, end) = self.selection_or_cursor_range();
+        let (c0, c1) = match (child_of(&start.path), child_of(&end.path)) {
+            (Some(a), Some(b)) => (a.min(b), a.max(b)),
+            _ => (own, own),
+        };
+        let idx = self.leaf_index(&path);
+        let offset = self.cursor.offset;
+        if tree_edit::children_into_lists(&mut self.tdoc, &path, c0, c1, target).is_none() {
+            return Ok(());
+        }
+        self.restore_cursor_by_leaf_index(idx, offset);
+        self.selection = None;
+        self.trigger_paragraph_change();
+        // The new list may abut a same-kind sibling inside the same container.
+        self.merge_lists_at_cursor();
         Ok(())
     }
 
@@ -4220,6 +4344,137 @@ mod tests {
         assert_eq!(items[0].terms.len(), 1, "the paragraph became a term");
         assert!(items[1].terms.is_empty(), "the list has no term form");
         assert_eq!(editor.leaf_plain_text(&editor.cursor().path), "two");
+    }
+
+    fn quote_child_path(child: usize) -> TreePath {
+        TreePath::root(0).child(PathSegment::QuoteChild(child))
+    }
+
+    #[test]
+    fn quote_over_a_range_of_quotes_toggles_them_all_off() {
+        // The range decides, not the cursor: two selected quotes both unquote, the way a
+        // selected range of same-kind lists delists.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("> a\n\n> b"));
+        editor.select_all();
+        editor.toggle_quote().unwrap();
+        assert_eq!(md(&editor), "a\n\nb");
+    }
+
+    #[test]
+    fn quote_over_a_range_that_is_only_partly_quoted_wraps_it_once() {
+        // Mixed range → one quote around the whole of it; the quote already there goes in as
+        // a child verbatim, as any container does.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("head\n\n> quoted"));
+        editor.select_all();
+        editor.toggle_quote().unwrap();
+        assert_eq!(md(&editor), "> head\n> \n> > quoted");
+    }
+
+    #[test]
+    fn quote_over_a_range_round_trips() {
+        // The result is left selected, so pressing Quote again undoes it.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("a\n\nb"));
+        editor.select_all();
+        editor.toggle_quote().unwrap();
+        assert_eq!(md(&editor), "> a\n> \n> b");
+        editor.toggle_quote().unwrap();
+        assert_eq!(md(&editor), "a\n\nb");
+    }
+
+    #[test]
+    fn quote_toggles_off_from_a_caret_below_the_quote_child() {
+        // A list inside a quote is still inside it, so Quote there means "not quoted" rather
+        // than wrapping the whole quote in a second one.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("> intro\n>\n> - one"));
+        editor.set_cursor(DocumentPosition::at(
+            quote_child_path(1).child(PathSegment::ListEntry { entry: 0, para: 0 }),
+            1,
+        ));
+        editor.toggle_quote().unwrap();
+        assert_eq!(md(&editor), "intro\n\n- one");
+        assert_eq!(editor.leaf_plain_text(&editor.cursor().path), "one");
+    }
+
+    #[test]
+    fn bullet_on_a_quote_paragraph_builds_the_list_inside_the_quote() {
+        // The caret has no top-level block of its own here; the list is built where it stands.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("> a\n>\n> b"));
+        editor.set_cursor(DocumentPosition::at(quote_child_path(1), 1));
+        editor.toggle_list().unwrap();
+        assert_eq!(md(&editor), "> a\n> \n> - b");
+        assert_eq!(editor.leaf_plain_text(&editor.cursor().path), "b");
+        // And off again — delisting a list in a quote leaves plain quote paragraphs.
+        editor.toggle_list().unwrap();
+        assert_eq!(md(&editor), "> a\n> \n> b");
+    }
+
+    #[test]
+    fn bullet_over_two_quote_children_makes_one_list_inside_the_quote() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("> a\n>\n> b"));
+        editor.set_cursor(DocumentPosition::at(quote_child_path(1), 1));
+        editor.set_selection(
+            DocumentPosition::at(quote_child_path(0), 0),
+            DocumentPosition::at(quote_child_path(1), 1),
+        );
+        editor.toggle_list().unwrap();
+        assert_eq!(md(&editor), "> - a\n> - b");
+    }
+
+    #[test]
+    fn bullet_on_a_quote_paragraph_merges_with_the_list_above_it() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("> - a\n>\n> b"));
+        editor.set_cursor(DocumentPosition::at(quote_child_path(1), 1));
+        editor.toggle_list().unwrap();
+        assert_eq!(md(&editor), "> - a\n> - b");
+    }
+
+    #[test]
+    fn checklist_on_a_quote_paragraph_stays_in_the_quote() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("> a\n>\n> b"));
+        editor.set_cursor(DocumentPosition::at(quote_child_path(1), 1));
+        editor.toggle_checklist().unwrap();
+        assert_eq!(md(&editor), "> a\n> \n> - [ ] b");
+    }
+
+    #[test]
+    fn bullet_on_a_definition_leaf_matches_the_block_type_call() {
+        // A term and a definition leave the list before taking a new type, so the toggle
+        // routes to the same lift `set_block_type` uses rather than doing nothing.
+        let bullet = BlockType::ListItem {
+            ordered: false,
+            number: None,
+            checkbox: None,
+            depth: 0,
+        };
+        for (name, leaf) in [
+            ("term", PathSegment::DefinitionTerm { item: 0, term: 0 }),
+            (
+                "definition",
+                PathSegment::DefinitionPara { item: 0, para: 0 },
+            ),
+        ] {
+            let at = || DocumentPosition::at(TreePath::root(0).child(leaf.clone()), 1);
+            let mut toggled = Editor::new();
+            toggled.set_document(markdown_to_document("Coffee\n: Black hot drink"));
+            toggled.set_cursor(at());
+            toggled.toggle_list().unwrap();
+
+            let mut typed = Editor::new();
+            typed.set_document(markdown_to_document("Coffee\n: Black hot drink"));
+            typed.set_cursor(at());
+            typed.set_block_type(bullet.clone()).unwrap();
+
+            assert_eq!(md(&toggled), md(&typed), "{name}");
+            assert_ne!(md(&toggled), "Coffee\n: Black hot drink", "{name}: no-op");
+        }
     }
 
     #[test]

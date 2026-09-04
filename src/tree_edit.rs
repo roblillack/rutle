@@ -2559,6 +2559,28 @@ fn sibling_slice<'a>(doc: &'a Document, child_path: &TreePath) -> Option<(&'a [P
     }
 }
 
+/// Fold the children `c0..=c1` of the container that holds `child_path` into list/checklist
+/// node(s) of `target` kind, in place — [`paragraphs_into_lists`] applied to a run that is not
+/// at the document top level, so a list toggle inside a quote builds the list inside that
+/// quote instead of having nothing to act on. Returns the index the new nodes start at, or
+/// `None` when the path names no such run (a list entry, a table cell, a definition term).
+pub fn children_into_lists(
+    doc: &mut Document,
+    child_path: &TreePath,
+    c0: usize,
+    c1: usize,
+    target: ListKind,
+) -> Option<usize> {
+    let (vec, _) = sibling_vec_mut(doc, child_path)?;
+    if c0 > c1 || c1 >= vec.len() {
+        return None;
+    }
+    let drained: Vec<Paragraph> = vec.drain(c0..=c1).collect();
+    let new_nodes = paragraphs_into_lists(drained, target);
+    vec.splice(c0..c0, new_nodes);
+    Some(c0)
+}
+
 fn with_last_index(path: &TreePath, idx: usize) -> TreePath {
     let mut segs = path.0.clone();
     if let Some(last) = segs.last_mut() {

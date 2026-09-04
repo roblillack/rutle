@@ -203,6 +203,29 @@ While pre-1.0, the minor version is bumped for breaking changes.
   a multi-block selection goes to the same toggle rather than the cursor-only
   collapsed-container path, which would have lifted just one item out of its list.
 
+- `toggle_quote` now toggles over a *range*, like the list toggles: a selection
+  spanning several top-level blocks that are all quotes unquotes every one of
+  them, and a partly-quoted range becomes a single quote (the quotes already
+  there go in as children verbatim). The cursor's own block used to decide for
+  the whole range, so a selection ending inside a quote unquoted that one and
+  left the rest untouched. The result is left selected, so a second press undoes
+  it. Toggling off also works from a caret *below* the quote child — inside a
+  list or definition within the quote — where "Quote" previously wrapped the
+  whole quote in a second one.
+- A list toggle no longer does nothing when the caret sits below the top level.
+  `toggle_list` / `toggle_ordered_list` / `toggle_checklist` needed a top-level
+  paragraph to convert, so a caret in a quote's paragraph or a definition list
+  was ignored:
+  - In a quote, the list is now built *inside* that quote, around the children
+    the selection covers (`tree_edit::children_into_lists`), and merges with an
+    adjacent same-kind list there — so a quote's paragraphs can be bulleted one
+    at a time into a single list. Toggling off delists back to quote paragraphs
+    as before.
+  - On a definition list's term or definition, the toggle routes to the same lift
+    `set_block_type(BlockType::ListItem { .. })` uses, so the two agree: a term
+    takes its whole item out of the list, a definition takes its own content out
+    below it, and the new bullet is what that leaves behind.
+
 ## [0.5.0] - 2026-07-08
 
 ### Changed
