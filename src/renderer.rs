@@ -1930,27 +1930,48 @@ impl Renderer {
 
                 let mut current_y = y;
 
-                // Merge bullet with first line
-                if !content_runs.is_empty() && !content_runs[0].is_empty() {
-                    let first_wrap = content_wraps.first().copied().unwrap_or(false);
-                    let first_range = content_ranges.first().copied().unwrap_or((0, 0));
-                    runs.append(&mut content_runs[0]);
+                // The marker shares the item's first visual line, which may legitimately be
+                // empty — an item whose content opens with a hard break, or an empty item. The
+                // remaining lines are laid out either way, so a leading blank line cannot swallow
+                // the rest of the item.
+                let first_range = content_ranges.first().copied().unwrap_or((0, 0));
+                let first_wrap = content_wraps.first().copied().unwrap_or(false);
+                if let Some(first_line) = content_runs.first_mut() {
+                    runs.append(first_line);
+                }
+                // Char range from the content runs alone (the marker run is not text).
+                let char_start = runs
+                    .iter()
+                    .skip(1)
+                    .map(|r| r.char_range.0)
+                    .min()
+                    .unwrap_or(first_range.0);
+                let char_end = runs
+                    .iter()
+                    .skip(1)
+                    .map(|r| r.char_range.1)
+                    .max()
+                    .unwrap_or(first_range.1);
+                let visual_char_end = self.compute_visual_char_end(&runs, char_end, first_wrap);
+                self.layout_lines.push(LayoutLine {
+                    y: current_y,
+                    height: default_line_height,
+                    base_x: content_start_x,
+                    block_index: block_idx,
+                    char_start,
+                    char_end,
+                    visual_char_end,
+                    runs,
+                });
+                current_y += default_line_height;
 
-                    // Calculate char range from content runs (skip bullet)
-                    let char_start = runs
-                        .iter()
-                        .skip(1)
-                        .map(|r| r.char_range.0)
-                        .min()
-                        .unwrap_or(first_range.0);
-                    let char_end = runs
-                        .iter()
-                        .skip(1)
-                        .map(|r| r.char_range.1)
-                        .max()
-                        .unwrap_or(first_range.1);
+                // Add remaining lines
+                for (idx, line_runs) in content_runs.iter().enumerate().skip(1) {
+                    let (char_start, char_end) = content_ranges.get(idx).copied().unwrap_or((0, 0));
+                    let wrapped = content_wraps.get(idx).copied().unwrap_or(false);
+                    let visual_char_end =
+                        self.compute_visual_char_end(line_runs, char_end, wrapped);
 
-                    let visual_char_end = self.compute_visual_char_end(&runs, char_end, first_wrap);
                     self.layout_lines.push(LayoutLine {
                         y: current_y,
                         height: default_line_height,
@@ -1959,41 +1980,7 @@ impl Renderer {
                         char_start,
                         char_end,
                         visual_char_end,
-                        runs,
-                    });
-                    current_y += default_line_height;
-
-                    // Add remaining lines
-                    for (idx, line_runs) in content_runs.iter().enumerate().skip(1) {
-                        let (char_start, char_end) =
-                            content_ranges.get(idx).copied().unwrap_or((0, 0));
-                        let wrapped = content_wraps.get(idx).copied().unwrap_or(false);
-                        let visual_char_end =
-                            self.compute_visual_char_end(line_runs, char_end, wrapped);
-
-                        self.layout_lines.push(LayoutLine {
-                            y: current_y,
-                            height: default_line_height,
-                            base_x: content_start_x,
-                            block_index: block_idx,
-                            char_start,
-                            char_end,
-                            visual_char_end,
-                            runs: line_runs.clone(),
-                        });
-                        current_y += default_line_height;
-                    }
-                } else {
-                    // Just bullet
-                    self.layout_lines.push(LayoutLine {
-                        y: current_y,
-                        height: default_line_height,
-                        base_x: content_start_x,
-                        block_index: block_idx,
-                        char_start: 0,
-                        char_end: 0,
-                        visual_char_end: 0,
-                        runs,
+                        runs: line_runs.clone(),
                     });
                     current_y += default_line_height;
                 }
@@ -4365,6 +4352,52 @@ mod tests {
         display.layout(&mut ctx);
         let (x, _, _) = display.get_cursor_visual_position(&mut ctx).unwrap();
         assert_eq!(x, display.theme.padding_horizontal + 10);
+    }
+
+    #[test]
+    fn list_item_starting_with_hard_break_keeps_every_line() {
+        // A list item whose content opens with a hard break has an empty first visual line —
+        // the marker's line. Every following line must still be laid out; the leading blank
+        // line used to make the whole item render as a bare bullet.
+        let mut block = Block::new(BlockType::ListItem {
+            ordered: false,
+            number: None,
+            checkbox: None,
+            depth: 0,
+        });
+        block.content.push(InlineContent::HardBreak);
+        block
+            .content
+            .push(InlineContent::Text(TextRun::plain("first line")));
+        block.content.push(InlineContent::HardBreak);
+        block
+            .content
+            .push(InlineContent::Text(TextRun::plain("second line")));
+
+        let mut display = make_display_with_block(block);
+        let mut ctx = TestRenderContext::new_with_focus();
+        display.layout(&mut ctx);
+
+        assert_eq!(
+            display.layout_lines.len(),
+            3,
+            "expected the marker line plus both text lines, got {:?}",
+            display
+                .layout_lines
+                .iter()
+                .map(|l| l.runs.iter().map(|r| r.text.clone()).collect::<String>())
+                .collect::<Vec<_>>()
+        );
+        let text_of = |i: usize| -> String {
+            display.layout_lines[i]
+                .runs
+                .iter()
+                .map(|r| r.text.clone())
+                .collect()
+        };
+        assert_eq!(text_of(0), "• ");
+        assert_eq!(text_of(1), "first line");
+        assert_eq!(text_of(2), "second line");
     }
 
     #[test]
