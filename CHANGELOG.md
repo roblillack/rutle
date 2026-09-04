@@ -61,14 +61,16 @@ While pre-1.0, the minor version is bumped for breaking changes.
     term → Enter → definition → Enter → term → … → Enter twice ends the list.
   - **Tab pulls a list under a definition into it.** A list typed below a
     definition list is a list of its own; Tab on its first item moves that item
-    into the definition that ends the list above, where it stays a list item —
-    joining a list already ending that definition, so a whole list can be pulled
-    in an item at a time. Shift-Tab is the inverse: the item leaves the
-    definition list as a list of its own again (splitting the list when items
-    follow, as any definition paragraph leaving does) and rejoins the list it
-    came from rather than leaving a seam. This mirrors Tab nesting a list item
-    into a preceding quote. `toggle_list` on such an item still means "no longer
-    a list" and delists it where it stands, into a paragraph of the definition.
+    into the definition that ends the list above, where it stays the kind of item
+    it is — bullet, numbered or checkbox, with its checked state — joining a list
+    of that kind already ending that definition, so a whole list can be pulled in
+    an item at a time. Shift-Tab is the inverse: the item leaves the definition
+    list as a list of its own again (splitting the list when items follow, as any
+    definition paragraph leaving does) and rejoins the list it came from rather
+    than leaving a seam. This mirrors Tab nesting a list item into a preceding
+    quote. `toggle_list` / `toggle_checklist` on such an item still means "no
+    longer a list" and delists it where it stands, into a paragraph of the
+    definition.
   - `insert_continuation` (Ctrl+P in Pure) keeps its meaning inside a
     definition: another paragraph of the *same* definition. With Enter now
     moving on to the next term, this and Tab are the ways to grow one.

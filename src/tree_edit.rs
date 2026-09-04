@@ -2874,49 +2874,64 @@ pub fn indent_list_item_or_merge(doc: &mut Document, path: &TreePath) -> Option<
         .or_else(|| nest_first_item_into_preceding_definition(doc, path))
 }
 
-/// Nest the first item of a list that directly follows a definition list into that list's last
-/// definition, as another paragraph of it — the item stays a list item, joining a list that
-/// already ends the definition or starting one at its end. So a list typed under a definition
-/// is pulled into it with Tab, the way one typed under a quote is pulled into the quote.
-/// The inverse of Shift-Tab lifting it back out ([`exit_definition_list_item`]).
+/// Nest the first item of a list/checklist that directly follows a definition list into that
+/// list's last definition, as another paragraph of it — the item stays the kind of item it is,
+/// joining a list of that kind already ending the definition or starting one at its end. So a
+/// list typed under a definition is pulled into it with Tab, the way one typed under a quote is
+/// pulled into the quote. The inverse of Shift-Tab lifting it back out
+/// ([`exit_definition_list_item`], [`exit_definition_checklist_item`]).
 fn nest_first_item_into_preceding_definition(
     doc: &mut Document,
     path: &TreePath,
 ) -> Option<TreePath> {
-    // Only the first entry of an ordered/unordered list qualifies (cursor anywhere in it).
-    if !matches!(path.0.last()?, PathSegment::ListEntry { entry: 0, .. }) {
-        return None;
+    // The detached item, keeping the shape its kind of list holds it in.
+    enum Moved {
+        Entry(Vec<Paragraph>),
+        Item(ChecklistItem),
     }
+    // Only the first item of a list/checklist qualifies (cursor anywhere in it).
+    let checkbox = match path.0.last()? {
+        PathSegment::ListEntry { entry: 0, .. } => false,
+        PathSegment::ChecklistItem(0) => true,
+        _ => return None,
+    };
     let list_path = parent_path(path);
     let (vec, idx) = sibling_slice(doc, &list_path)?;
     if idx == 0 || !matches!(vec.get(idx - 1)?, Paragraph::DefinitionList { .. }) {
         return None;
     }
-    // Detach the first entry, remembering the list's kind so the item stays the same kind.
+    // Detach the first item, remembering a list's kind so the item stays the same kind.
     let ordered = match node_at_mut(doc, &list_path)? {
-        NodeMut::Para(p) => list_ordered(p)?,
+        NodeMut::Para(p) => list_ordered(p),
         _ => return None,
     };
     let moved = match node_at_mut(doc, &list_path)? {
+        NodeMut::Para(Paragraph::Checklist { items }) if checkbox => {
+            if items.is_empty() {
+                return None;
+            }
+            Moved::Item(items.remove(0))
+        }
         NodeMut::Para(
             Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
-        ) => {
+        ) if !checkbox => {
             if entries.is_empty() {
                 return None;
             }
-            entries.remove(0)
+            Moved::Entry(entries.remove(0))
         }
         _ => return None,
     };
-    let emptied = matches!(
-        node_at_mut(doc, &list_path),
-        Some(NodeMut::Para(
+    let emptied = match node_at_mut(doc, &list_path)? {
+        NodeMut::Para(Paragraph::Checklist { items }) => items.is_empty(),
+        NodeMut::Para(
             Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
-        )) if entries.is_empty()
-    );
+        ) => entries.is_empty(),
+        _ => false,
+    };
     let (cvec, cidx) = sibling_vec_mut(doc, &list_path)?;
     let prev = cidx - 1;
-    let (item, dpara, entry_idx) = match &mut cvec[prev] {
+    let (item, dpara, child) = match &mut cvec[prev] {
         Paragraph::DefinitionList { items } => {
             // The paragraph under a definition list belongs to the definition that ends it.
             let item = items.len().checked_sub(1)?;
@@ -2926,18 +2941,45 @@ fn nest_first_item_into_preceding_definition(
             if matches!(def.last(), Some(Paragraph::Text { content }) if content.is_empty()) {
                 def.pop();
             }
-            if matches!(def.last(), Some(p) if list_ordered(p).is_some()) {
-                let di = def.len() - 1;
-                match &mut def[di] {
-                    Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries } => {
-                        entries.push(moved);
-                        (item, di, entries.len() - 1)
+            match moved {
+                // Reuse whatever ordered/unordered list already ends the definition — a bullet
+                // pulled in under a numbered list joins it, as indenting under an item does.
+                Moved::Entry(entry) if matches!(def.last(), Some(p) if list_ordered(p).is_some()) =>
+                {
+                    let di = def.len() - 1;
+                    match &mut def[di] {
+                        Paragraph::OrderedList { entries }
+                        | Paragraph::UnorderedList { entries } => {
+                            entries.push(entry);
+                            let e = entries.len() - 1;
+                            (item, di, PathSegment::ListEntry { entry: e, para: 0 })
+                        }
+                        _ => return None,
                     }
-                    _ => return None,
                 }
-            } else {
-                def.push(new_list(ordered, vec![moved]));
-                (item, def.len() - 1, 0)
+                Moved::Entry(entry) => {
+                    def.push(new_list(ordered?, vec![entry]));
+                    (
+                        item,
+                        def.len() - 1,
+                        PathSegment::ListEntry { entry: 0, para: 0 },
+                    )
+                }
+                // A checklist keeps its checkboxes, so it only joins another checklist.
+                Moved::Item(it) if matches!(def.last(), Some(Paragraph::Checklist { .. })) => {
+                    let di = def.len() - 1;
+                    match &mut def[di] {
+                        Paragraph::Checklist { items } => {
+                            items.push(it);
+                            (item, di, PathSegment::ChecklistItem(items.len() - 1))
+                        }
+                        _ => return None,
+                    }
+                }
+                Moved::Item(it) => {
+                    def.push(Paragraph::new_checklist().with_checklist_items(vec![it]));
+                    (item, def.len() - 1, PathSegment::ChecklistItem(0))
+                }
             }
         }
         _ => return None,
@@ -2948,10 +2990,7 @@ fn nest_first_item_into_preceding_definition(
     Some(
         with_last_index(&list_path, prev)
             .child(PathSegment::DefinitionPara { item, para: dpara })
-            .child(PathSegment::ListEntry {
-                entry: entry_idx,
-                para: 0,
-            }),
+            .child(child),
     )
 }
 
@@ -3002,16 +3041,60 @@ fn exit_definition_list_item(
         para: moved_at,
     });
     let (lifted, _) = lift_definition_para(doc, &moved_path)?;
+    let (merged, shift) = rejoin_lifted_list(doc, &lifted)?;
+    Some(merged.child(PathSegment::ListEntry { entry: shift, para }))
+}
 
-    // The list it came from is usually right there again; one list, as everywhere else.
-    let shift = match sibling_slice(doc, &lifted) {
+/// Lift the checklist item `c` out of the definition list whose definition holds its
+/// checklist — [`exit_definition_list_item`] for a checklist, keeping the checkboxes.
+fn exit_definition_checklist_item(
+    doc: &mut Document,
+    list_path: &TreePath,
+    c: usize,
+) -> Option<TreePath> {
+    let PathSegment::DefinitionPara { item, para: dpara } = list_path.0.last()?.clone() else {
+        return None;
+    };
+    let items = match node_at_mut(doc, list_path)? {
+        NodeMut::Para(Paragraph::Checklist { items }) => {
+            if c >= items.len() {
+                return None;
+            }
+            std::mem::take(items)
+        }
+        _ => return None,
+    };
+    let mut before = items;
+    let moved = before.split_off(c);
+    let mut replacement: Vec<Paragraph> = Vec::new();
+    if !before.is_empty() {
+        replacement.push(Paragraph::new_checklist().with_checklist_items(before));
+    }
+    let moved_at = dpara + replacement.len();
+    replacement.push(Paragraph::new_checklist().with_checklist_items(moved));
+    container_splice(doc, list_path, replacement)?;
+
+    let moved_path = parent_path(list_path).child(PathSegment::DefinitionPara {
+        item,
+        para: moved_at,
+    });
+    let (lifted, _) = lift_definition_para(doc, &moved_path)?;
+    let (merged, shift) = rejoin_lifted_list(doc, &lifted)?;
+    Some(merged.child(PathSegment::ChecklistItem(shift)))
+}
+
+/// Fold the list just lifted out of a definition back together with the same-kind lists it
+/// landed between — the list it came from is usually right there again, and adjacent same-kind
+/// lists are one list everywhere else. Returns the merged list's path and the index its own
+/// first item ended up at (a preceding list's items come before it).
+fn rejoin_lifted_list(doc: &mut Document, lifted: &TreePath) -> Option<(TreePath, usize)> {
+    let shift = match sibling_slice(doc, lifted) {
         Some((vec, i)) if i > 0 && list_like_kind(&vec[i - 1]) == list_like_kind(vec.get(i)?) => {
             list_item_count(&vec[i - 1])
         }
         _ => 0,
     };
-    let merged = merge_adjacent_lists(doc, &lifted);
-    Some(merged.child(PathSegment::ListEntry { entry: shift, para }))
+    Some((merge_adjacent_lists(doc, lifted), shift))
 }
 
 /// How many entries/items a list-like paragraph holds (0 for anything else).
@@ -3256,6 +3339,11 @@ fn outdent_list_item_inner(
             Some(PathSegment::ListEntry { entry, para }) => {
                 let (oe, op) = (*entry, *para);
                 exit_nested_checklist_item(doc, &pp, oe, op, c)
+            }
+            // A checklist inside a definition: the item leaves the definition list keeping its
+            // checkbox — the inverse of Tab pulling it in.
+            Some(PathSegment::DefinitionPara { .. }) if keep_bullet => {
+                exit_definition_checklist_item(doc, &pp, c)
             }
             _ => exit_checklist_to_container(doc, &pp, c),
         },

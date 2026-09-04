@@ -4613,6 +4613,101 @@ mod tests {
         assert_eq!(editor.leaf_plain_text(&editor.cursor().path), "beans");
     }
 
+    /// The first item of the top-level checklist at paragraph `i`.
+    fn first_check_of(i: usize) -> TreePath {
+        TreePath::root(i).child(PathSegment::ChecklistItem(0))
+    }
+
+    #[test]
+    fn indent_nests_a_following_checklist_item_into_the_definition_above() {
+        // Same move as for a bullet, and the checkbox (with its state) comes along.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("Coffee\n: drink\n\n- [x] beans"));
+        editor.set_cursor(DocumentPosition::at(first_check_of(1), 1));
+        editor.indent().unwrap();
+        assert_eq!(md(&editor), "Coffee\n: drink\n  \n  - [x] beans");
+        assert_eq!(
+            editor.document().paragraphs.len(),
+            1,
+            "the emptied checklist is gone"
+        );
+        assert_eq!(editor.leaf_plain_text(&editor.cursor().path), "beans");
+    }
+
+    #[test]
+    fn indenting_again_joins_the_checklist_already_in_the_definition() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document(
+            "Coffee\n: drink\n\n- [ ] beans\n- [x] water",
+        ));
+        editor.set_cursor(DocumentPosition::at(first_check_of(1), 1));
+        editor.indent().unwrap();
+        editor.set_cursor(DocumentPosition::at(first_check_of(1), 1));
+        editor.indent().unwrap();
+        assert_eq!(
+            md(&editor),
+            "Coffee\n: drink\n  \n  - [ ] beans\n  - [x] water"
+        );
+        assert_eq!(editor.leaf_plain_text(&editor.cursor().path), "water");
+    }
+
+    #[test]
+    fn a_checklist_pulled_into_a_definition_keeps_clear_of_a_bullet_list_there() {
+        // Checkboxes only join another checklist; a bullet list ending the definition is left
+        // as it is rather than absorbing the item.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document(
+            "Coffee\n: drink\n  \n  - b\n\n- [ ] c",
+        ));
+        editor.set_cursor(DocumentPosition::at(first_check_of(1), 1));
+        editor.indent().unwrap();
+        assert_eq!(md(&editor), "Coffee\n: drink\n  \n  - b\n  \n  - [ ] c");
+    }
+
+    #[test]
+    fn indent_a_checklist_into_a_definition_then_outdent_round_trips() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("Coffee\n: drink\n\n- [x] beans"));
+        let before = format!("{:?}", editor.document().paragraphs);
+        editor.set_cursor(DocumentPosition::at(first_check_of(1), 1));
+        editor.indent().unwrap();
+        editor.outdent().unwrap();
+        assert_eq!(
+            format!("{:?}", editor.document().paragraphs),
+            before,
+            "indent into the definition then outdent restores the original structure"
+        );
+    }
+
+    #[test]
+    fn outdent_from_a_definition_rejoins_the_checklist_it_came_from() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document(
+            "Coffee\n: drink\n\n- [ ] beans\n- [x] water",
+        ));
+        editor.set_cursor(DocumentPosition::at(first_check_of(1), 1));
+        editor.indent().unwrap();
+        editor.outdent().unwrap();
+        assert_eq!(md(&editor), "Coffee\n: drink\n\n- [ ] beans\n- [x] water");
+        assert_eq!(
+            editor.document().paragraphs.len(),
+            2,
+            "one checklist, not two"
+        );
+        assert_eq!(editor.leaf_plain_text(&editor.cursor().path), "beans");
+    }
+
+    #[test]
+    fn toggling_a_checklist_off_inside_a_definition_delists_it_there() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("Coffee\n: drink\n\n- [ ] beans"));
+        editor.set_cursor(DocumentPosition::at(first_check_of(1), 1));
+        editor.indent().unwrap();
+        editor.toggle_checklist().unwrap();
+        assert_eq!(md(&editor), "Coffee\n: drink\n  \n  beans");
+        assert_eq!(editor.leaf_plain_text(&editor.cursor().path), "beans");
+    }
+
     #[test]
     fn outdent_lifts_quote_child_out() {
         let mut editor = Editor::new();
