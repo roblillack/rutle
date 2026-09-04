@@ -256,6 +256,17 @@ While pre-1.0, the minor version is bumped for breaking changes.
   selected checklist inside a definition is where this showed: the subitems came
   out level with their parents.
 
+- Merging one list item into another no longer loses what hung below it, and
+  **a checklist item's subitems are no longer deleted with it**. A checklist item
+  holds its subitems inside itself, so `tree_edit::remove_node_at` took them
+  along when the item went — Delete on an empty item, which merges the next item
+  into it, dropped that item's whole subtree. Removing an item now leaves its
+  subitems in its place, one level shallower, and a merge moves the merged item's
+  body onto the item that absorbed its text (`move_item_body`): subitems become
+  the absorbing item's, and a list entry's continuation paragraphs and sublists
+  are inserted just after the paragraph they merged into, instead of standing
+  under an item with none of their text left.
+
 ## [0.5.0] - 2026-07-08
 
 ### Changed

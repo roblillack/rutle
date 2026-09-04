@@ -399,8 +399,77 @@ pub fn merge_with_previous(doc: &mut Document, path: &TreePath) -> Option<(TreeP
     block.normalize_content();
     tree_walk::set_leaf_inline(doc, &prev, &block.content);
 
+    // The text moved, so what hangs below it moves too: otherwise a subitem would be left
+    // under an item holding none of the text it belonged to — or, for a checklist, taken
+    // along when the emptied item goes.
+    move_item_body(doc, path, &prev);
+
     remove_node_at(doc, path);
     Some((prev, prev_len))
+}
+
+/// Move the body of the item at `from` onto the item at `to`, for a merge that is about to
+/// remove `from`: a checklist item's subitems become the absorbing item's, and a list entry's
+/// remaining paragraphs (continuation paragraphs, sublists) are inserted just after the
+/// paragraph the text merged into. Only within one kind of list, and only between two
+/// different items — anything else is left where it stands for [`remove_node_at`] to keep.
+fn move_item_body(doc: &mut Document, from: &TreePath, to: &TreePath) {
+    match (from.0.last(), to.0.last()) {
+        (Some(PathSegment::ChecklistItem(_)), Some(PathSegment::ChecklistItem(_))) => {
+            if from == to {
+                return;
+            }
+            let children = match node_at_mut(doc, from) {
+                Some(NodeMut::Check(item)) => std::mem::take(&mut item.children),
+                _ => return,
+            };
+            if children.is_empty() {
+                return;
+            }
+            match node_at_mut(doc, to) {
+                Some(NodeMut::Check(item)) => item.children.extend(children),
+                // Leave them where they were rather than dropping them.
+                _ => {
+                    if let Some(NodeMut::Check(item)) = node_at_mut(doc, from) {
+                        item.children = children;
+                    }
+                }
+            }
+        }
+        (
+            Some(PathSegment::ListEntry {
+                entry: from_e,
+                para: from_p,
+            }),
+            Some(PathSegment::ListEntry {
+                entry: to_e,
+                para: to_p,
+            }),
+        ) => {
+            let (from_e, from_p, to_e, to_p) = (*from_e, *from_p, *to_e, *to_p);
+            let list_path = parent_path(from);
+            // The same entry already holds its own body, and across two lists the indices
+            // would shift under us; the ordinary removal handles those.
+            if from_e == to_e || list_path != parent_path(to) {
+                return;
+            }
+            if let Some(NodeMut::Para(
+                Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
+            )) = node_at_mut(doc, &list_path)
+            {
+                if from_e >= entries.len() || to_e >= entries.len() {
+                    return;
+                }
+                if from_p + 1 >= entries[from_e].len() {
+                    return; // nothing below the text that merged away
+                }
+                let tail: Vec<Paragraph> = entries[from_e].split_off(from_p + 1);
+                let at = (to_p + 1).min(entries[to_e].len());
+                entries[to_e].splice(at..at, tail);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// After removing the node at `idx` from `vec`, join the definition lists that removal left
@@ -468,17 +537,24 @@ pub fn remove_node_at(doc: &mut Document, path: &TreePath) {
                 remove_node_at(doc, &pp);
             }
         }
+        // A checklist item holds its subitems *inside* it, so removing one would take them
+        // along; they take its place instead, one level shallower — the item goes, its
+        // subitems stay in the document.
         PathSegment::ChecklistItem(c) => {
             let mut empty = false;
             match node_at_mut(doc, &pp) {
                 Some(NodeMut::Para(Paragraph::Checklist { items })) => {
                     if c < items.len() {
+                        let children = std::mem::take(&mut items[c].children);
                         items.remove(c);
+                        items.splice(c..c, children);
                     }
                     empty = items.is_empty();
                 }
                 Some(NodeMut::Check(item)) if c < item.children.len() => {
+                    let children = std::mem::take(&mut item.children[c].children);
                     item.children.remove(c);
+                    item.children.splice(c..c, children);
                 }
                 _ => {}
             }
@@ -3926,6 +4002,15 @@ mod tests {
         let item = TreePath::root(1).child(PathSegment::ListEntry { entry: 0, para: 0 });
         remove_node_at(&mut doc, &item);
         assert_eq!(md(&doc).trim(), "Before\n\nAfter");
+    }
+
+    #[test]
+    fn removing_a_checklist_item_keeps_its_subitems() {
+        // Subitems live inside the item, so a plain removal would take them along.
+        let mut doc = parse("- [ ] a\n  - [ ] sub\n- [ ] b");
+        let item = TreePath::root(0).child(PathSegment::ChecklistItem(0));
+        remove_node_at(&mut doc, &item);
+        assert_eq!(md(&doc).trim(), "- [ ] sub\n- [ ] b");
     }
 
     #[test]

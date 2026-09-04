@@ -4835,6 +4835,80 @@ mod tests {
     }
 
     #[test]
+    fn delete_on_an_empty_checklist_item_keeps_the_next_items_subitems() {
+        // Delete at the end of an item merges the next one into it. A checklist item holds
+        // its subitems inside itself, so removing the merged item used to take them along.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document(
+            "term\n: DEFINITION\n  \n  - [ ] BULLET\n  - [ ] \n  - [ ] CHECKLIST\n    - [ ] SUBCHECKLIST",
+        ));
+        let items = TreePath::root(0).child(PathSegment::DefinitionPara { item: 0, para: 1 });
+        editor.set_cursor(DocumentPosition::at(
+            items.child(PathSegment::ChecklistItem(1)),
+            0,
+        ));
+        editor.delete_forward().unwrap();
+        assert_eq!(
+            md(&editor),
+            "term\n: DEFINITION\n  \n  - [ ] BULLET\n  - [ ] CHECKLIST\n    - [ ] SUBCHECKLIST"
+        );
+        assert_eq!(editor.leaf_plain_text(&editor.cursor().path), "CHECKLIST");
+    }
+
+    #[test]
+    fn backspace_at_a_checklist_item_start_keeps_its_subitems() {
+        // The same merge from the other end: the subitems follow their text into the item
+        // that absorbed it.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("- [ ] one\n- [ ] two\n  - [ ] sub"));
+        editor.set_cursor(DocumentPosition::at(
+            TreePath::root(0).child(PathSegment::ChecklistItem(1)),
+            0,
+        ));
+        editor.delete_backward().unwrap();
+        assert_eq!(md(&editor), "- [ ] onetwo\n  - [ ] sub");
+    }
+
+    #[test]
+    fn merging_a_checklist_item_into_a_paragraph_keeps_its_subitems() {
+        // Nothing to hold subitems here — the paragraph above is no checklist item — so they
+        // take the removed item's place in the checklist instead of vanishing with it.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("para\n\n- [ ] A\n  - [ ] B"));
+        editor.set_cursor(DocumentPosition::at(
+            TreePath::root(1).child(PathSegment::ChecklistItem(0)),
+            0,
+        ));
+        editor.delete_backward().unwrap();
+        assert_eq!(md(&editor), "paraA\n\n- [ ] B");
+    }
+
+    #[test]
+    fn merging_a_bullet_item_carries_its_sublist_along() {
+        // A list entry keeps its body in its own paragraph vec, so nothing was ever dropped
+        // here — but the sublist stayed behind under an item with none of its text left.
+        let text = |t: &str| Paragraph::new_text().with_content(vec![Span::new_text(t)]);
+        let mut editor = Editor::new();
+        editor.set_document(Document {
+            paragraphs: vec![Paragraph::new_unordered_list().with_entries(vec![
+                vec![text("one")],
+                vec![text("")],
+                vec![
+                    text("two"),
+                    Paragraph::new_unordered_list().with_entries(vec![vec![text("sub")]]),
+                ],
+            ])],
+            ..Default::default()
+        });
+        editor.set_cursor(DocumentPosition::at(
+            TreePath::root(0).child(PathSegment::ListEntry { entry: 1, para: 0 }),
+            0,
+        ));
+        editor.delete_forward().unwrap();
+        assert_eq!(md(&editor), "- one\n- two\n  \n  - sub");
+    }
+
+    #[test]
     fn outdent_lifts_quote_child_out() {
         let mut editor = Editor::new();
         editor.set_document(markdown_to_document("> quoted"));
