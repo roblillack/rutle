@@ -1137,6 +1137,14 @@ pub(crate) fn delisted_paragraph(p: Paragraph) -> Paragraph {
 /// their own spans; a container owns none, so its descendants' text is joined instead — lossy in
 /// structure, but never silently empty.
 pub(crate) fn paragraph_as_spans(p: &Paragraph) -> Vec<Span> {
+    paragraphs_as_spans(std::slice::from_ref(p))
+}
+
+/// A whole run of paragraphs as the spans of *one* span-only sink: the same walk as
+/// [`paragraph_as_spans`], with a single space between neighbours so their text does not run
+/// together (`head` + `tail` → `head tail`, not `headtail`). Used when a multi-paragraph
+/// selection is wrapped in a single checklist item.
+pub(crate) fn paragraphs_as_spans(paragraphs: &[Paragraph]) -> Vec<Span> {
     fn push_text(out: &mut Vec<Span>, spans: &[Span]) {
         if spans.is_empty() {
             return;
@@ -1179,7 +1187,9 @@ pub(crate) fn paragraph_as_spans(p: &Paragraph) -> Vec<Span> {
         }
     }
     let mut out = Vec::new();
-    walk(&mut out, p);
+    for p in paragraphs {
+        walk(&mut out, p);
+    }
     out
 }
 

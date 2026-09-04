@@ -185,6 +185,13 @@ While pre-1.0, the minor version is bumped for breaking changes.
   staying where it is and splitting the list around it, and it survives being
   quoted or lifted out of a list entry intact.
 
+- Wrapping a multi-paragraph selection in a single checklist item
+  (`Editor::wrap_selection`) no longer runs the blocks' text together:
+  `head`/`middle`/`tail` became `headmiddletail`. The separating space lived
+  inside `paragraph_as_spans`, which the caller invoked once per paragraph, so it
+  never applied between them; the new `tree_edit::paragraphs_as_spans` walks the
+  whole run into one sink instead.
+
 ## [0.5.0] - 2026-07-08
 
 ### Changed

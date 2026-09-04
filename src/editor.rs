@@ -2475,12 +2475,10 @@ impl Editor {
                 },
             ),
             tree_edit::ContainerKind::Checklist => {
-                // Checklist items are span-only: concatenate the paragraphs' text, descending
-                // into containers so nothing is dropped on the way in.
-                let mut content: Vec<Span> = Vec::new();
-                for p in &drained {
-                    content.extend(tree_edit::paragraph_as_spans(p));
-                }
+                // Checklist items are span-only: join the paragraphs' text into one item —
+                // descending into containers so nothing is dropped on the way in, and keeping a
+                // space between blocks so their text does not run together.
+                let content = tree_edit::paragraphs_as_spans(&drained);
                 (
                     Paragraph::new_checklist().with_checklist_items(vec![
                         ChecklistItem::new(false).with_content(content),
@@ -4114,6 +4112,33 @@ mod tests {
         } else {
             panic!("expected a list");
         }
+    }
+
+    #[test]
+    fn wrap_selection_checklist_keeps_a_space_between_the_paragraphs() {
+        // A checklist item holds inline spans only, so a multi-paragraph selection is joined
+        // into one — with the block boundaries becoming spaces, not nothing at all.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("head\n\nmiddle\n\ntail"));
+        editor.select_all();
+        editor
+            .wrap_selection(tree_edit::ContainerKind::Checklist)
+            .unwrap();
+        assert_eq!(md(&editor), "- [ ] head middle tail");
+    }
+
+    #[test]
+    fn wrap_selection_checklist_joins_a_definition_lists_text() {
+        // The join descends into containers too, so nothing is lost on the way in.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document(
+            "head\n\nCoffee\n: Black hot drink\n\ntail",
+        ));
+        editor.select_all();
+        editor
+            .wrap_selection(tree_edit::ContainerKind::Checklist)
+            .unwrap();
+        assert_eq!(md(&editor), "- [ ] head Coffee Black hot drink tail");
     }
 
     #[test]
