@@ -5284,6 +5284,72 @@ mod tests {
         assert_eq!(md(&editor), "plain\n\n> quoted");
     }
 
+    #[test]
+    fn toggle_bullet_over_range_with_definition_list_keeps_terms_and_definitions() {
+        // A definition list owns no inline content of its own either: its terms and definition
+        // paragraphs contribute items of their own, the way a quote's children do.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document(
+            "head\n\nCoffee\n: Black hot drink\n\nTea\n: A leaf infusion\n\ntail",
+        ));
+        editor.select_all();
+        editor.toggle_list().unwrap();
+        assert_eq!(
+            md(&editor),
+            "- head\n- Coffee\n- Black hot drink\n- Tea\n- A leaf infusion\n- tail"
+        );
+    }
+
+    #[test]
+    fn toggle_checklist_over_range_with_definition_list_keeps_its_text() {
+        // Same into a checklist, whose items hold inline spans only.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("head\n\nCoffee\n: Black hot drink"));
+        editor.select_all();
+        editor.toggle_checklist().unwrap();
+        assert_eq!(
+            md(&editor),
+            "- [ ] head\n- [ ] Coffee\n- [ ] Black hot drink"
+        );
+    }
+
+    #[test]
+    fn toggle_bullet_over_range_with_horizontal_rule_keeps_the_rule_outside() {
+        // A rule is a leaf, but a contentless one: like a table it has no item form, so it
+        // stays where it is and splits the list instead of leaving an empty bullet behind.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("head\n\n---\n\ntail"));
+        editor.select_all();
+        editor.toggle_list().unwrap();
+        assert_eq!(md(&editor), "- head\n\n---\n\n- tail");
+    }
+
+    #[test]
+    fn toggle_quote_over_range_with_horizontal_rule_keeps_the_rule() {
+        // Quoting flattens leaves to plain text — but flattening a rule that way would leave
+        // an empty paragraph, since it carries no inline content to keep.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("head\n\n---\n\ntail"));
+        editor.select_all();
+        editor.toggle_quote().unwrap();
+        assert_eq!(md(&editor), "> head\n> \n> ---\n> \n> tail");
+    }
+
+    #[test]
+    fn toggle_quote_over_range_with_definition_list_keeps_it_whole() {
+        // A quote can hold any paragraph, so the list goes in as it is rather than dissolving.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document(
+            "head\n\nCoffee\n: Black hot drink\n\ntail",
+        ));
+        editor.select_all();
+        editor.toggle_quote().unwrap();
+        assert_eq!(
+            md(&editor),
+            "> head\n> \n> Coffee\n> : Black hot drink\n> \n> tail"
+        );
+    }
+
     /// Select a whole block range from either end, apply a block type, and assert the result is
     /// the same both ways (i.e. it does not depend on where the cursor/focus landed).
     fn assert_block_type_reproducible(

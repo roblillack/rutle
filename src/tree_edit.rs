@@ -941,18 +941,20 @@ pub fn list_node_kind(p: &Paragraph) -> Option<ListKind> {
 /// Fold a run of top-level paragraphs into a list/checklist of `target` kind.
 ///
 /// Existing list/checklist nodes contribute their items (remapped to the target kind); a quote
-/// contributes its children, recursively, so quoted paragraphs become items of their own; every
-/// leaf paragraph becomes one item, flattened to plain text (dropping heading/code styling) —
-/// the same flattening a single-paragraph list toggle performs.
+/// contributes its children and a definition list its terms and definition paragraphs, both
+/// recursively, so what they hold becomes items of their own; every leaf paragraph becomes one
+/// item, flattened to plain text (dropping heading/code styling) — the same flattening a
+/// single-paragraph list toggle performs.
 ///
-/// The result is normally a single node, but a table has no item representation — a checklist
-/// item holds inline spans only, and a table inside a list entry does not render with its
-/// marker — so it stays as it is and splits the run into several nodes rather than being
-/// dropped. Callers therefore splice the returned paragraphs in; the vector is never empty.
+/// The result is normally a single node, but neither a table nor a horizontal rule has an item
+/// representation — a checklist item holds inline spans only, a table inside a list entry does
+/// not render with its marker, and a rule has no inline form at all — so such a block stays as
+/// it is and splits the run into several nodes rather than being dropped. Callers therefore
+/// splice the returned paragraphs in; the vector is never empty.
 pub fn paragraphs_into_lists(paragraphs: Vec<Paragraph>, target: ListKind) -> Vec<Paragraph> {
-    // A quote owns no inline content of its own, so flatten it to the paragraphs it holds
-    // instead of turning it into one empty item.
-    let paragraphs = dissolve_quotes(paragraphs);
+    // A quote and a definition list own no inline content of their own, so flatten them to the
+    // paragraphs they hold instead of turning them into one empty item.
+    let paragraphs = dissolve_itemless_containers(paragraphs);
     let ordered = target == ListKind::Ordered;
     let mut out: Vec<Paragraph> = Vec::new();
     // Items collected for the list currently being built, as entries (checklist items are
@@ -986,11 +988,12 @@ pub fn paragraphs_into_lists(paragraphs: Vec<Paragraph>, target: ListKind) -> Ve
 
     for p in paragraphs {
         match (target, p) {
-            // A table cannot become an item of any kind: leave it standing between two lists
-            // instead of losing its rows.
-            (_, table @ Paragraph::Table { .. }) => {
+            // Neither a table nor a horizontal rule can become an item of any kind: leave it
+            // standing between two lists instead of losing the table's rows, or leaving an
+            // empty bullet where the rule was.
+            (_, block @ (Paragraph::Table { .. } | Paragraph::HorizontalRule)) => {
                 flush(&mut out, &mut entries, &mut items, target, ordered);
-                out.push(table);
+                out.push(block);
             }
             (ListKind::Checklist, p) => match p {
                 Paragraph::OrderedList { entries: es }
@@ -999,7 +1002,7 @@ pub fn paragraphs_into_lists(paragraphs: Vec<Paragraph>, target: ListKind) -> Ve
                 }
                 Paragraph::Checklist { items: its } => items.extend(its),
                 other => {
-                    items.push(ChecklistItem::new(false).with_content(other.content().to_vec()))
+                    items.push(ChecklistItem::new(false).with_content(paragraph_as_spans(&other)))
                 }
             },
             (_, p) => match p {
@@ -1009,9 +1012,7 @@ pub fn paragraphs_into_lists(paragraphs: Vec<Paragraph>, target: ListKind) -> Ve
                     its.into_iter()
                         .map(|it| checklist_item_to_entry(it, ordered)),
                 ),
-                other => entries.push(vec![
-                    Paragraph::new_text().with_content(other.content().to_vec()),
-                ]),
+                other => entries.push(vec![delisted_paragraph(other)]),
             },
         }
     }
@@ -1027,15 +1028,23 @@ pub fn paragraphs_into_lists(paragraphs: Vec<Paragraph>, target: ListKind) -> Ve
     out
 }
 
-/// Replace every quote in `paragraphs` with the paragraphs it holds, recursively. Used before a
-/// list/checklist conversion: a quote has no inline content of its own, so converting it as one
-/// paragraph would yield an empty item and drop everything inside it. Quotes nested inside list
-/// entries are left alone — only the run's own paragraphs are dissolved.
-fn dissolve_quotes(paragraphs: Vec<Paragraph>) -> Vec<Paragraph> {
+/// Replace every container that has no item form of its own — a quote, a definition list — with
+/// the paragraphs it holds, recursively. Used before a list/checklist conversion: neither owns
+/// inline content, so converting one as a single paragraph would yield an empty item and drop
+/// everything inside it. A definition list contributes one paragraph per term followed by its
+/// definition's paragraphs, exactly as [`definition_list_into_paragraphs`] lifts it out, so leaf
+/// order and count are preserved. Containers nested inside list entries are left alone — only
+/// the run's own paragraphs are dissolved.
+fn dissolve_itemless_containers(paragraphs: Vec<Paragraph>) -> Vec<Paragraph> {
     let mut out: Vec<Paragraph> = Vec::new();
     for p in paragraphs {
         match p {
-            Paragraph::Quote { children } => out.extend(dissolve_quotes(children)),
+            Paragraph::Quote { children } => out.extend(dissolve_itemless_containers(children)),
+            // A definition can hold a quote (or another definition list) of its own, so the
+            // lifted paragraphs go through the same pass again.
+            Paragraph::DefinitionList { items } => out.extend(dissolve_itemless_containers(
+                definition_list_into_paragraphs(items),
+            )),
             other => out.push(other),
         }
     }
@@ -1112,10 +1121,12 @@ pub fn definition_list_into_paragraphs(items: Vec<DefinitionItem>) -> Vec<Paragr
 
 /// One paragraph as it looks after being lifted out of a list entry: a leaf loses its bullet and
 /// becomes plain text (dropping heading/code styling, as everywhere else), while a container — a
-/// quote, table or nested list — is kept whole. Flattening a container through `content()`, which
-/// is empty for one, would silently drop everything it holds.
+/// quote, table, nested list or definition list — is kept whole. Flattening a container through
+/// `content()`, which is empty for one, would silently drop everything it holds. A horizontal
+/// rule counts as a leaf but owns no inline content either, so it is kept as it is rather than
+/// flattened into an empty paragraph.
 pub(crate) fn delisted_paragraph(p: Paragraph) -> Paragraph {
-    if p.is_leaf() {
+    if p.is_leaf() && !matches!(p, Paragraph::HorizontalRule) {
         Paragraph::new_text().with_content(p.content().to_vec())
     } else {
         p
@@ -1158,6 +1169,12 @@ pub(crate) fn paragraph_as_spans(p: &Paragraph) -> Vec<Span> {
                     }
                 }
             }
+            Paragraph::DefinitionList { items } => {
+                for item in items {
+                    item.terms.iter().for_each(|t| push_text(out, t));
+                    item.definition.iter().for_each(|c| walk(out, c));
+                }
+            }
             leaf => push_text(out, leaf.content()),
         }
     }
@@ -1170,9 +1187,9 @@ pub(crate) fn paragraph_as_spans(p: &Paragraph) -> Vec<Span> {
 /// paragraph supplies the item text, and any continuation paragraphs / nested sublists
 /// become nested checklist children.
 fn entry_to_checklist_item(entry: Vec<Paragraph>) -> ChecklistItem {
-    // A quote as the entry's body has no inline content of its own; its paragraphs supply the
-    // item text and children instead of the item coming out empty.
-    let mut paras = dissolve_quotes(entry).into_iter().peekable();
+    // A quote or definition list as the entry's body has no inline content of its own; its
+    // paragraphs supply the item text and children instead of the item coming out empty.
+    let mut paras = dissolve_itemless_containers(entry).into_iter().peekable();
     // The entry's first paragraph supplies the item text — unless it is itself a list, which has
     // no text of its own and folds into the item's children below.
     let content = match paras.peek() {
@@ -3263,6 +3280,80 @@ mod tests {
         assert_eq!(doc.paragraphs.len(), 2);
         assert!(matches!(doc.paragraphs[0], Paragraph::Text { .. }));
         assert!(matches!(doc.paragraphs[1], Paragraph::Text { .. }));
+    }
+
+    #[test]
+    fn dissolve_bullet_list_keeps_a_horizontal_rule_entry() {
+        // A rule is a leaf with no inline content: flattening it through `content()` on the way
+        // out of the list would leave an empty paragraph where the rule was.
+        let mut doc = parse("x");
+        doc.paragraphs = vec![
+            Paragraph::new_unordered_list()
+                .with_entries(vec![vec![text("lead")], vec![Paragraph::HorizontalRule]]),
+        ];
+        assert_eq!(dissolve_container(&mut doc, &TreePath::root(0)), Some(0));
+        assert!(
+            matches!(doc.paragraphs[1], Paragraph::HorizontalRule),
+            "{:?}",
+            doc.paragraphs
+        );
+    }
+
+    #[test]
+    fn definition_list_into_a_bullet_list_yields_one_item_per_leaf() {
+        let dl = Paragraph::DefinitionList {
+            items: vec![
+                DefinitionItem::new()
+                    .with_terms(vec![vec![Span::new_text("Coffee")]])
+                    .with_definition(vec![text("Black hot drink")]),
+            ],
+        };
+        let out = paragraphs_into_lists(vec![dl], ListKind::Unordered);
+        let Some(Paragraph::UnorderedList { entries }) = out.first() else {
+            panic!("expected one list, got {out:?}");
+        };
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0][0].content()[0].text, "Coffee");
+        assert_eq!(entries[1][0].content()[0].text, "Black hot drink");
+    }
+
+    #[test]
+    fn definition_holding_a_quote_dissolves_all_the_way_down() {
+        // The pass recurses: a quote inside a definition contributes items of its own rather
+        // than arriving as an empty one.
+        let dl = Paragraph::DefinitionList {
+            items: vec![
+                DefinitionItem::new()
+                    .with_terms(vec![vec![Span::new_text("Term")]])
+                    .with_definition(vec![
+                        Paragraph::new_quote().with_children(vec![text("quoted")]),
+                    ]),
+            ],
+        };
+        let out = paragraphs_into_lists(vec![dl], ListKind::Unordered);
+        let Some(Paragraph::UnorderedList { entries }) = out.first() else {
+            panic!("expected one list, got {out:?}");
+        };
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1][0].content()[0].text, "quoted");
+    }
+
+    #[test]
+    fn paragraph_as_spans_reaches_terms_and_definitions() {
+        // The span-only sink (a checklist item): a definition list owns no inline content, so
+        // its terms and definitions have to be joined rather than coming out empty.
+        let dl = Paragraph::DefinitionList {
+            items: vec![
+                DefinitionItem::new()
+                    .with_terms(vec![vec![Span::new_text("Coffee")]])
+                    .with_definition(vec![text("Black hot drink")]),
+            ],
+        };
+        let joined: String = paragraph_as_spans(&dl)
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(joined, "Coffee Black hot drink");
     }
 
     #[test]

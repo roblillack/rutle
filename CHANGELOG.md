@@ -173,6 +173,18 @@ While pre-1.0, the minor version is bumped for breaking changes.
   quoting a range. The reverse direction (delisting, `dissolve_container`) keeps a
   container that is a list entry's body intact as well. (#13)
 
+- Converting a range of paragraphs into a list or a quote no longer drops a
+  definition list or a horizontal rule — the two block kinds #13 could not know
+  about. A definition list owns no inline content, so, like a quote, it now
+  contributes its terms and definition paragraphs as items of their own
+  (recursively, so a quote inside a definition comes along) instead of collapsing
+  into one empty item; for a checklist, whose items are spans only,
+  `tree_edit::paragraph_as_spans` joins their text rather than coming back empty.
+  A horizontal rule is a *leaf* with no inline content, which `content()`
+  flattening turned into an empty paragraph — it now behaves like a table,
+  staying where it is and splitting the list around it, and it survives being
+  quoted or lifted out of a list entry intact.
+
 ## [0.5.0] - 2026-07-08
 
 ### Changed
