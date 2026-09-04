@@ -2,8 +2,10 @@
 //
 // "Reveal codes" shows a document's inline-style structure inline, the way
 // classic Pure (and WordPerfect before it) did: a styled span renders with a
-// `[Bold>` tag where it opens and a `<Bold]` tag where it closes, nesting for
-// stacked styles (`[Bold>styles [Highlight>gets messy<Highlight]<Bold]`).
+// tag where it opens and another where it closes, nesting for stacked styles
+// (`[Bold>styles [Highlight>gets messy<Highlight]<Bold]`). A pixel backend
+// draws each tag as WordPerfect's pointed code box; a cell backend, which can
+// only place glyphs, gets that bracketed text form (`Theme::reveal_tag_text`).
 //
 // The tags are derived purely from the leaf's flattened inline runs by a small
 // stack reconciler: walking the runs left to right, a style that is present in a

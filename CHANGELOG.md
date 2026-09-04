@@ -10,6 +10,29 @@ While pre-1.0, the minor version is bumped for breaking changes.
 
 ## [Unreleased] - ReleaseDate
 
+### Changed
+
+- Reveal-codes tags are now *drawn* as WordPerfect-style code boxes — an
+  outlined, filled box whose pointed end faces the text the style applies to
+  (right where it opens, left where it closes) — instead of being simulated with
+  the bracket text `[Bold>` / `<Bold]`. The shape comes from the new
+  `RenderContext::draw_reveal_tag`, which has a default implementation built
+  from the existing fill/line primitives, so a pixel backend gets the boxes
+  without doing anything; a backend with a polygon primitive can override it for
+  an antialiased shape. Tag runs are laid out wider than their label to make
+  room for the box's padding and point, and the caret steps over that full
+  width. A tag rests on its line's text baseline — the *block's* font size, not
+  the tag's — so tags in a heading sit on the words they mark instead of
+  floating at the top of the taller line. (#11)
+- New theme fields: `reveal_tag_border` (the box outline) and `reveal_tag_text`.
+  **A character-cell backend must set `reveal_tag_text = true`**, which keeps
+  the old bracketed-text tags — a box can't be drawn in a character grid.
+  `reveal_tag_bg` also lightened to `0xDDDDD5FF` to suit a filled, outlined box.
+  (#11)
+- `tree_edit::paragraphs_into_list` is now `tree_edit::paragraphs_into_lists` and
+  returns `Vec<Paragraph>`: a run can convert into more than one node when it
+  holds a block that cannot become an item (a table). (#13)
+
 ### Fixed
 
 - A list/checklist item whose content starts with a hard break (or is otherwise
@@ -31,12 +54,6 @@ While pre-1.0, the minor version is bumped for breaking changes.
   of collapsing; and a quote/table/list becomes a quote child verbatim when
   quoting a range. The reverse direction (delisting, `dissolve_container`) keeps a
   container that is a list entry's body intact as well. (#13)
-
-### Changed
-
-- `tree_edit::paragraphs_into_list` is now `tree_edit::paragraphs_into_lists` and
-  returns `Vec<Paragraph>`: a run can convert into more than one node when it
-  holds a block that cannot become an item (a table). (#13)
 
 ## [0.5.0] - 2026-07-08
 
