@@ -59,6 +59,16 @@ While pre-1.0, the minor version is bumped for breaking changes.
     empty term or definition *leaves* the list, splitting it around the new
     paragraph, exactly as Enter on an empty list item leaves a list. So
     term → Enter → definition → Enter → term → … → Enter twice ends the list.
+  - **Tab pulls a list under a definition into it.** A list typed below a
+    definition list is a list of its own; Tab on its first item moves that item
+    into the definition that ends the list above, where it stays a list item —
+    joining a list already ending that definition, so a whole list can be pulled
+    in an item at a time. Shift-Tab is the inverse: the item leaves the
+    definition list as a list of its own again (splitting the list when items
+    follow, as any definition paragraph leaving does) and rejoins the list it
+    came from rather than leaving a seam. This mirrors Tab nesting a list item
+    into a preceding quote. `toggle_list` on such an item still means "no longer
+    a list" and delists it where it stands, into a paragraph of the definition.
   - `insert_continuation` (Ctrl+P in Pure) keeps its meaning inside a
     definition: another paragraph of the *same* definition. With Enter now
     moving on to the next term, this and Tab are the ways to grow one.
@@ -225,6 +235,14 @@ While pre-1.0, the minor version is bumped for breaking changes.
     `set_block_type(BlockType::ListItem { .. })` uses, so the two agree: a term
     takes its whole item out of the list, a definition takes its own content out
     below it, and the new bullet is what that leaves behind.
+
+- Lifting a list item out of a list that sits inside a definition no longer
+  dropped it. `tree_edit::container_splice` — the splice every "leaf leaves its
+  container" move ends in — knew the document top level, a quote's children and a
+  list entry's paragraphs, but not a definition's, so it bailed out *after* the
+  entries had been taken and the item was gone. It now understands a definition's
+  paragraph vec (and `para_at`, the read-side walk, descends into one too, so the
+  list toggles see a list nested in a definition at all).
 
 ## [0.5.0] - 2026-07-08
 

@@ -889,8 +889,9 @@ impl ListKind {
     }
 }
 
-/// Immutably descend to the `Paragraph` at `path` (through quotes and lists). Returns
-/// `None` if the path leaves the paragraph tree (e.g. into a checklist item).
+/// Immutably descend to the `Paragraph` at `path` (through quotes, lists and definitions).
+/// Returns `None` if the path leaves the paragraph tree (e.g. into a checklist item or a
+/// definition's term, neither of which is a `Paragraph`).
 fn para_at<'a>(doc: &'a Document, path: &TreePath) -> Option<&'a Paragraph> {
     let mut segs = path.0.iter();
     let PathSegment::Paragraph(i) = segs.next()? else {
@@ -904,6 +905,9 @@ fn para_at<'a>(doc: &'a Document, path: &TreePath) -> Option<&'a Paragraph> {
                 Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
                 PathSegment::ListEntry { entry, para },
             ) => entries.get(*entry)?.get(*para)?,
+            (Paragraph::DefinitionList { items }, PathSegment::DefinitionPara { item, para }) => {
+                items.get(*item)?.definition.get(*para)?
+            }
             _ => return None,
         };
     }
@@ -1419,13 +1423,20 @@ fn container_child_path(node_path: &TreePath, idx: usize) -> TreePath {
                 para: idx,
             })
         }
+        Some(PathSegment::DefinitionPara { item, .. }) => {
+            parent_path(node_path).child(PathSegment::DefinitionPara {
+                item: *item,
+                para: idx,
+            })
+        }
         _ => TreePath::root(idx),
     }
 }
 
 /// Replace the single node at `node_path` with `replacement` in its container: top-level
-/// paragraphs, a quote's children, or a list entry's paragraph vec (so a container nested
-/// inside a list item can be spliced too). Returns the base index of the replacement.
+/// paragraphs, a quote's children, a list entry's paragraph vec, or a definition's paragraph
+/// vec (so a container nested inside a list item or a definition can be spliced too). Returns
+/// the base index of the replacement.
 fn container_splice(
     doc: &mut Document,
     node_path: &TreePath,
@@ -1460,6 +1471,19 @@ fn container_splice(
                         return None;
                     }
                     e.splice(para..=para, replacement);
+                    Some(para)
+                }
+                _ => None,
+            }
+        }
+        PathSegment::DefinitionPara { item, para } => {
+            match node_at_mut(doc, &parent_path(node_path))? {
+                NodeMut::Para(Paragraph::DefinitionList { items }) => {
+                    let def = &mut items.get_mut(item)?.definition;
+                    if para >= def.len() {
+                        return None;
+                    }
+                    def.splice(para..=para, replacement);
                     Some(para)
                 }
                 _ => None,
@@ -2841,11 +2865,162 @@ fn nest_first_item_into_preceding_quote(doc: &mut Document, path: &TreePath) -> 
 
 /// Indent the list/checklist item at `path`, or — for the first item of a top-level list
 /// that follows another list — merge it into that preceding list, or — for the first item of
-/// a list that follows a quote — nest it into that quote (keeping it a list item).
+/// a list that follows a quote or a definition list — nest it into that container (keeping it
+/// a list item).
 pub fn indent_list_item_or_merge(doc: &mut Document, path: &TreePath) -> Option<TreePath> {
     indent_list_item(doc, path)
         .or_else(|| merge_first_item_into_preceding_list(doc, path))
         .or_else(|| nest_first_item_into_preceding_quote(doc, path))
+        .or_else(|| nest_first_item_into_preceding_definition(doc, path))
+}
+
+/// Nest the first item of a list that directly follows a definition list into that list's last
+/// definition, as another paragraph of it — the item stays a list item, joining a list that
+/// already ends the definition or starting one at its end. So a list typed under a definition
+/// is pulled into it with Tab, the way one typed under a quote is pulled into the quote.
+/// The inverse of Shift-Tab lifting it back out ([`exit_definition_list_item`]).
+fn nest_first_item_into_preceding_definition(
+    doc: &mut Document,
+    path: &TreePath,
+) -> Option<TreePath> {
+    // Only the first entry of an ordered/unordered list qualifies (cursor anywhere in it).
+    if !matches!(path.0.last()?, PathSegment::ListEntry { entry: 0, .. }) {
+        return None;
+    }
+    let list_path = parent_path(path);
+    let (vec, idx) = sibling_slice(doc, &list_path)?;
+    if idx == 0 || !matches!(vec.get(idx - 1)?, Paragraph::DefinitionList { .. }) {
+        return None;
+    }
+    // Detach the first entry, remembering the list's kind so the item stays the same kind.
+    let ordered = match node_at_mut(doc, &list_path)? {
+        NodeMut::Para(p) => list_ordered(p)?,
+        _ => return None,
+    };
+    let moved = match node_at_mut(doc, &list_path)? {
+        NodeMut::Para(
+            Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
+        ) => {
+            if entries.is_empty() {
+                return None;
+            }
+            entries.remove(0)
+        }
+        _ => return None,
+    };
+    let emptied = matches!(
+        node_at_mut(doc, &list_path),
+        Some(NodeMut::Para(
+            Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
+        )) if entries.is_empty()
+    );
+    let (cvec, cidx) = sibling_vec_mut(doc, &list_path)?;
+    let prev = cidx - 1;
+    let (item, dpara, entry_idx) = match &mut cvec[prev] {
+        Paragraph::DefinitionList { items } => {
+            // The paragraph under a definition list belongs to the definition that ends it.
+            let item = items.len().checked_sub(1)?;
+            let def = &mut items[item].definition;
+            // An empty paragraph the definition is only holding open (what lifting its content
+            // out leaves behind) is the slot to fill, not something to keep above the list.
+            if matches!(def.last(), Some(Paragraph::Text { content }) if content.is_empty()) {
+                def.pop();
+            }
+            if matches!(def.last(), Some(p) if list_ordered(p).is_some()) {
+                let di = def.len() - 1;
+                match &mut def[di] {
+                    Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries } => {
+                        entries.push(moved);
+                        (item, di, entries.len() - 1)
+                    }
+                    _ => return None,
+                }
+            } else {
+                def.push(new_list(ordered, vec![moved]));
+                (item, def.len() - 1, 0)
+            }
+        }
+        _ => return None,
+    };
+    if emptied {
+        cvec.remove(cidx); // `prev < cidx`, so the definition list's index is unaffected
+    }
+    Some(
+        with_last_index(&list_path, prev)
+            .child(PathSegment::DefinitionPara { item, para: dpara })
+            .child(PathSegment::ListEntry {
+                entry: entry_idx,
+                para: 0,
+            }),
+    )
+}
+
+/// Lift the list item at `entry` out of the definition list whose definition holds its list,
+/// back to a list of its own just below that definition list — the inverse of Tab nesting a
+/// following list's first item into a definition. The entries below it come along so nothing
+/// is reordered, the definition list splits when items follow (as any definition paragraph
+/// leaving does), and the lifted list rejoins an adjacent same-kind list instead of leaving a
+/// seam where it came from.
+fn exit_definition_list_item(
+    doc: &mut Document,
+    list_path: &TreePath,
+    entry: usize,
+    para: usize,
+) -> Option<TreePath> {
+    let PathSegment::DefinitionPara { item, para: dpara } = list_path.0.last()?.clone() else {
+        return None;
+    };
+    let ordered = match node_at_mut(doc, list_path)? {
+        NodeMut::Para(p) => list_ordered(p)?,
+        _ => return None,
+    };
+    // Carve the item and the entries below it out into a list paragraph of their own inside
+    // the definition, so the ordinary definition-paragraph lift can take it from there.
+    let entries = match node_at_mut(doc, list_path)? {
+        NodeMut::Para(
+            Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
+        ) => {
+            if entry >= entries.len() {
+                return None;
+            }
+            std::mem::take(entries)
+        }
+        _ => return None,
+    };
+    let mut before = entries;
+    let moved = before.split_off(entry);
+    let mut replacement: Vec<Paragraph> = Vec::new();
+    if !before.is_empty() {
+        replacement.push(new_list(ordered, before));
+    }
+    let moved_at = dpara + replacement.len();
+    replacement.push(new_list(ordered, moved));
+    container_splice(doc, list_path, replacement)?;
+
+    let moved_path = parent_path(list_path).child(PathSegment::DefinitionPara {
+        item,
+        para: moved_at,
+    });
+    let (lifted, _) = lift_definition_para(doc, &moved_path)?;
+
+    // The list it came from is usually right there again; one list, as everywhere else.
+    let shift = match sibling_slice(doc, &lifted) {
+        Some((vec, i)) if i > 0 && list_like_kind(&vec[i - 1]) == list_like_kind(vec.get(i)?) => {
+            list_item_count(&vec[i - 1])
+        }
+        _ => 0,
+    };
+    let merged = merge_adjacent_lists(doc, &lifted);
+    Some(merged.child(PathSegment::ListEntry { entry: shift, para }))
+}
+
+/// How many entries/items a list-like paragraph holds (0 for anything else).
+fn list_item_count(p: &Paragraph) -> usize {
+    match p {
+        Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries } => entries.len(),
+        Paragraph::Checklist { items } => items.len(),
+        _ => 0,
+    }
 }
 
 pub fn indent_list_item(doc: &mut Document, path: &TreePath) -> Option<TreePath> {
@@ -2971,7 +3146,7 @@ pub fn outdent_list_item_delisting(doc: &mut Document, path: &TreePath) -> Optio
 fn outdent_list_item_inner(
     doc: &mut Document,
     path: &TreePath,
-    keep_list_in_quote: bool,
+    keep_bullet: bool,
 ) -> Option<TreePath> {
     let last = path.0.last()?.clone();
     let pp = parent_path(path);
@@ -3036,8 +3211,14 @@ fn outdent_list_item_inner(
             // list item (splitting the quote around it) — the inverse of Tab nesting a list
             // item into a preceding quote — unless we are delisting, in which case fall through
             // to drop it into the quote as a plain text child.
-            Some(PathSegment::QuoteChild(_)) if keep_list_in_quote => {
+            Some(PathSegment::QuoteChild(_)) if keep_bullet => {
                 exit_quote_list_item(doc, &pp, entry, para)
+            }
+            // Likewise a list inside a definition: the item leaves the definition list as a
+            // list of its own — the inverse of Tab pulling it in. Delisting instead drops it
+            // into the definition as a plain paragraph, through the fall-through below.
+            Some(PathSegment::DefinitionPara { .. }) if keep_bullet => {
+                exit_definition_list_item(doc, &pp, entry, para)
             }
             _ => exit_list_to_container(doc, &pp, entry, para),
         },

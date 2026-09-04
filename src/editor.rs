@@ -4477,6 +4477,142 @@ mod tests {
         }
     }
 
+    /// The first item of the top-level list at paragraph `i`.
+    fn first_item_of(i: usize) -> TreePath {
+        TreePath::root(i).child(PathSegment::ListEntry { entry: 0, para: 0 })
+    }
+
+    #[test]
+    fn indent_nests_a_following_list_item_into_the_definition_above() {
+        // A list typed under a definition is pulled into it with Tab, the way one typed under
+        // a quote is pulled into the quote — staying a list item, inside the definition.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document(
+            "Coffee\n: A black hot drink\n\n- beans",
+        ));
+        editor.set_cursor(DocumentPosition::at(first_item_of(1), 1));
+        editor.indent().unwrap();
+        assert_eq!(md(&editor), "Coffee\n: A black hot drink\n  \n  - beans");
+        assert_eq!(
+            editor.document().paragraphs.len(),
+            1,
+            "the emptied list is gone"
+        );
+        assert_eq!(editor.leaf_plain_text(&editor.cursor().path), "beans");
+    }
+
+    #[test]
+    fn indent_keeps_the_item_a_numbered_one_inside_the_definition() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("Coffee\n: drink\n\n1. beans"));
+        editor.set_cursor(DocumentPosition::at(first_item_of(1), 1));
+        editor.indent().unwrap();
+        assert_eq!(md(&editor), "Coffee\n: drink\n  \n  1. beans");
+    }
+
+    #[test]
+    fn indenting_again_joins_the_list_already_in_the_definition() {
+        // So a whole list can be pulled in an item at a time instead of stacking sublists.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("Coffee\n: drink\n\n- beans\n- water"));
+        editor.set_cursor(DocumentPosition::at(first_item_of(1), 1));
+        editor.indent().unwrap();
+        editor.set_cursor(DocumentPosition::at(first_item_of(1), 1));
+        editor.indent().unwrap();
+        assert_eq!(md(&editor), "Coffee\n: drink\n  \n  - beans\n  - water");
+        assert_eq!(editor.leaf_plain_text(&editor.cursor().path), "water");
+    }
+
+    #[test]
+    fn indent_targets_the_last_definition_of_the_list_above() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("A\n: one\n\nB\n: two\n\n- x"));
+        editor.set_cursor(DocumentPosition::at(first_item_of(1), 1));
+        editor.indent().unwrap();
+        assert_eq!(md(&editor), "A\n: one\n\nB\n: two\n  \n  - x");
+    }
+
+    #[test]
+    fn only_the_first_item_of_a_following_list_nests_into_the_definition() {
+        // A later item has the item above it to nest under, as in any list.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("Coffee\n: drink\n\n- beans\n- water"));
+        editor.set_cursor(DocumentPosition::at(
+            TreePath::root(1).child(PathSegment::ListEntry { entry: 1, para: 0 }),
+            1,
+        ));
+        editor.indent().unwrap();
+        assert_eq!(md(&editor), "Coffee\n: drink\n\n- beans\n  \n  - water");
+    }
+
+    #[test]
+    fn indent_into_a_definition_then_outdent_round_trips() {
+        // Tab into the definition, Shift-Tab back out — the inverse, as across a quote.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("Coffee\n: drink\n\n- beans"));
+        let before = format!("{:?}", editor.document().paragraphs);
+        editor.set_cursor(DocumentPosition::at(first_item_of(1), 1));
+        editor.indent().unwrap();
+        editor.outdent().unwrap();
+        assert_eq!(
+            format!("{:?}", editor.document().paragraphs),
+            before,
+            "indent into the definition then outdent restores the original structure"
+        );
+    }
+
+    #[test]
+    fn outdent_from_a_definition_rejoins_the_list_it_came_from() {
+        // The item left a two-item list behind; coming back out it joins it again rather than
+        // leaving two adjacent lists (which render alike but serialize with a seam).
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("Coffee\n: drink\n\n- beans\n- water"));
+        editor.set_cursor(DocumentPosition::at(first_item_of(1), 1));
+        editor.indent().unwrap();
+        editor.outdent().unwrap();
+        assert_eq!(md(&editor), "Coffee\n: drink\n\n- beans\n- water");
+        assert_eq!(editor.document().paragraphs.len(), 2, "one list, not two");
+        assert_eq!(editor.leaf_plain_text(&editor.cursor().path), "beans");
+    }
+
+    #[test]
+    fn outdent_a_list_out_of_a_middle_definition_splits_the_list() {
+        // Lifting any definition paragraph out splits the list around it; a list nested in a
+        // definition is no exception — and nothing may be dropped on the way (it was).
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("A\n: one\n\nB\n: two"));
+        if let Some(Paragraph::DefinitionList { items }) =
+            editor.document_mut().paragraphs.get_mut(0)
+        {
+            items[0]
+                .definition
+                .push(Paragraph::new_unordered_list().with_entries(vec![vec![
+                    Paragraph::new_text().with_content(vec![Span::new_text("nested")]),
+                ]]));
+        }
+        editor.set_cursor(DocumentPosition::at(
+            TreePath::root(0)
+                .child(PathSegment::DefinitionPara { item: 0, para: 1 })
+                .child(PathSegment::ListEntry { entry: 0, para: 0 }),
+            0,
+        ));
+        editor.outdent().unwrap();
+        assert_eq!(md(&editor), "A\n: one\n\n- nested\n\nB\n: two");
+        assert_eq!(editor.leaf_plain_text(&editor.cursor().path), "nested");
+    }
+
+    #[test]
+    fn toggling_a_list_off_inside_a_definition_delists_it_there() {
+        // "No longer a list" keeps the text where it is — a paragraph of the definition.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("Coffee\n: drink\n\n- beans"));
+        editor.set_cursor(DocumentPosition::at(first_item_of(1), 1));
+        editor.indent().unwrap();
+        editor.toggle_list().unwrap();
+        assert_eq!(md(&editor), "Coffee\n: drink\n  \n  beans");
+        assert_eq!(editor.leaf_plain_text(&editor.cursor().path), "beans");
+    }
+
     #[test]
     fn outdent_lifts_quote_child_out() {
         let mut editor = Editor::new();

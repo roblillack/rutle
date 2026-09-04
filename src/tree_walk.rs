@@ -1257,6 +1257,28 @@ mod tests {
     }
 
     #[test]
+    fn a_list_inside_a_definition_carries_both_depths() {
+        // Tab pulls a following list into a definition, so its items must indent for the
+        // definition they are in *and* carry their list marker level.
+        let mut doc = parse("Coffee\n: drink\n");
+        if let Some(Paragraph::DefinitionList { items }) = doc.paragraphs.get_mut(0) {
+            items[0]
+                .definition
+                .push(Paragraph::new_unordered_list().with_entries(vec![vec![
+                    Paragraph::new_text().with_content(vec![Span::new_text("beans")]),
+                ]]));
+        }
+        let leaves = enumerate_leaves(&doc);
+        let item = leaves
+            .iter()
+            .find(|l| leaf_text(&doc, &l.path) == "beans")
+            .expect("the nested item");
+        assert_eq!(item.definition_depth, 1, "indents for the definition");
+        assert_eq!(item.list_levels, 1, "and still carries its bullet");
+        assert!(item.marker.is_some());
+    }
+
+    #[test]
     fn leaf_spans_mut_edits_tree() {
         let mut doc = parse("hello");
         let path = TreePath::root(0);
