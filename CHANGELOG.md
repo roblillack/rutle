@@ -23,11 +23,12 @@ While pre-1.0, the minor version is bumped for breaking changes.
   room for the box's padding and point, and the caret steps over that full
   width. A tag rests on its line's text baseline — the *block's* font size, not
   the tag's — so tags in a heading sit on the words they mark instead of
-  floating at the top of the taller line.
+  floating at the top of the taller line. (#11)
 - New theme fields: `reveal_tag_border` (the box outline) and `reveal_tag_text`.
   **A character-cell backend must set `reveal_tag_text = true`**, which keeps
   the old bracketed-text tags — a box can't be drawn in a character grid.
   `reveal_tag_bg` also lightened to `0xDDDDD5FF` to suit a filled, outlined box.
+  (#11)
 
 ## [0.5.0] - 2026-07-08
 
