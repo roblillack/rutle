@@ -10,6 +10,8 @@ While pre-1.0, the minor version is bumped for breaking changes.
 
 ## [Unreleased] - ReleaseDate
 
+## [0.6.0] - 2026-09-04
+
 ### Changed
 
 - **Breaking:** the `tdoc` dependency is now `0.12` and the two block kinds it
@@ -395,7 +397,8 @@ across multiple tools.
   metric regimes, plus layout/edit performance benchmarks.
 
 <!-- next-url -->
-[Unreleased]: https://github.com/roblillack/rutle/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/roblillack/rutle/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/roblillack/rutle/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/roblillack/rutle/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/roblillack/rutle/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/roblillack/rutle/compare/v0.3.2...v0.4.0
