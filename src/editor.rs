@@ -3386,15 +3386,20 @@ impl Editor {
             let Some(path) = leaves.get(idx).cloned() else {
                 continue;
             };
-            if matches!(
-                path.last(),
-                Some(
-                    PathSegment::ListEntry { .. }
-                        | PathSegment::ChecklistItem(_)
-                        | PathSegment::QuoteChild(_)
-                )
-            ) && op(&mut self.tdoc, &path).is_some()
-            {
+            if !is_shiftable_item(&path) {
+                continue;
+            }
+            // An item inside another item the selection covers rides *with* it and is not
+            // moved on its own: the whole selected subtree shifts one level, keeping the
+            // nesting the author built. Moving a subitem separately would land it beside its
+            // parent — both went one level out, but out of different containers.
+            let inside_selected = (start_idx..=end_idx).any(|j| {
+                j != idx
+                    && leaves.get(j).is_some_and(|other| {
+                        is_shiftable_item(other) && path_inside_item(&path, other)
+                    })
+            });
+            if !inside_selected && op(&mut self.tdoc, &path).is_some() {
                 changed = true;
             }
         }
@@ -3603,6 +3608,31 @@ fn leaves_of_range(doc: &Document, s: usize, e: usize) -> Vec<TreePath> {
 fn leaf_bounds_of_range(doc: &Document, s: usize, e: usize) -> Option<(TreePath, TreePath)> {
     let leaves = leaves_of_range(doc, s, e);
     Some((leaves.first()?.clone(), leaves.last()?.clone()))
+}
+
+/// Whether `path` addresses one of the items [`Editor::shift_list_items`] moves — a list or
+/// checklist item, or a quote's child.
+fn is_shiftable_item(path: &TreePath) -> bool {
+    matches!(
+        path.last(),
+        Some(
+            PathSegment::ListEntry { .. }
+                | PathSegment::ChecklistItem(_)
+                | PathSegment::QuoteChild(_)
+        )
+    )
+}
+
+/// Whether `path` sits *inside* the item at `ancestor` — a subitem of it, or a leaf of one —
+/// rather than being that item itself or a sibling. Segments are compared by the child they
+/// address, so a list segment's `para` is ignored: an item's sublist counts as inside the item.
+fn path_inside_item(path: &TreePath, ancestor: &TreePath) -> bool {
+    let (p, a) = (path.segments(), ancestor.segments());
+    p.len() > a.len()
+        && p.iter().zip(a).all(|(x, y)| {
+            std::mem::discriminant(x) == std::mem::discriminant(y)
+                && child_index(x) == child_index(y)
+        })
 }
 
 /// The index a path segment addresses within its container (the entry for a list segment,
@@ -4706,6 +4736,102 @@ mod tests {
         editor.toggle_checklist().unwrap();
         assert_eq!(md(&editor), "Coffee\n: drink\n  \n  beans");
         assert_eq!(editor.leaf_plain_text(&editor.cursor().path), "beans");
+    }
+
+    /// A checklist item with children, for building trees by hand.
+    fn check_item(text: &str, children: Vec<ChecklistItem>) -> ChecklistItem {
+        let mut item = ChecklistItem::new(false).with_content(vec![Span::new_text(text)]);
+        item.children = children;
+        item
+    }
+
+    /// "Ctrl-Q / : to quit" with a checklist in the definition: `A` (holding `B`) and `C`.
+    fn definition_holding_a_nested_checklist() -> Document {
+        Document {
+            paragraphs: vec![Paragraph::DefinitionList {
+                items: vec![
+                    tdoc::DefinitionItem::new()
+                        .with_terms(vec![vec![Span::new_text("Ctrl-Q")]])
+                        .with_definition(vec![
+                            Paragraph::new_text().with_content(vec![Span::new_text("to quit")]),
+                            Paragraph::new_checklist().with_checklist_items(vec![
+                                check_item("A", vec![check_item("B", vec![])]),
+                                check_item("C", vec![]),
+                            ]),
+                        ]),
+                ],
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn outdent_a_selected_subtree_keeps_its_nesting() {
+        // Selecting an item together with its subitems and pressing Shift-Tab moves the whole
+        // subtree one level out. Outdenting the subitem on its own as well would land it
+        // beside its parent: both went one level out, but out of different containers.
+        let dp = TreePath::root(0).child(PathSegment::DefinitionPara { item: 0, para: 1 });
+        let a = dp.clone().child(PathSegment::ChecklistItem(0));
+        let c = dp.child(PathSegment::ChecklistItem(1));
+
+        let mut editor = Editor::new();
+        editor.set_document(definition_holding_a_nested_checklist());
+        editor.set_cursor(DocumentPosition::at(c.clone(), 1));
+        editor.set_selection(
+            DocumentPosition::at(a.clone(), 0),
+            DocumentPosition::at(c, 1),
+        );
+        editor.outdent().unwrap();
+        assert_eq!(
+            md(&editor),
+            "Ctrl-Q\n: to quit\n\n- [ ] A\n  - [ ] B\n- [ ] C"
+        );
+
+        // Which is exactly what outdenting the parent alone does — the subitem rides along
+        // either way.
+        let mut caret_only = Editor::new();
+        caret_only.set_document(definition_holding_a_nested_checklist());
+        caret_only.set_cursor(DocumentPosition::at(a, 0));
+        caret_only.outdent().unwrap();
+        assert_eq!(md(&caret_only), md(&editor));
+    }
+
+    #[test]
+    fn outdent_selected_items_keeps_a_subitem_under_its_parent() {
+        // Same rule among bullets: "a" and "b" come out a level, "deep" stays under "a".
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("- one\n  - a\n    - deep\n  - b"));
+        let sub = |item: usize| {
+            TreePath::root(0)
+                .child(PathSegment::ListEntry { entry: 0, para: 1 })
+                .child(PathSegment::ListEntry {
+                    entry: item,
+                    para: 0,
+                })
+        };
+        editor.set_cursor(DocumentPosition::at(sub(1), 1));
+        editor.set_selection(
+            DocumentPosition::at(sub(0), 0),
+            DocumentPosition::at(sub(1), 1),
+        );
+        editor.outdent().unwrap();
+        assert_eq!(md(&editor), "- one\n- a\n  \n  - deep\n- b");
+    }
+
+    #[test]
+    fn indent_selected_items_keeps_subitems_side_by_side() {
+        // The same in the other direction: "p" nests under "x" taking its two subitems along,
+        // rather than the second subitem being re-adopted as a child of the first.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("- x\n- p\n  - c1\n  - c2"));
+        let p_item = TreePath::root(0).child(PathSegment::ListEntry { entry: 1, para: 0 });
+        let c2 = TreePath::root(0)
+            .child(PathSegment::ListEntry { entry: 1, para: 1 })
+            .child(PathSegment::ListEntry { entry: 1, para: 0 });
+        editor.set_cursor(DocumentPosition::at(c2.clone(), 2));
+        editor.set_selection(DocumentPosition::at(p_item, 0), DocumentPosition::at(c2, 2));
+        editor.indent().unwrap();
+        assert_eq!(md(&editor), "- x\n  \n  - p\n    \n    - c1\n    - c2");
     }
 
     #[test]

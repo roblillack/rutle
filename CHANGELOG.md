@@ -246,6 +246,16 @@ While pre-1.0, the minor version is bumped for breaking changes.
   paragraph vec (and `para_at`, the read-side walk, descends into one too, so the
   list toggles see a list nested in a definition at all).
 
+- Tab / Shift-Tab over a selection that covers an item *and* its subitems no
+  longer flattens the nesting. Every item in the selection was shifted on its
+  own, so a subitem moved one level out at the same time as its parent — and the
+  two steps are not the same step: the parent left its container while the
+  subitem only lost a level, landing the two side by side. An item inside another
+  item the selection covers now rides along with it, so the whole selected
+  subtree moves one level and keeps the shape the author built. Shift-Tab on a
+  selected checklist inside a definition is where this showed: the subitems came
+  out level with their parents.
+
 ## [0.5.0] - 2026-07-08
 
 ### Changed
