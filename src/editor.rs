@@ -4908,6 +4908,87 @@ mod tests {
         assert_eq!(md(&editor), "- one\n- two\n  \n  - sub");
     }
 
+    /// "term / : DEFINITION" with a checklist in the definition: `BULLET`, then
+    /// `x CHECKLIST` holding `SUBCHECKLIST`.
+    const CHECKLIST_IN_DEFINITION: &str =
+        "term\n: DEFINITION\n  \n  - [ ] BULLET\n  - [ ] x CHECKLIST\n    - [ ] SUBCHECKLIST";
+
+    /// The item holding `x CHECKLIST` in [`CHECKLIST_IN_DEFINITION`].
+    fn checklist_in_definition_item() -> TreePath {
+        TreePath::root(0)
+            .child(PathSegment::DefinitionPara { item: 0, para: 1 })
+            .child(PathSegment::ChecklistItem(1))
+    }
+
+    #[test]
+    fn enter_at_a_checklist_items_start_moves_it_down_with_its_subitems() {
+        // All of the text goes to the new item, so its subitems go with it: an empty item
+        // appears above and the item the caret is in shifts down whole. Leaving the subitems
+        // behind would sandwich them between the empty item and their own text.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document(CHECKLIST_IN_DEFINITION));
+        editor.set_cursor(DocumentPosition::at(checklist_in_definition_item(), 0));
+        editor.insert_newline().unwrap();
+        assert_eq!(
+            md(&editor),
+            "term\n: DEFINITION\n  \n  - [ ] BULLET\n  - [ ] \n  - [ ] x CHECKLIST\n    - [ ] SUBCHECKLIST"
+        );
+        assert_eq!(editor.leaf_plain_text(&editor.cursor().path), "x CHECKLIST");
+    }
+
+    #[test]
+    fn enter_mid_checklist_item_keeps_the_subitems_under_the_text_above_them() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document(CHECKLIST_IN_DEFINITION));
+        editor.set_cursor(DocumentPosition::at(checklist_in_definition_item(), 1));
+        editor.insert_newline().unwrap();
+        assert_eq!(
+            md(&editor),
+            "term\n: DEFINITION\n  \n  - [ ] BULLET\n  - [ ] x\n  - [ ] &emsp14;CHECKLIST\n    - [ ] SUBCHECKLIST"
+        );
+    }
+
+    #[test]
+    fn enter_at_a_checklist_items_end_leaves_its_subitems_with_it() {
+        // The new item gets none of the text, so it is a fresh sibling after the whole
+        // subtree rather than the item's continuation — it must not take the subitems.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("- [ ] two\n  - [ ] sub"));
+        editor.set_cursor(DocumentPosition::at(
+            TreePath::root(0).child(PathSegment::ChecklistItem(0)),
+            3,
+        ));
+        editor.insert_newline().unwrap();
+        assert_eq!(md(&editor), "- [ ] two\n  - [ ] sub\n- [ ]");
+    }
+
+    #[test]
+    fn enter_in_a_bullet_item_moves_its_sublist_with_the_text() {
+        // The same rule for a list entry, whose body is its own paragraph vec: at the start
+        // the sublist follows the text down, at the end it stays with the text above it.
+        let text = |t: &str| Paragraph::new_text().with_content(vec![Span::new_text(t)]);
+        let with_sublist = || Document {
+            paragraphs: vec![Paragraph::new_unordered_list().with_entries(vec![vec![
+                text("two"),
+                Paragraph::new_unordered_list().with_entries(vec![vec![text("sub")]]),
+            ]])],
+            ..Default::default()
+        };
+        let item = TreePath::root(0).child(PathSegment::ListEntry { entry: 0, para: 0 });
+
+        let mut at_start = Editor::new();
+        at_start.set_document(with_sublist());
+        at_start.set_cursor(DocumentPosition::at(item.clone(), 0));
+        at_start.insert_newline().unwrap();
+        assert_eq!(md(&at_start), "- \n- two\n  \n  - sub");
+
+        let mut at_end = Editor::new();
+        at_end.set_document(with_sublist());
+        at_end.set_cursor(DocumentPosition::at(item, 3));
+        at_end.insert_newline().unwrap();
+        assert_eq!(md(&at_end), "- two\n  \n  - sub\n-");
+    }
+
     #[test]
     fn outdent_lifts_quote_child_out() {
         let mut editor = Editor::new();

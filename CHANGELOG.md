@@ -267,6 +267,17 @@ While pre-1.0, the minor version is bumped for breaking changes.
   are inserted just after the paragraph they merged into, instead of standing
   under an item with none of their text left.
 
+- Enter inside a list item now keeps the item's body with its text. A checklist
+  item's subitems live inside the item, so they stayed with the half that kept
+  the item struct: pressing Enter at the start of an item — where all of the text
+  moves to the new item below — left the subitems hanging under the empty item
+  above, sandwiched between an empty line and their own text. They now follow the
+  text, as a list entry's continuation paragraphs and sublists already did.
+  The other end of that rule is new for both kinds: when the new item gets *none*
+  of the text (Enter at the very end of a line) it is a fresh sibling rather than
+  the item's continuation, so it no longer takes the body along — a sublist stays
+  under the line it belongs to instead of moving to the empty item below it.
+
 ## [0.5.0] - 2026-07-08
 
 ### Changed

@@ -173,6 +173,11 @@ pub fn split_leaf(doc: &mut Document, path: &TreePath, offset: usize) -> Option<
     let runs = tree_walk::leaf_spans(doc, path).map(|_| tree_walk::leaf_inline(doc, path))?;
     let (left, right) = split_runs(&runs, offset);
     tree_walk::set_leaf_inline(doc, path, &left);
+    // Whether the new leaf gets any of the text. It does not when Enter is pressed at the very
+    // end of the leaf, which is what tells "split this line" apart from "add one after it" —
+    // and so whether an item's body (subitems, continuation paragraphs) belongs with the new
+    // item or stays with the text it was written under.
+    let carries_text = right.iter().any(|c| c.text_len() > 0);
 
     let last = path.0.last()?.clone();
     let pp = parent_path(path);
@@ -198,9 +203,10 @@ pub fn split_leaf(doc: &mut Document, path: &TreePath, offset: usize) -> Option<
                 Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
             ) = node_at_mut(doc, &pp)?
             {
-                // The new entry takes the right half plus any continuation paragraphs of
-                // the original entry; its first paragraph keeps the split leaf's kind.
-                let continuation = if para < entries.get(entry)?.len() {
+                // The new entry takes the right half; the paragraphs below the split one
+                // follow the text into it, so a sublist stays under the line it belongs to.
+                // Its first paragraph keeps the split leaf's kind.
+                let continuation = if carries_text && para < entries.get(entry)?.len() {
                     entries[entry].split_off(para + 1)
                 } else {
                     Vec::new()
@@ -217,13 +223,22 @@ pub fn split_leaf(doc: &mut Document, path: &TreePath, offset: usize) -> Option<
                 None
             }
         }
+        // A checklist item's subitems live *inside* it rather than beside it, so they have to
+        // be handed over explicitly — they follow the text into the new item exactly as a list
+        // entry's continuation paragraphs do.
         PathSegment::ChecklistItem(c) => {
-            let new_item = ChecklistItem::new(false).with_content(inline_to_spans(&right));
+            let mut new_item = ChecklistItem::new(false).with_content(inline_to_spans(&right));
             match node_at_mut(doc, &pp)? {
                 NodeMut::Para(Paragraph::Checklist { items }) => {
+                    if carries_text {
+                        new_item.children = std::mem::take(&mut items.get_mut(c)?.children);
+                    }
                     items.insert(c + 1, new_item);
                 }
                 NodeMut::Check(item) => {
+                    if carries_text {
+                        new_item.children = std::mem::take(&mut item.children.get_mut(c)?.children);
+                    }
                     item.children.insert(c + 1, new_item);
                 }
                 _ => return None,
@@ -248,7 +263,6 @@ pub fn split_leaf(doc: &mut Document, path: &TreePath, offset: usize) -> Option<
             if term >= it.terms.len() {
                 return None;
             }
-            let carries_text = right.iter().any(|c| c.text_len() > 0);
             if !carries_text && it.definition.is_empty() {
                 it.definition.push(Paragraph::new_text());
                 return Some(pp.child(PathSegment::DefinitionPara { item, para: 0 }));
