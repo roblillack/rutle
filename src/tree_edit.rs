@@ -938,53 +938,114 @@ pub fn list_node_kind(p: &Paragraph) -> Option<ListKind> {
     }
 }
 
-/// Fold a run of top-level paragraphs into a single list/checklist node of `target` kind.
-/// Existing list/checklist nodes contribute their items (remapped to the target kind); every
-/// other paragraph becomes one item, flattened to plain text (dropping heading/code styling) —
+/// Fold a run of top-level paragraphs into a list/checklist of `target` kind.
+///
+/// Existing list/checklist nodes contribute their items (remapped to the target kind); a quote
+/// contributes its children, recursively, so quoted paragraphs become items of their own; every
+/// leaf paragraph becomes one item, flattened to plain text (dropping heading/code styling) —
 /// the same flattening a single-paragraph list toggle performs.
-pub fn paragraphs_into_list(paragraphs: Vec<Paragraph>, target: ListKind) -> Paragraph {
-    match target {
-        ListKind::Checklist => {
-            let mut items: Vec<ChecklistItem> = Vec::new();
-            for p in paragraphs {
-                match p {
-                    Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries } => {
-                        items.extend(entries.into_iter().map(entry_to_checklist_item));
-                    }
-                    Paragraph::Checklist { items: its } => items.extend(its),
-                    other => {
-                        items.push(ChecklistItem::new(false).with_content(other.content().to_vec()))
-                    }
+///
+/// The result is normally a single node, but a table has no item representation — a checklist
+/// item holds inline spans only, and a table inside a list entry does not render with its
+/// marker — so it stays as it is and splits the run into several nodes rather than being
+/// dropped. Callers therefore splice the returned paragraphs in; the vector is never empty.
+pub fn paragraphs_into_lists(paragraphs: Vec<Paragraph>, target: ListKind) -> Vec<Paragraph> {
+    // A quote owns no inline content of its own, so flatten it to the paragraphs it holds
+    // instead of turning it into one empty item.
+    let paragraphs = dissolve_quotes(paragraphs);
+    let ordered = target == ListKind::Ordered;
+    let mut out: Vec<Paragraph> = Vec::new();
+    // Items collected for the list currently being built, as entries (checklist items are
+    // derived from them on flush, so an existing checklist's checked states are kept verbatim
+    // in `items` instead).
+    let mut entries: Vec<Vec<Paragraph>> = Vec::new();
+    let mut items: Vec<ChecklistItem> = Vec::new();
+    // Close off the list being built (if it has any item) so the next paragraph starts a new one.
+    fn flush(
+        out: &mut Vec<Paragraph>,
+        entries: &mut Vec<Vec<Paragraph>>,
+        items: &mut Vec<ChecklistItem>,
+        target: ListKind,
+        ordered: bool,
+    ) {
+        match target {
+            ListKind::Checklist => {
+                if !items.is_empty() {
+                    out.push(
+                        Paragraph::new_checklist().with_checklist_items(std::mem::take(items)),
+                    );
                 }
             }
-            Paragraph::new_checklist().with_checklist_items(items)
-        }
-        ListKind::Ordered | ListKind::Unordered => {
-            let ordered = target == ListKind::Ordered;
-            let mut entries: Vec<Vec<Paragraph>> = Vec::new();
-            for p in paragraphs {
-                match p {
-                    Paragraph::OrderedList { entries: es }
-                    | Paragraph::UnorderedList { entries: es } => entries.extend(es),
-                    Paragraph::Checklist { items } => entries.extend(
-                        items
-                            .into_iter()
-                            .map(|it| checklist_item_to_entry(it, ordered)),
-                    ),
-                    other => entries.push(vec![
-                        Paragraph::new_text().with_content(other.content().to_vec()),
-                    ]),
+            _ => {
+                if !entries.is_empty() {
+                    out.push(new_list(ordered, std::mem::take(entries)));
                 }
             }
-            new_list(ordered, entries)
         }
     }
+
+    for p in paragraphs {
+        match (target, p) {
+            // A table cannot become an item of any kind: leave it standing between two lists
+            // instead of losing its rows.
+            (_, table @ Paragraph::Table { .. }) => {
+                flush(&mut out, &mut entries, &mut items, target, ordered);
+                out.push(table);
+            }
+            (ListKind::Checklist, p) => match p {
+                Paragraph::OrderedList { entries: es }
+                | Paragraph::UnorderedList { entries: es } => {
+                    items.extend(es.into_iter().map(entry_to_checklist_item));
+                }
+                Paragraph::Checklist { items: its } => items.extend(its),
+                other => {
+                    items.push(ChecklistItem::new(false).with_content(other.content().to_vec()))
+                }
+            },
+            (_, p) => match p {
+                Paragraph::OrderedList { entries: es }
+                | Paragraph::UnorderedList { entries: es } => entries.extend(es),
+                Paragraph::Checklist { items: its } => entries.extend(
+                    its.into_iter()
+                        .map(|it| checklist_item_to_entry(it, ordered)),
+                ),
+                other => entries.push(vec![
+                    Paragraph::new_text().with_content(other.content().to_vec()),
+                ]),
+            },
+        }
+    }
+    flush(&mut out, &mut entries, &mut items, target, ordered);
+    // A run that contributed no item at all (a lone table) still has to come back, and an empty
+    // run keeps the old behaviour of producing one empty list node.
+    if out.is_empty() {
+        out.push(match target {
+            ListKind::Checklist => Paragraph::new_checklist(),
+            _ => new_list(ordered, Vec::new()),
+        });
+    }
+    out
+}
+
+/// Replace every quote in `paragraphs` with the paragraphs it holds, recursively. Used before a
+/// list/checklist conversion: a quote has no inline content of its own, so converting it as one
+/// paragraph would yield an empty item and drop everything inside it. Quotes nested inside list
+/// entries are left alone — only the run's own paragraphs are dissolved.
+fn dissolve_quotes(paragraphs: Vec<Paragraph>) -> Vec<Paragraph> {
+    let mut out: Vec<Paragraph> = Vec::new();
+    for p in paragraphs {
+        match p {
+            Paragraph::Quote { children } => out.extend(dissolve_quotes(children)),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Expand a run of top-level paragraphs, replacing every list/checklist node with its items as
 /// plain paragraphs (an entry's first paragraph loses its bullet; continuation paragraphs and
 /// nested sublists are lifted out alongside it). Non-list paragraphs pass through unchanged.
-/// The inverse of [`paragraphs_into_list`]; mirrors how a single list is unwrapped.
+/// The inverse of [`paragraphs_into_lists`]; mirrors how a single list is unwrapped.
 pub fn lists_into_paragraphs(paragraphs: Vec<Paragraph>) -> Vec<Paragraph> {
     let mut out: Vec<Paragraph> = Vec::new();
     for p in paragraphs {
@@ -993,7 +1054,7 @@ pub fn lists_into_paragraphs(paragraphs: Vec<Paragraph>) -> Vec<Paragraph> {
                 for entry in entries {
                     let mut paras = entry.into_iter();
                     if let Some(first) = paras.next() {
-                        out.push(Paragraph::new_text().with_content(first.content().to_vec()));
+                        out.push(delisted_paragraph(first));
                     }
                     out.extend(paras);
                 }
@@ -1013,7 +1074,7 @@ pub fn lists_into_paragraphs(paragraphs: Vec<Paragraph>) -> Vec<Paragraph> {
 }
 
 /// Wrap a run of paragraphs into a single definition list: each paragraph becomes one
-/// item, mirroring how [`paragraphs_into_list`] gives each paragraph its own list item.
+/// item, mirroring how [`paragraphs_into_lists`] gives each paragraph its own list item.
 /// A paragraph that owns inline content becomes that item's *term*, with the definition
 /// left empty for the author to fill in (Enter at the end of a term opens it — see
 /// [`split_leaf`]). A paragraph that owns none — a nested list, table or rule — has no
@@ -1049,15 +1110,78 @@ pub fn definition_list_into_paragraphs(items: Vec<DefinitionItem>) -> Vec<Paragr
     out
 }
 
+/// One paragraph as it looks after being lifted out of a list entry: a leaf loses its bullet and
+/// becomes plain text (dropping heading/code styling, as everywhere else), while a container — a
+/// quote, table or nested list — is kept whole. Flattening a container through `content()`, which
+/// is empty for one, would silently drop everything it holds.
+pub(crate) fn delisted_paragraph(p: Paragraph) -> Paragraph {
+    if p.is_leaf() {
+        Paragraph::new_text().with_content(p.content().to_vec())
+    } else {
+        p
+    }
+}
+
+/// The inline spans to represent `p` with inside a span-only sink (a checklist item). Leaves give
+/// their own spans; a container owns none, so its descendants' text is joined instead — lossy in
+/// structure, but never silently empty.
+pub(crate) fn paragraph_as_spans(p: &Paragraph) -> Vec<Span> {
+    fn push_text(out: &mut Vec<Span>, spans: &[Span]) {
+        if spans.is_empty() {
+            return;
+        }
+        if !out.is_empty() {
+            out.push(Span::new_text(" "));
+        }
+        out.extend(spans.iter().cloned());
+    }
+    fn walk(out: &mut Vec<Span>, p: &Paragraph) {
+        match p {
+            Paragraph::Quote { children } => children.iter().for_each(|c| walk(out, c)),
+            Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries } => entries
+                .iter()
+                .flat_map(|e| e.iter())
+                .for_each(|c| walk(out, c)),
+            Paragraph::Checklist { items } => {
+                fn walk_items(out: &mut Vec<Span>, items: &[ChecklistItem]) {
+                    for item in items {
+                        push_text(out, &item.content);
+                        walk_items(out, &item.children);
+                    }
+                }
+                walk_items(out, items);
+            }
+            Paragraph::Table { rows } => {
+                for row in rows {
+                    for cell in &row.cells {
+                        push_text(out, &cell.content);
+                    }
+                }
+            }
+            leaf => push_text(out, leaf.content()),
+        }
+    }
+    let mut out = Vec::new();
+    walk(&mut out, p);
+    out
+}
+
 /// Convert one ordered/unordered list entry into a checklist item: the entry's first
 /// paragraph supplies the item text, and any continuation paragraphs / nested sublists
 /// become nested checklist children.
 fn entry_to_checklist_item(entry: Vec<Paragraph>) -> ChecklistItem {
-    let mut paras = entry.into_iter();
-    let content = paras
-        .next()
-        .map(|p| p.content().to_vec())
-        .unwrap_or_default();
+    // A quote as the entry's body has no inline content of its own; its paragraphs supply the
+    // item text and children instead of the item coming out empty.
+    let mut paras = dissolve_quotes(entry).into_iter().peekable();
+    // The entry's first paragraph supplies the item text — unless it is itself a list, which has
+    // no text of its own and folds into the item's children below.
+    let content = match paras.peek() {
+        Some(p) if list_node_kind(p).is_none() => {
+            let first = paras.next().unwrap_or_else(Paragraph::new_text);
+            paragraph_as_spans(&first)
+        }
+        _ => Vec::new(),
+    };
     let mut item = ChecklistItem::new(false).with_content(content);
     for p in paras {
         match p {
@@ -1068,7 +1192,7 @@ fn entry_to_checklist_item(entry: Vec<Paragraph>) -> ChecklistItem {
             Paragraph::Checklist { items } => item.children.extend(items),
             other => item
                 .children
-                .push(ChecklistItem::new(false).with_content(other.content().to_vec())),
+                .push(ChecklistItem::new(false).with_content(paragraph_as_spans(&other))),
         }
     }
     item
@@ -2117,7 +2241,7 @@ pub fn dissolve_container(doc: &mut Document, container_path: &TreePath) -> Opti
             for entry in std::mem::take(entries) {
                 let mut paras = entry.into_iter();
                 if let Some(first) = paras.next() {
-                    out.push(Paragraph::new_text().with_content(first.content().to_vec()));
+                    out.push(delisted_paragraph(first));
                 }
                 out.extend(paras);
             }
@@ -2276,7 +2400,7 @@ pub fn add_paragraphs_to_container(
         Paragraph::Checklist { items } => {
             let new_items = paras
                 .into_iter()
-                .map(|p| ChecklistItem::new(false).with_content(p.content().to_vec()));
+                .map(|p| ChecklistItem::new(false).with_content(paragraph_as_spans(&p)));
             if at_start {
                 items.splice(0..0, new_items);
             } else {

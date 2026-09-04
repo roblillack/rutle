@@ -158,9 +158,9 @@ pub struct Editor {
     last_edit_kind: Option<UndoKind>,
     last_edit_time: Option<Instant>,
     /// Whether reveal-codes mode is active. When on, inline-style boundaries are
-    /// shown as `[Bold>` / `<Bold]` tags by the display, and backspace/delete next
+    /// shown as opening/closing tags by the display, and backspace/delete next
     /// to such a tag removes the style instead of editing text. Off by default, so
-    /// frontends that never enable it (the GUI) are wholly unaffected.
+    /// frontends that never enable it are wholly unaffected.
     reveal_codes: bool,
     /// While reveal codes is on, how many of the inline-style tags rendered at
     /// the cursor's byte offset the caret sits *past* (0 = before all of them).
@@ -2404,8 +2404,10 @@ impl Editor {
         }
     }
 
-    /// Convert the selected top-level paragraph(s) into one quote, flattening each to plain
-    /// text (dropping heading/code type) — mirrors how lists convert. Top-level only.
+    /// Convert the selected top-level paragraph(s) into one quote, flattening each leaf to plain
+    /// text (dropping heading/code type) — mirrors how lists convert. Containers (lists, tables,
+    /// nested quotes) become quote children as they are, since a quote can hold any paragraph.
+    /// Top-level only.
     fn convert_selection_to_quote(&mut self) -> EditResult {
         let (start, end) = self.selection_or_cursor_range();
         let (Some(s), Some(e)) = (top_index(&start.path), top_index(&end.path)) else {
@@ -2422,7 +2424,7 @@ impl Editor {
         let drained: Vec<Paragraph> = self.tdoc.paragraphs.drain(s..=e).collect();
         let children: Vec<Paragraph> = drained
             .into_iter()
-            .map(|p| Paragraph::new_text().with_content(p.content().to_vec()))
+            .map(tree_edit::delisted_paragraph)
             .collect();
         self.tdoc
             .paragraphs
@@ -2473,10 +2475,11 @@ impl Editor {
                 },
             ),
             tree_edit::ContainerKind::Checklist => {
-                // Checklist items are span-only: concatenate the paragraphs' spans.
+                // Checklist items are span-only: concatenate the paragraphs' text, descending
+                // into containers so nothing is dropped on the way in.
                 let mut content: Vec<Span> = Vec::new();
                 for p in &drained {
-                    content.extend(p.content().iter().cloned());
+                    content.extend(tree_edit::paragraph_as_spans(p));
                 }
                 (
                     Paragraph::new_checklist().with_checklist_items(vec![
@@ -2855,41 +2858,26 @@ impl Editor {
         if s > e || e >= self.tdoc.paragraphs.len() {
             return Ok(());
         }
-        let cursor_rel = self
-            .cursor_top_index()
-            .map(|ci| ci.saturating_sub(s))
+        // Which leaf of the range does the caret sit in? The conversion keeps the leaves in
+        // document order, so the same ordinal identifies the caret's leaf afterwards — even
+        // where the leaf count per paragraph changes (a quote contributing several items).
+        let cursor_leaf = leaves_of_range(&self.tdoc, s, e)
+            .iter()
+            .position(|p| *p == self.cursor.path)
             .unwrap_or(0);
         let offset = self.cursor.offset;
         let drained: Vec<Paragraph> = self.tdoc.paragraphs.drain(s..=e).collect();
+        let new_nodes = tree_edit::paragraphs_into_lists(drained, target);
+        let count = new_nodes.len();
+        self.tdoc.paragraphs.splice(s..s, new_nodes);
 
-        let new_node = if checklist {
-            let items = drained
-                .into_iter()
-                .map(|p| ChecklistItem::new(false).with_content(p.content().to_vec()))
-                .collect();
-            Paragraph::new_checklist().with_checklist_items(items)
-        } else {
-            let entries: Vec<Vec<Paragraph>> = drained
-                .into_iter()
-                .map(|p| vec![Paragraph::new_text().with_content(p.content().to_vec())])
-                .collect();
-            if ordered {
-                Paragraph::new_ordered_list().with_entries(entries)
-            } else {
-                Paragraph::new_unordered_list().with_entries(entries)
-            }
-        };
-        self.tdoc.paragraphs.insert(s, new_node);
-
-        let leaf_seg = if checklist {
-            PathSegment::ChecklistItem(cursor_rel)
-        } else {
-            PathSegment::ListEntry {
-                entry: cursor_rel,
-                para: 0,
-            }
-        };
-        self.cursor = DocumentPosition::at(TreePath::root(s).child(leaf_seg), offset);
+        let leaves = leaves_of_range(&self.tdoc, s, s + count.saturating_sub(1));
+        let path = leaves
+            .get(cursor_leaf)
+            .or_else(|| leaves.last())
+            .cloned()
+            .unwrap_or_else(|| TreePath::root(s));
+        self.cursor = DocumentPosition::at(path, offset);
         self.normalize_cursor();
         self.trigger_paragraph_change();
         // The freshly wrapped list may abut a same-kind sibling (e.g. a paragraph turned
@@ -3007,13 +2995,13 @@ impl Editor {
             .iter()
             .all(|p| tree_edit::list_node_kind(p) == Some(target));
 
-        let (first, last) = if all_target {
+        let replaced = if all_target {
             // Toggle off: expand every list in the range back into plain paragraphs.
             let drained: Vec<Paragraph> = self.tdoc.paragraphs.drain(s..=e).collect();
             let expanded = tree_edit::lists_into_paragraphs(drained);
-            let last = s + expanded.len().saturating_sub(1);
+            let count = expanded.len();
             self.tdoc.paragraphs.splice(s..s, expanded);
-            (TreePath::root(s), TreePath::root(last))
+            count
         } else {
             // Apply: also absorb any same-kind list sibling immediately adjacent to the range,
             // so the outcome is one contiguous list (adjacent same-kind lists are a single node
@@ -3027,23 +3015,17 @@ impl Editor {
                 e += 1;
             }
             let drained: Vec<Paragraph> = self.tdoc.paragraphs.drain(s..=e).collect();
-            let new_node = tree_edit::paragraphs_into_list(drained, target);
-            let item_count = list_item_count(&new_node);
-            self.tdoc.paragraphs.insert(s, new_node);
-            let leaf = |item: usize| match target {
-                tree_edit::ListKind::Checklist => {
-                    TreePath::root(s).child(PathSegment::ChecklistItem(item))
-                }
-                _ => TreePath::root(s).child(PathSegment::ListEntry {
-                    entry: item,
-                    para: 0,
-                }),
-            };
-            (leaf(0), leaf(item_count.saturating_sub(1)))
+            // Usually one list node, but a block with no item representation (a table) stays
+            // whole and splits the run rather than being dropped.
+            let new_nodes = tree_edit::paragraphs_into_lists(drained, target);
+            let count = new_nodes.len();
+            self.tdoc.paragraphs.splice(s..s, new_nodes);
+            count
         };
 
-        // Select the whole transformed region; the cursor rides its end. Endpoints are clamped
-        // to real leaves (`last` may address a list node in the delist case).
+        // Select the whole transformed region; the cursor rides its end.
+        let (first, last) = leaf_bounds_of_range(&self.tdoc, s, s + replaced.saturating_sub(1))
+            .unwrap_or_else(|| (TreePath::root(s), TreePath::root(s)));
         let start = tree_walk::clamp_position(&self.tdoc, &DocumentPosition::at(first, 0));
         let end =
             tree_walk::clamp_position_forward(&self.tdoc, &DocumentPosition::at(last, usize::MAX));
@@ -3098,8 +3080,7 @@ impl Editor {
                     }
                     let mut paras = entry.into_iter();
                     if let Some(first) = paras.next() {
-                        paragraphs
-                            .push(Paragraph::new_text().with_content(first.content().to_vec()));
+                        paragraphs.push(tree_edit::delisted_paragraph(first));
                     }
                     paragraphs.extend(paras);
                 }
@@ -3478,14 +3459,19 @@ fn top_para_index(path: &TreePath) -> Option<usize> {
     }
 }
 
-/// The number of items (list entries or checklist items) in a list/checklist node; `0` for any
-/// other paragraph.
-fn list_item_count(p: &Paragraph) -> usize {
-    match p {
-        Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries } => entries.len(),
-        Paragraph::Checklist { items } => items.len(),
-        _ => 0,
-    }
+/// Every leaf path inside the top-level paragraphs `s..=e`, in document order.
+fn leaves_of_range(doc: &Document, s: usize, e: usize) -> Vec<TreePath> {
+    tree_walk::leaf_paths(doc)
+        .into_iter()
+        .filter(|p| top_para_index(p).is_some_and(|i| i >= s && i <= e))
+        .collect()
+}
+
+/// The first and last leaf path inside the top-level paragraphs `s..=e`, or `None` when the
+/// range holds no leaf at all (an empty container).
+fn leaf_bounds_of_range(doc: &Document, s: usize, e: usize) -> Option<(TreePath, TreePath)> {
+    let leaves = leaves_of_range(doc, s, e);
+    Some((leaves.first()?.clone(), leaves.last()?.clone()))
 }
 
 /// The index a path segment addresses within its container (the entry for a list segment,
@@ -5198,6 +5184,104 @@ mod tests {
         assert!(editor.selection().is_some());
         editor.toggle_ordered_list().unwrap();
         assert_eq!(md(&editor), "first\n\nsecond\n\nthird");
+    }
+
+    #[test]
+    fn toggle_bullet_over_range_with_quote_keeps_quoted_paragraphs() {
+        // A quote owns no inline content of its own, so converting it as a single paragraph used
+        // to produce one empty bullet and silently drop everything it held.
+        assert_range_toggle_reproducible(
+            "first\n\n> quoted one\n>\n> quoted two\n\nlast",
+            TreePath::root(0),
+            TreePath::root(2),
+            |e| e.toggle_list().unwrap(),
+            "- first\n- quoted one\n- quoted two\n- last",
+        );
+    }
+
+    #[test]
+    fn toggle_bullet_over_quote_at_document_end_keeps_its_text() {
+        // The reported symptom: everything below the first paragraph lived in a trailing quote,
+        // and bulleting the selection left just that paragraph plus one empty bullet.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("first\n\n> quoted one\n> quoted two"));
+        editor.select_all();
+        editor.toggle_list().unwrap();
+        assert_eq!(md(&editor), "- first\n- quoted one quoted two");
+    }
+
+    #[test]
+    fn toggle_bullet_over_range_with_nested_quote_content_keeps_all_of_it() {
+        // Lists inside the quote contribute their items; nesting inside those items survives.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document(
+            "head\n\n> intro\n>\n> - one\n>   - deep\n> - two",
+        ));
+        editor.select_all();
+        editor.toggle_list().unwrap();
+        assert_eq!(md(&editor), "- head\n- intro\n- one\n  \n  - deep\n- two");
+    }
+
+    #[test]
+    fn toggle_bullet_over_range_with_table_keeps_the_table_outside() {
+        // A table has no item representation, so it stays where it is and splits the list
+        // instead of collapsing into an empty bullet.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document(
+            "head\n\n| aa | bb |\n| -- | -- |\n| 11 | 22 |\n\ntail",
+        ));
+        editor.select_all();
+        editor.toggle_list().unwrap();
+        assert_eq!(
+            md(&editor),
+            "- head\n\n| aa  | bb  |\n|-----|-----|\n| 11  | 22  |\n\n- tail"
+        );
+    }
+
+    #[test]
+    fn toggle_checklist_over_range_with_table_leaves_the_table_outside() {
+        // Same for a checklist, whose items carry inline spans only.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document(
+            "head\n\n| aa |\n| -- |\n| 11 |\n\ntail",
+        ));
+        editor.select_all();
+        editor.toggle_checklist().unwrap();
+        assert_eq!(
+            md(&editor),
+            "- [ ] head\n\n| aa  |\n|-----|\n| 11  |\n\n- [ ] tail"
+        );
+    }
+
+    #[test]
+    fn toggle_bullet_over_a_lone_table_leaves_it_alone() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("| aa |\n| -- |\n| 11 |"));
+        editor.select_all();
+        editor.toggle_list().unwrap();
+        assert_eq!(md(&editor), "| aa  |\n|-----|\n| 11  |");
+    }
+
+    #[test]
+    fn toggle_quote_over_range_with_list_keeps_the_list() {
+        // Quoting a range mirrors the list conversions: leaves flatten to plain text, containers
+        // (here a bullet list) become quote children as they are.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("head\n\n- one\n- two\n\ntail"));
+        editor.select_all();
+        editor.toggle_quote().unwrap();
+        assert_eq!(md(&editor), "> head\n> \n> - one\n> - two\n> \n> tail");
+    }
+
+    #[test]
+    fn delisting_an_item_that_holds_a_quote_keeps_the_quote() {
+        // The reverse direction: lifting entries out of a list must not flatten a container
+        // entry through `content()` either.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("- plain\n- > quoted"));
+        editor.set_cursor(DocumentPosition::at(list_item_path_at(0, 0), 0));
+        editor.toggle_list().unwrap();
+        assert_eq!(md(&editor), "plain\n\n> quoted");
     }
 
     /// Select a whole block range from either end, apply a block type, and assert the result is

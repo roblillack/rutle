@@ -14,6 +14,7 @@ use crate::render_context::CaretLean;
 use crate::render_context::FontStyle;
 use crate::render_context::FontType;
 use crate::render_context::RenderContext;
+use crate::render_context::{RevealTag, RevealTagKind};
 use crate::theme::{FontSettings, Theme};
 
 /// A search match in the document
@@ -126,7 +127,7 @@ fn run_from_style(
         char_range,
         inline_index: Some(inline_index),
         checklist: None,
-        reveal_tag: false,
+        reveal_tag: None,
     }
 }
 
@@ -356,7 +357,7 @@ fn layout_styled_text(
                     char_range: (char_base, char_base + space_end),
                     inline_index: Some(inline_index),
                     checklist: None,
-                    reveal_tag: false,
+                    reveal_tag: None,
                 });
 
                 *current_x += space_width;
@@ -406,12 +407,44 @@ fn layout_styled_text(
     }
 }
 
-/// Place a reveal-codes tag (e.g. `[Bold>`) onto the current line as a
-/// zero-document-width, cursor-skipped run, wrapping to the next line if it
-/// doesn't fit. The tag occupies visual space — so following text wraps and the
-/// caret lands past it — but spans no document text: its `char_range` is the
-/// empty `(char_offset, char_offset)` and it carries no `inline_index`, which is
+/// Horizontal padding between a drawn reveal tag's label and the box around it,
+/// and the width of the box's pointed end — both scaled off the tag's font size
+/// so the shape keeps its proportions. Shared by layout (which sizes the run)
+/// and paint (which insets the label), so the two always agree.
+fn reveal_tag_metrics(font_size: u8) -> (i32, i32) {
+    let pad = (font_size as i32 * 3 / 10).max(3);
+    let point = (font_size as i32 * 4 / 10).max(4);
+    (pad, point)
+}
+
+/// Vertical placement of a drawn reveal tag on its line, as `(box top, box
+/// height)`. The label rests on the line's text baseline — `baseline` pixels
+/// below `line_top`, which is the *block's* font size, not the tag's — so a tag
+/// in a heading sits on the words it marks instead of floating at the top of the
+/// taller line. The box wraps the label from just above its ascent to just below
+/// its descent, capped to the line so tags on consecutive lines stay separate.
+fn reveal_tag_box(
+    line_top: i32,
+    line_height: i32,
+    baseline: i32,
+    font_size: i32,
+    descent: i32,
+) -> (i32, i32) {
+    let height = (font_size + descent - 1).min(line_height - 1);
+    (line_top + baseline - font_size + 1, height)
+}
+
+/// Place a reveal-codes tag onto the current line as a zero-document-width,
+/// cursor-skipped run, wrapping to the next line if it doesn't fit. The tag
+/// occupies visual space — so following text wraps and the caret lands past it —
+/// but spans no document text: its `char_range` is the empty
+/// `(char_offset, char_offset)` and it carries no `inline_index`, which is
 /// exactly the shape the cursor/column logic skips.
+///
+/// `shape` is `None` for a text tag (`label` already carries the `[Bold>`
+/// brackets) and `Some(kind)` for a drawn one (`label` is the bare name, the run
+/// is widened by the box's padding and point, and the run remembers `baseline` —
+/// the block's font size — so paint can sit the box on the text's baseline).
 #[allow(clippy::too_many_arguments)]
 fn push_reveal_tag(
     ctx: &mut dyn RenderContext,
@@ -425,12 +458,18 @@ fn push_reveal_tag(
     width: i32,
     line_height: i32,
     label: &str,
+    shape: Option<RevealTagKind>,
+    baseline: i32,
     char_offset: usize,
     block_idx: usize,
     style: ResolvedRunStyle,
 ) {
-    let tag_width =
+    let mut tag_width =
         ctx.text_width(label, style.font_type, style.font_style, style.font_size) as i32;
+    if shape.is_some() {
+        let (pad, point) = reveal_tag_metrics(style.font_size);
+        tag_width += 2 * pad + point;
+    }
     if *current_x + tag_width > start_x + width && *current_x > start_x {
         push_line(
             lines,
@@ -458,13 +497,18 @@ fn push_reveal_tag(
         char_range: (char_offset, char_offset),
         inline_index: None,
         checklist: None,
-        reveal_tag: true,
+        reveal_tag: Some(match shape {
+            Some(kind) => RevealTagRun::Shape { kind, baseline },
+            None => RevealTagRun::Text,
+        }),
     });
     *current_x += tag_width;
 }
 
-/// Emit the reveal tags at one boundary: end tags (`<Name]`, innermost first)
-/// then start tags (`[Name>`, outermost first), all at `char_offset`.
+/// Emit the reveal tags at one boundary: end tags (innermost first) then start
+/// tags (outermost first), all at `char_offset`, resting on the block's
+/// `baseline`. `text_tags` picks the classic bracketed text form (`<Bold]` /
+/// `[Bold>`) over the drawn tag shapes.
 #[allow(clippy::too_many_arguments)]
 fn emit_reveal_tags(
     ctx: &mut dyn RenderContext,
@@ -480,10 +524,25 @@ fn emit_reveal_tags(
     char_offset: usize,
     block_idx: usize,
     style: ResolvedRunStyle,
+    baseline: i32,
+    text_tags: bool,
     closes: &[RevealStyle],
     opens: &[RevealStyle],
 ) {
-    for s in closes {
+    let tags = closes
+        .iter()
+        .map(|s| (s, RevealTagKind::Close))
+        .chain(opens.iter().map(|s| (s, RevealTagKind::Open)));
+    for (s, kind) in tags {
+        let (label, shape) = if text_tags {
+            let bracketed = match kind {
+                RevealTagKind::Close => format!("<{}]", s.label()),
+                RevealTagKind::Open => format!("[{}>", s.label()),
+            };
+            (bracketed, None)
+        } else {
+            (s.label().to_string(), Some(kind))
+        };
         push_reveal_tag(
             ctx,
             lines,
@@ -495,25 +554,9 @@ fn emit_reveal_tags(
             start_x,
             width,
             line_height,
-            &format!("<{}]", s.label()),
-            char_offset,
-            block_idx,
-            style,
-        );
-    }
-    for s in opens {
-        push_reveal_tag(
-            ctx,
-            lines,
-            line_ranges,
-            line_wraps,
-            current_line,
-            current_x,
-            current_y,
-            start_x,
-            width,
-            line_height,
-            &format!("[{}>", s.label()),
+            &label,
+            shape,
+            baseline,
             char_offset,
             block_idx,
             style,
@@ -574,6 +617,20 @@ struct InlineContentLayout {
     y_after: i32,
 }
 
+/// How a reveal-codes tag run is painted: as the classic bracketed text
+/// (`[Bold>`, for backends that can only place glyphs) or as a drawn box with a
+/// pointed end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RevealTagRun {
+    Text,
+    Shape {
+        kind: RevealTagKind,
+        /// Distance from the line's top to the baseline the tag rests on (the
+        /// block's font size) — see [`reveal_tag_box`].
+        baseline: i32,
+    },
+}
+
 /// Checklist marker rendering metadata
 #[derive(Debug, Clone)]
 struct ChecklistVisual {
@@ -600,9 +657,10 @@ struct VisualRun {
     inline_index: Option<usize>,
     /// Checklist rendering info (if this run is a checklist marker)
     checklist: Option<ChecklistVisual>,
-    /// True for a reveal-codes tag run (`[Bold>`/`<Bold]`): a zero-document-width
-    /// decoration the caret can still step onto (see `cursor_reveal_stop`).
-    reveal_tag: bool,
+    /// Set for a reveal-codes tag run: a zero-document-width decoration the
+    /// caret can still step onto (see `cursor_reveal_stop`), painted either as
+    /// the classic bracketed text or as a drawn tag box.
+    reveal_tag: Option<RevealTagRun>,
 
     font_type: FontType,
     font_style: FontStyle,
@@ -1724,7 +1782,7 @@ impl Renderer {
                         char_range: (char_start, char_end),
                         inline_index: None,
                         checklist: None,
-                        reveal_tag: false,
+                        reveal_tag: None,
                     }];
                     let visual_char_end = self.compute_visual_char_end(&runs, char_end, false);
                     self.layout_lines.push(LayoutLine {
@@ -1893,7 +1951,7 @@ impl Renderer {
                         char_range: (0, 0),
                         inline_index: None,
                         checklist: None,
-                        reveal_tag: false,
+                        reveal_tag: None,
                     };
                 let mut runs = if self.theme.checkbox_text
                     && matches!(checkbox, Some(true))
@@ -1963,27 +2021,48 @@ impl Renderer {
 
                 let mut current_y = y;
 
-                // Merge bullet with first line
-                if !content_runs.is_empty() && !content_runs[0].is_empty() {
-                    let first_wrap = content_wraps.first().copied().unwrap_or(false);
-                    let first_range = content_ranges.first().copied().unwrap_or((0, 0));
-                    runs.append(&mut content_runs[0]);
+                // The marker shares the item's first visual line, which may legitimately be
+                // empty — an item whose content opens with a hard break, or an empty item. The
+                // remaining lines are laid out either way, so a leading blank line cannot swallow
+                // the rest of the item.
+                let first_range = content_ranges.first().copied().unwrap_or((0, 0));
+                let first_wrap = content_wraps.first().copied().unwrap_or(false);
+                if let Some(first_line) = content_runs.first_mut() {
+                    runs.append(first_line);
+                }
+                // Char range from the content runs alone (the marker run is not text).
+                let char_start = runs
+                    .iter()
+                    .skip(1)
+                    .map(|r| r.char_range.0)
+                    .min()
+                    .unwrap_or(first_range.0);
+                let char_end = runs
+                    .iter()
+                    .skip(1)
+                    .map(|r| r.char_range.1)
+                    .max()
+                    .unwrap_or(first_range.1);
+                let visual_char_end = self.compute_visual_char_end(&runs, char_end, first_wrap);
+                self.layout_lines.push(LayoutLine {
+                    y: current_y,
+                    height: default_line_height,
+                    base_x: content_start_x,
+                    block_index: block_idx,
+                    char_start,
+                    char_end,
+                    visual_char_end,
+                    runs,
+                });
+                current_y += default_line_height;
 
-                    // Calculate char range from content runs (skip bullet)
-                    let char_start = runs
-                        .iter()
-                        .skip(1)
-                        .map(|r| r.char_range.0)
-                        .min()
-                        .unwrap_or(first_range.0);
-                    let char_end = runs
-                        .iter()
-                        .skip(1)
-                        .map(|r| r.char_range.1)
-                        .max()
-                        .unwrap_or(first_range.1);
+                // Add remaining lines
+                for (idx, line_runs) in content_runs.iter().enumerate().skip(1) {
+                    let (char_start, char_end) = content_ranges.get(idx).copied().unwrap_or((0, 0));
+                    let wrapped = content_wraps.get(idx).copied().unwrap_or(false);
+                    let visual_char_end =
+                        self.compute_visual_char_end(line_runs, char_end, wrapped);
 
-                    let visual_char_end = self.compute_visual_char_end(&runs, char_end, first_wrap);
                     self.layout_lines.push(LayoutLine {
                         y: current_y,
                         height: default_line_height,
@@ -1992,41 +2071,7 @@ impl Renderer {
                         char_start,
                         char_end,
                         visual_char_end,
-                        runs,
-                    });
-                    current_y += default_line_height;
-
-                    // Add remaining lines
-                    for (idx, line_runs) in content_runs.iter().enumerate().skip(1) {
-                        let (char_start, char_end) =
-                            content_ranges.get(idx).copied().unwrap_or((0, 0));
-                        let wrapped = content_wraps.get(idx).copied().unwrap_or(false);
-                        let visual_char_end =
-                            self.compute_visual_char_end(line_runs, char_end, wrapped);
-
-                        self.layout_lines.push(LayoutLine {
-                            y: current_y,
-                            height: default_line_height,
-                            base_x: content_start_x,
-                            block_index: block_idx,
-                            char_start,
-                            char_end,
-                            visual_char_end,
-                            runs: line_runs.clone(),
-                        });
-                        current_y += default_line_height;
-                    }
-                } else {
-                    // Just bullet
-                    self.layout_lines.push(LayoutLine {
-                        y: current_y,
-                        height: default_line_height,
-                        base_x: content_start_x,
-                        block_index: block_idx,
-                        char_start: 0,
-                        char_end: 0,
-                        visual_char_end: 0,
-                        runs,
+                        runs: line_runs.clone(),
                     });
                     current_y += default_line_height;
                 }
@@ -2453,8 +2498,8 @@ impl Renderer {
             _ => self.theme.plain_text,
         };
 
-        // Reveal codes: surface inline-style boundaries as `[Bold>` / `<Bold]`
-        // tags interleaved with the text. The reconciler tracks the open tags so
+        // Reveal codes: surface inline-style boundaries as opening/closing tags
+        // interleaved with the text. The reconciler tracks the open tags so
         // a style stays open across an inner style's span (classic nesting). Off
         // unless the caller permits it (not for read-only table cells) and the
         // editor is in reveal mode.
@@ -2481,6 +2526,8 @@ impl Renderer {
                     char_offset,
                     block_idx,
                     reveal_style,
+                    base_font.font_size as i32,
+                    self.theme.reveal_tag_text,
                     &closes,
                     &opens,
                 );
@@ -2555,6 +2602,8 @@ impl Renderer {
                                     char_offset,
                                     block_idx,
                                     reveal_style,
+                                    base_font.font_size as i32,
+                                    self.theme.reveal_tag_text,
                                     &closes,
                                     &opens,
                                 );
@@ -2644,6 +2693,8 @@ impl Renderer {
                 char_offset,
                 block_idx,
                 reveal_style,
+                base_font.font_size as i32,
+                self.theme.reveal_tag_text,
                 &closes,
                 &[],
             );
@@ -3062,6 +3113,41 @@ impl Renderer {
 
                 let draw_y = line_top + run.font_size as i32;
 
+                // Reveal-codes tags drawn as shapes: paint the pointed box, then
+                // the bare label inside it. They carry no document text, so none
+                // of the selection/hover/search decorations below apply.
+                if let Some(RevealTagRun::Shape { kind, baseline }) = run.reveal_tag {
+                    let (pad, point) = reveal_tag_metrics(run.font_size);
+                    let (box_y, height) = reveal_tag_box(
+                        line_top,
+                        line.height,
+                        baseline,
+                        run.font_size as i32,
+                        descent,
+                    );
+                    ctx.draw_reveal_tag(RevealTag {
+                        x: draw_x,
+                        y: box_y,
+                        width: run.width,
+                        height,
+                        point,
+                        kind,
+                        fill: self.theme.reveal_tag_bg,
+                        border: self.theme.reveal_tag_border,
+                    });
+                    let label_x = draw_x
+                        + pad
+                        + match kind {
+                            RevealTagKind::Open => 0,
+                            RevealTagKind::Close => point,
+                        };
+                    ctx.set_color(run.font_color);
+                    // The label rides the line's baseline, not the tag's own
+                    // top-aligned one (`draw_y`), so it lines up with the text.
+                    ctx.draw_text(&run.text, label_x, line_top + baseline);
+                    continue;
+                }
+
                 // Draw inline highlight background for styles that specify a bgcolor
                 // (e.g., text highlight). Draw this first so selection can paint over it.
                 {
@@ -3407,7 +3493,7 @@ impl Renderer {
                 let mut anchored = false;
                 let mut passed = 0usize;
                 for run in &line.runs {
-                    if !(run.reveal_tag && run.char_range.0 == cursor.offset) {
+                    if !(run.reveal_tag.is_some() && run.char_range.0 == cursor.offset) {
                         continue;
                     }
                     if !anchored {
@@ -3417,9 +3503,9 @@ impl Renderer {
                     if passed >= stop {
                         break;
                     }
-                    x = run.x
-                        + ctx.text_width(&run.text, run.font_type, run.font_style, run.font_size)
-                            as i32;
+                    // The laid-out width, not the label's: a drawn tag's box is
+                    // wider than its text.
+                    x = run.x + run.width;
                     passed += 1;
                 }
             }
@@ -4344,7 +4430,7 @@ mod tests {
             d.layout_lines.iter().any(|l| {
                 l.char_start == l.char_end
                     && !l.runs.is_empty()
-                    && l.runs.iter().all(|r| r.reveal_tag)
+                    && l.runs.iter().all(|r| r.reveal_tag.is_some())
             })
         };
         let phantom_width = (60..=400).step_by(2).find(|&w| {
@@ -4385,6 +4471,172 @@ mod tests {
             "Down stalled before the trailing paragraph at {:?} (phantom width {w})",
             display.editor().cursor(),
         );
+    }
+
+    /// The reveal-tag runs of the first layout line, as `(text, width)`.
+    fn reveal_tag_runs(display: &Renderer) -> Vec<(String, i32)> {
+        display.layout_lines[0]
+            .runs
+            .iter()
+            .filter(|r| r.reveal_tag.is_some())
+            .map(|r| (r.text.clone(), r.width))
+            .collect()
+    }
+
+    #[test]
+    fn reveal_tag_box_rests_on_the_lines_baseline() {
+        // A paragraph tag (label font == block font) boxes the line as before…
+        let (top, height) = reveal_tag_box(100, 17, 14, 14, 4);
+        assert_eq!((top, height), (101, 16));
+
+        // …and in a heading, whose text is taller, the tag drops to the heading's
+        // baseline instead of floating at the top of the line: the label sits on
+        // it (line top + 24) with the box hugging the label, exactly as in the
+        // paragraph above.
+        let (top, height) = reveal_tag_box(100, 31, 24, 14, 4);
+        assert_eq!(top, 100 + 24 - 14 + 1, "one pixel above the label's ascent");
+        assert_eq!(height, 17);
+        assert!(
+            top + height <= 100 + 31,
+            "the box stays inside its line: {top}+{height}",
+        );
+    }
+
+    #[test]
+    fn reveal_tags_in_a_heading_sit_lower_than_in_a_paragraph() {
+        // The layout side of the same thing: a heading's tag run remembers the
+        // heading's font size as its baseline, a paragraph's its own.
+        let doc = crate::markdown_converter::markdown_to_document("# a **b**\n\nc **d**\n");
+        let mut display = Renderer::new(0, 0, 400, 300);
+        display.editor_mut().set_document(doc);
+        display.set_reveal_codes(true);
+        let mut ctx = TestRenderContext::new_with_focus();
+        display.layout(&mut ctx);
+
+        let baselines: Vec<i32> = display
+            .layout_lines
+            .iter()
+            .map(|line| {
+                line.runs
+                    .iter()
+                    .find_map(|r| match r.reveal_tag {
+                        Some(RevealTagRun::Shape { baseline, .. }) => Some(baseline),
+                        _ => None,
+                    })
+                    .expect("every line here carries a tag")
+            })
+            .collect();
+        assert_eq!(
+            baselines,
+            vec![
+                display.theme.header_level_1.font_size as i32,
+                display.theme.plain_text.font_size as i32,
+            ],
+        );
+    }
+
+    #[test]
+    fn default_reveal_tag_shape_tapers_to_its_tip() {
+        // The fallback shape (used by any backend without a polygon primitive)
+        // fills row by row: full width at the tip's row, pulled back by the
+        // point width at the top and bottom edges — on the right for an opening
+        // tag, on the left for a closing one.
+        let tag = RevealTag {
+            x: 10,
+            y: 20,
+            width: 40,
+            height: 9,
+            point: 4,
+            kind: RevealTagKind::Open,
+            fill: 0,
+            border: 0,
+        };
+
+        let mut ctx = TestRenderContext::new_with_focus();
+        ctx.draw_reveal_tag(tag);
+        assert_eq!(ctx.rects.len(), 9, "one filled row per pixel of height");
+        assert_eq!(
+            ctx.rects[0],
+            (10, 20, 36, 1),
+            "top row, right side cut back"
+        );
+        assert_eq!(ctx.rects[4], (10, 24, 40, 1), "the tip's row spans it all");
+        assert_eq!(ctx.rects[8], (10, 28, 36, 1), "bottom row, cut back again");
+
+        let mut ctx = TestRenderContext::new_with_focus();
+        ctx.draw_reveal_tag(RevealTag {
+            kind: RevealTagKind::Close,
+            ..tag
+        });
+        assert_eq!(ctx.rects[0], (14, 20, 36, 1), "top row, left side cut back");
+        assert_eq!(ctx.rects[4], (10, 24, 40, 1));
+    }
+
+    #[test]
+    fn reveal_tags_lay_out_as_boxed_labels() {
+        // Drawn tags carry the bare style name — the brackets are the shape —
+        // and reserve the box's padding and pointed end on top of the label.
+        let doc = crate::markdown_converter::markdown_to_document("a **b** c");
+        let mut display = Renderer::new(0, 0, 400, 300);
+        display.editor_mut().set_document(doc);
+        display.set_reveal_codes(true);
+        let mut ctx = TestRenderContext::new_with_focus();
+        display.layout(&mut ctx);
+
+        let size = display.theme.plain_text.font_size;
+        let (pad, point) = reveal_tag_metrics(size);
+        let label_width =
+            ctx.text_width("Bold", FontType::Content, FontStyle::Regular, size) as i32;
+        assert_eq!(
+            reveal_tag_runs(&display),
+            vec![
+                ("Bold".to_string(), label_width + 2 * pad + point),
+                ("Bold".to_string(), label_width + 2 * pad + point),
+            ],
+        );
+    }
+
+    #[test]
+    fn reveal_tags_stay_textual_for_cell_backends() {
+        // With `reveal_tag_text` on, tags keep the classic bracketed form and
+        // take exactly the width of that text — no box padding.
+        let doc = crate::markdown_converter::markdown_to_document("a **b** c");
+        let mut display = Renderer::new(0, 0, 400, 300);
+        display.theme.reveal_tag_text = true;
+        display.editor_mut().set_document(doc);
+        display.set_reveal_codes(true);
+        let mut ctx = TestRenderContext::new_with_focus();
+        display.layout(&mut ctx);
+
+        let size = display.theme.plain_text.font_size;
+        let open = ctx.text_width("[Bold>", FontType::Content, FontStyle::Regular, size) as i32;
+        let close = ctx.text_width("<Bold]", FontType::Content, FontStyle::Regular, size) as i32;
+        assert_eq!(
+            reveal_tag_runs(&display),
+            vec![("[Bold>".to_string(), open), ("<Bold]".to_string(), close)],
+        );
+    }
+
+    #[test]
+    fn caret_steps_over_the_whole_reveal_tag_box() {
+        // Stepping onto the far side of an opening tag must clear the drawn box,
+        // not just its label — otherwise the caret lands inside the shape.
+        let doc = crate::markdown_converter::markdown_to_document("**b**");
+        let mut display = Renderer::new(0, 0, 400, 300);
+        display.editor_mut().set_document(doc);
+        display.set_reveal_codes(true);
+        display.editor_mut().set_cursor(DocumentPosition::new(0, 0));
+        let mut ctx = TestRenderContext::new_with_focus();
+        display.layout(&mut ctx);
+
+        let (before, _) = display.cursor_screen_position(&mut ctx).unwrap();
+        // Right once: past the opening tag, still at offset 0.
+        display.editor_mut().move_cursor_right();
+        assert_eq!(display.editor().cursor().offset, 0);
+        let (after, _) = display.cursor_screen_position(&mut ctx).unwrap();
+
+        let tag_width = reveal_tag_runs(&display)[0].1;
+        assert_eq!(after - before, tag_width);
     }
 
     #[test]
@@ -4506,6 +4758,52 @@ mod tests {
         display.layout(&mut ctx);
         let (x, _, _) = display.get_cursor_visual_position(&mut ctx).unwrap();
         assert_eq!(x, display.theme.padding_horizontal + 10);
+    }
+
+    #[test]
+    fn list_item_starting_with_hard_break_keeps_every_line() {
+        // A list item whose content opens with a hard break has an empty first visual line —
+        // the marker's line. Every following line must still be laid out; the leading blank
+        // line used to make the whole item render as a bare bullet.
+        let mut block = Block::new(BlockType::ListItem {
+            ordered: false,
+            number: None,
+            checkbox: None,
+            depth: 0,
+        });
+        block.content.push(InlineContent::HardBreak);
+        block
+            .content
+            .push(InlineContent::Text(TextRun::plain("first line")));
+        block.content.push(InlineContent::HardBreak);
+        block
+            .content
+            .push(InlineContent::Text(TextRun::plain("second line")));
+
+        let mut display = make_display_with_block(block);
+        let mut ctx = TestRenderContext::new_with_focus();
+        display.layout(&mut ctx);
+
+        assert_eq!(
+            display.layout_lines.len(),
+            3,
+            "expected the marker line plus both text lines, got {:?}",
+            display
+                .layout_lines
+                .iter()
+                .map(|l| l.runs.iter().map(|r| r.text.clone()).collect::<String>())
+                .collect::<Vec<_>>()
+        );
+        let text_of = |i: usize| -> String {
+            display.layout_lines[i]
+                .runs
+                .iter()
+                .map(|r| r.text.clone())
+                .collect()
+        };
+        assert_eq!(text_of(0), "• ");
+        assert_eq!(text_of(1), "first line");
+        assert_eq!(text_of(2), "second line");
     }
 
     #[test]

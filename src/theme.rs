@@ -35,12 +35,20 @@ pub struct Theme {
     pub search_highlight_color: u32,
     pub search_current_highlight_color: u32,
 
-    /// Foreground / background of the inline reveal-codes tags (`[Bold>`,
-    /// `<Bold]`, …) drawn when reveal codes is enabled. Only consulted while
-    /// reveal codes is on (a Pure-only mode, off by default), so the defaults are
-    /// harmless for the GUI, which never turns it on.
+    /// Label / fill / outline colors of the inline reveal-codes tags drawn when
+    /// reveal codes is enabled. Only consulted while reveal codes is on (off by
+    /// default), so the defaults are harmless otherwise. `reveal_tag_border` is
+    /// unused when `reveal_tag_text` is on (text tags have no outline).
     pub reveal_tag_fg: u32,
     pub reveal_tag_bg: u32,
+    pub reveal_tag_border: u32,
+
+    /// Render reveal-codes tags as bracketed text (`[Bold>` / `<Bold]`) instead
+    /// of drawn tag shapes. Off by default: a pixel backend draws the pointed
+    /// WordPerfect-style box (see [`crate::render_context::RenderContext::draw_reveal_tag`]).
+    /// A cell backend turns this on, since the shape can't be drawn in a
+    /// character grid.
+    pub reveal_tag_text: bool,
 
     pub padding_vertical: i32,
     pub padding_horizontal: i32,
@@ -219,8 +227,10 @@ impl Default for Theme {
             highlight_color: 0xFFFF00FF,        // Yellow highlight color
             search_highlight_color: 0xFFE4B5FF, // Light orange for search matches
             search_current_highlight_color: 0xFFA500FF, // Orange for current match
-            reveal_tag_fg: 0x000000FF,          // Black tag text (GUI: unused)
-            reveal_tag_bg: 0xCCCCCCFF,          // Light gray tag fill (GUI: unused)
+            reveal_tag_fg: 0x000000FF,          // Black tag label
+            reveal_tag_bg: 0xDDDDD5FF,          // Light gray tag fill
+            reveal_tag_border: 0x77776FFF,      // Gray tag outline
+            reveal_tag_text: false,
 
             padding_vertical: 10,
             padding_horizontal: 25,
