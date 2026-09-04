@@ -1,0 +1,6 @@
+---
+source: tests/layout_snapshots.rs
+expression: "common::horizontal_rule_as_text(MODE)"
+extension: svg
+snapshot_kind: binary
+---

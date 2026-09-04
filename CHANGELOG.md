@@ -12,48 +12,83 @@ While pre-1.0, the minor version is bumped for breaking changes.
 
 ### Changed
 
-- Reveal-codes tags are now *drawn* as WordPerfect-style code boxes — an
-  outlined, filled box whose pointed end faces the text the style applies to
-  (right where it opens, left where it closes) — instead of being simulated with
-  the bracket text `[Bold>` / `<Bold]`. The shape comes from the new
-  `RenderContext::draw_reveal_tag`, which has a default implementation built
-  from the existing fill/line primitives, so a pixel backend gets the boxes
-  without doing anything; a backend with a polygon primitive can override it for
-  an antialiased shape. Tag runs are laid out wider than their label to make
-  room for the box's padding and point, and the caret steps over that full
-  width. A tag rests on its line's text baseline — the *block's* font size, not
-  the tag's — so tags in a heading sit on the words they mark instead of
-  floating at the top of the taller line. (#11)
-- New theme fields: `reveal_tag_border` (the box outline) and `reveal_tag_text`.
-  **A character-cell backend must set `reveal_tag_text = true`**, which keeps
-  the old bracketed-text tags — a box can't be drawn in a character grid.
-  `reveal_tag_bg` also lightened to `0xDDDDD5FF` to suit a filled, outlined box.
-  (#11)
-- `tree_edit::paragraphs_into_list` is now `tree_edit::paragraphs_into_lists` and
-  returns `Vec<Paragraph>`: a run can convert into more than one node when it
-  holds a block that cannot become an item (a table). (#13)
+- **Breaking:** the `tdoc` dependency is now `0.12` and the two block kinds it
+  introduces are supported. `BlockType` gained `HorizontalRule` and
+  `DefinitionTerm { depth }`, `PathSegment` gained `DefinitionTerm` and
+  `DefinitionPara`, `Theme` gained `horizontal_rule_color`,
+  `horizontal_rule_thickness`, `horizontal_rule_spacing`,
+  `horizontal_rule_as_text`, `definition_indent`, `definition_term_spacing` and
+  `definition_term`, and `tree_walk::LeafInfo` gained `definition_depth`.
+  Frontends need new match arms for the variants and, when constructing `Theme`
+  or `LeafInfo` literally, the new fields. (#12)
+  - **Horizontal rules** are non-editable leaves like tables: the caret can rest
+    on one, Backspace and Delete remove it, and `set_block_type` to a rule is a
+    no-op. `Editor::insert_horizontal_rule()` inserts one after the caret's
+    top-level block, splitting a paragraph around it when the caret is inside
+    its text. A rule is drawn as a line across the content column, or as
+    `tdoc`'s `───── • ─────` text ornament when `horizontal_rule_as_text` is
+    set.
+  - **Definition lists** are fully editable: terms and definition paragraphs are
+    ordinary leaves. Enter moves through the list one half at a time (at the end
+    of a term it opens the definition, in a definition it starts the next item)
+    and leaves the list from an empty term or definition. Tab and Shift-Tab move
+    a line between the two halves, or pull a list typed below the definition
+    list into its last definition and back out; `insert_continuation` adds
+    another paragraph to the same definition.
+    `set_block_type(BlockType::DefinitionTerm { .. })` wraps the selected
+    paragraphs into a definition list, one term each, or dissolves one back into
+    paragraphs; any other block type lifts the term or definition out of the
+    list before applying. Terms render in the `definition_term` font (bold by
+    default) and definitions indent by `definition_indent`.
+- `Editor::outdent` is the new Shift-Tab entry point, replacing direct calls to
+  `outdent_list_item`, which it still routes list items to. (#12)
+- Reveal-codes tags are now drawn as WordPerfect-style code boxes instead of the
+  bracket text `[Bold>` / `<Bold]`. `RenderContext::draw_reveal_tag` has a
+  default implementation built from the fill/line primitives, so a pixel backend
+  gets the boxes for free and can override it for an antialiased shape. Tags are
+  laid out wider than their label and rest on the block's text baseline. New
+  theme fields `reveal_tag_border` and `reveal_tag_text`; **a character-cell
+  backend must set `reveal_tag_text = true`** to keep the text tags.
+  `reveal_tag_bg` lightened to `0xDDDDD5FF`. (#11)
+- `tree_edit::paragraphs_into_list` is now `paragraphs_into_lists` and returns
+  `Vec<Paragraph>`, since a run holding a table converts into more than one
+  node. (#13)
 
 ### Fixed
 
-- A list/checklist item whose content starts with a hard break (or is otherwise
-  empty on its first visual line) now lays out all of its remaining lines. The
-  marker-merge path bailed out to a marker-only line whenever the item's first
-  visual line had no runs, dropping every following line from the layout — so a
-  pasted text paragraph carrying hard breaks, converted to a list, rendered as a
-  single empty bullet even though the document was intact. (#13)
-
-- Converting a range of paragraphs into a list (`toggle_list` /
-  `toggle_ordered_list` / `toggle_checklist`) or into a quote (`toggle_quote`) no
-  longer drops the content of the container blocks it covers. Every non-list
-  paragraph was flattened through `Paragraph::content()`, which is empty for a
-  quote or a table, so those blocks turned into empty items and everything inside
-  them was lost — selecting a document whose text sat in a trailing quote and
-  hitting "List Item" left the first paragraph plus a single empty bullet. Quotes
-  now contribute their paragraphs (recursively) as items of their own; a table,
-  which has no item representation, stays where it is and splits the list instead
-  of collapsing; and a quote/table/list becomes a quote child verbatim when
-  quoting a range. The reverse direction (delisting, `dissolve_container`) keeps a
-  container that is a list entry's body intact as well. (#13)
+- A list item whose first visual line is empty (e.g. its content starts with a
+  hard break) now lays out all of its lines instead of a single empty bullet.
+  (#13)
+- Converting a range into a list or quote no longer drops the content of the
+  quotes and tables it covers: a quote's paragraphs become items of their own,
+  a table stays where it is and splits the list, and quoting a range keeps
+  nested blocks verbatim. Delisting keeps a container inside a list entry intact
+  as well. (#13)
+- `toggle_quote`, `Editor::wrap_selection` and the definition-list toggle no
+  longer do nothing when the selection ends inside a list, quote or definition
+  list (e.g. after Select All on a document ending in a list). They act on the
+  top-level blocks the selection covers and keep the caret on its line. (#12)
+- `toggle_quote` now toggles the whole selected range, like the list toggles: an
+  all-quote selection unquotes every block, a mixed range becomes one quote, and
+  the result stays selected. Toggling off also works from a caret inside a list
+  or definition within the quote, which used to wrap it in a second quote. (#12)
+- The list toggles no longer do nothing when the caret is below the top level:
+  in a quote the list is built inside that quote; on a definition list's term or
+  definition the leaf is lifted out of the list first, as `set_block_type` does.
+  (#12)
+- Wrapping a multi-paragraph selection in one checklist item
+  (`Editor::wrap_selection`) keeps a space between the paragraphs' text instead
+  of running them together. (#12)
+- Tab and Shift-Tab over a selection that covers an item and its subitems move
+  the subtree as a whole instead of flattening it. (#12)
+- Removing a checklist item no longer deletes its subitems, and merging one list
+  item into another (Backspace or Delete at an item boundary) keeps the merged
+  item's subitems and continuation paragraphs with the text they belong to.
+  (#12)
+- Enter inside a list item keeps the item's subitems and continuation paragraphs
+  with their text: at the start of an item they follow the text into the new
+  item; at the end of the item's text the new item is an empty sibling and the
+  body stays above it. (#12)
 
 ## [0.5.0] - 2026-07-08
 

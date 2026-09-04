@@ -190,6 +190,24 @@ pub enum BlockType {
     Table {
         rows: Vec<TableRow>,
     },
+    /// A horizontal rule / thematic break. Carries no content at all: the block's
+    /// `content` stays empty and the renderer paints the rule from the block's
+    /// geometry alone. Like a table it is a non-editable leaf — the caret can rest
+    /// on it and it can be deleted, but there is nothing in it to type into.
+    HorizontalRule,
+    /// A term (`<dt>`) of a definition list. Its inline content lives in
+    /// [`Block::content`] like any other text leaf, so a term is fully editable.
+    /// `depth` is the number of enclosing definition bodies (`<dd>`) — 0 for a
+    /// top-level list — and drives indentation; the term sits one step left of the
+    /// definition it heads, which carries `depth + 1`.
+    ///
+    /// A definition's *body* has no block type of its own: its paragraphs keep their
+    /// intrinsic type (paragraph, heading, nested list, …) and are indented from
+    /// `LeafInfo::definition_depth`, exactly as continuation paragraphs inside a list
+    /// item stay `Paragraph` and indent from their list depth.
+    DefinitionTerm {
+        depth: usize,
+    },
 }
 
 /// A block of content

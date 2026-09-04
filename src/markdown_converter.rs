@@ -113,6 +113,66 @@ mod tests {
     }
 
     #[test]
+    fn thematic_break_parses_to_a_horizontal_rule() {
+        for md in ["A\n\n---\n\nB", "A\n\n***\n\nB", "A\n\n___\n\nB"] {
+            let doc = markdown_to_document(md);
+            assert!(
+                doc.paragraphs
+                    .iter()
+                    .any(|p| matches!(p, Paragraph::HorizontalRule)),
+                "expected a horizontal rule from {md:?}: {doc:?}"
+            );
+            assert_eq!(document_to_markdown(&doc).trim(), "A\n\n---\n\nB");
+        }
+    }
+
+    #[test]
+    fn horizontal_rule_survives_the_html_flavor() {
+        let doc = markdown_to_document("A\n\n---\n\nB");
+        let html = document_to_html(&doc);
+        assert!(html.contains("<hr />"), "html was: {html}");
+    }
+
+    #[test]
+    fn definition_list_round_trips_through_markdown() {
+        let md = "Coffee\n: Black hot drink";
+        let doc = markdown_to_document(md);
+        assert!(
+            doc.paragraphs
+                .iter()
+                .any(|p| matches!(p, Paragraph::DefinitionList { .. })),
+            "expected a definition list: {doc:?}"
+        );
+        assert_eq!(document_to_markdown(&doc).trim(), md);
+    }
+
+    #[test]
+    fn multi_paragraph_definition_round_trips_through_markdown() {
+        // tdoc writes a definition's second paragraph as an indented continuation
+        // rather than a second `:` line — a different surface form for the same
+        // tree, so assert on the tree rather than on the text.
+        let md = "Coffee\n: Black hot drink\n: Also bitter\n\nWater\n: The plain one";
+        let doc = markdown_to_document(md);
+        let rendered = document_to_markdown(&doc);
+        let reparsed = markdown_to_document(&rendered);
+        assert_eq!(
+            doc, reparsed,
+            "definition list should be stable across a markdown round trip; rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn definition_list_survives_the_html_flavor() {
+        let doc = markdown_to_document("Coffee\n: Black hot drink");
+        let html = document_to_html(&doc);
+        assert!(html.contains("<dt>Coffee</dt>"), "html was: {html}");
+        assert!(
+            html.contains("<dd>Black hot drink</dd>"),
+            "html was: {html}"
+        );
+    }
+
+    #[test]
     fn ordered_list_round_trips_with_numbering() {
         let md = "1. First\n2. Second";
         let doc = markdown_to_document(md);

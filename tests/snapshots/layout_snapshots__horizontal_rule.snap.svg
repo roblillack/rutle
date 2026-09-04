@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="440" height="300" viewBox="0 0 440 300">
+<style>
+            @font-face { font-family: 'SnapshotSans'; font-weight: 500; font-style: normal; src: url('../NotoSans-Medium.ttf') format('truetype'); }
+            @font-face { font-family: 'SnapshotSans'; font-weight: 700; font-style: normal; src: url('../NotoSans-Bold.ttf') format('truetype'); }
+            @font-face { font-family: 'SnapshotSans'; font-weight: 500; font-style: italic; src: url('../NotoSans-MediumItalic.ttf') format('truetype'); }
+            @font-face { font-family: 'SnapshotSans'; font-weight: 700; font-style: italic; src: url('../NotoSans-BoldItalic.ttf') format('truetype'); }
+            </style>
+  <rect width="440" height="300" fill="#ffffff"/>
+  <rect x="0" y="0" width="440" height="300" fill="#fffff5"/>
+  <defs>
+    <clipPath id="clip-0-0-440-300">
+      <rect x="0" y="0" width="440" height="300"/>
+    </clipPath>
+  </defs>
+  <rect x="25" y="94" width="390" height="1" fill="#cccccc" clip-path="url(#clip-0-0-440-300)"/>
+  <text x="25" y="30" fill="#000000" font-family="SnapshotSans" font-size="20" font-weight="bold" font-style="normal" clip-path="url(#clip-0-0-440-300)">Before </text>
+  <text x="98" y="30" fill="#000000" font-family="SnapshotSans" font-size="20" font-weight="bold" font-style="normal" clip-path="url(#clip-0-0-440-300)">the </text>
+  <text x="137" y="30" fill="#000000" font-family="SnapshotSans" font-size="20" font-weight="bold" font-style="normal" clip-path="url(#clip-0-0-440-300)">break</text>
+  <text x="25" y="65" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-300)">A </text>
+  <text x="38" y="65" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-300)">paragraph </text>
+  <text x="114" y="65" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-300)">above </text>
+  <text x="159" y="65" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-300)">the </text>
+  <text x="185" y="65" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-300)">rule.</text>
+  <text x="25" y="135" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-300)">A </text>
+  <text x="38" y="135" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-300)">paragraph </text>
+  <text x="114" y="135" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-300)">below </text>
+  <text x="159" y="135" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-300)">the </text>
+  <text x="185" y="135" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-300)">rule.</text>
+  <text x="39" y="164" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-300)">• </text>
+  <text x="48" y="164" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-300)">and </text>
+  <text x="77" y="164" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-300)">a </text>
+  <text x="88" y="164" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-300)">list </text>
+  <text x="112" y="164" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-300)">item</text>
+  <text x="39" y="183" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-300)">• </text>
+  <text x="48" y="183" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-300)">to </text>
+  <text x="66" y="183" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-300)">check </text>
+  <text x="109" y="183" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-300)">the </text>
+  <text x="135" y="183" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-300)">rule </text>
+  <text x="165" y="183" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-300)">clears </text>
+  <text x="209" y="183" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-300)">block </text>
+  <text x="249" y="183" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-300)">content </text>
+  <text x="305" y="183" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-300)">on </text>
+  <text x="326" y="183" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-300)">both </text>
+  <text x="361" y="183" fill="#000000" font-family="SnapshotSans" font-size="14" font-weight="normal" font-style="normal" clip-path="url(#clip-0-0-440-300)">sides</text>
+  <rect x="25" y="10" width="2" height="26" fill="#000000" clip-path="url(#clip-0-0-440-300)"/>
+</svg>

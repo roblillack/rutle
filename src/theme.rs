@@ -20,6 +20,13 @@ pub struct Theme {
     pub table_border_color: u32,
     pub table_header_background: u32,
 
+    /// Color of a horizontal rule (thematic break), in both its drawn-line and
+    /// its text form (see `horizontal_rule_as_text`).
+    pub horizontal_rule_color: u32,
+    /// Thickness of the drawn horizontal rule, in pixels. Ignored when
+    /// `horizontal_rule_as_text` is on.
+    pub horizontal_rule_thickness: i32,
+
     pub link_color: u32,
     pub link_hover_background: u32,
     pub link_hover_color: u32,
@@ -61,6 +68,12 @@ pub struct Theme {
     pub quote_spacing: i32,
     pub code_block_padding: i32,
 
+    /// Extra breathing room above and below a horizontal rule, on top of the
+    /// ordinary inter-block gap, so the rule reads as a section break rather than
+    /// as another line of the surrounding text. Pixel value for the GUI; a cell
+    /// backend sets this to 0 and lets `classic_block_spacing` carry the gap.
+    pub horizontal_rule_spacing: i32,
+
     /// Horizontal indent per quote nesting level, and the x-offset of the quote
     /// bar within that indent. Pixel values for the GUI; small for a cell grid.
     pub quote_indent: i32,
@@ -71,6 +84,18 @@ pub struct Theme {
     /// a cell backend, whose fonts report `font_size == 0`, sets a small nonzero
     /// value so nested list items still indent.
     pub list_indent: i32,
+
+    /// Horizontal indent of a definition (`<dd>`) past the term it defines, per
+    /// nesting level. This *is* the visual cue that separates a definition list's
+    /// two halves — the terms carry no marker — so a backend that zeroes it should
+    /// distinguish the term some other way (see `definition_term`). Pixel value for
+    /// the GUI; small for a cell grid.
+    pub definition_indent: i32,
+
+    /// Trailing space below a definition term. Tight by default so a term reads as
+    /// attached to the definition beneath it rather than floating between items;
+    /// the fuller `paragraph_spacing` follows the definition itself.
+    pub definition_term_spacing: i32,
 
     /// Padding inside table cells (horizontal and vertical). Pixel values for
     /// the GUI; a cell backend uses tight values so rows/columns aren't huge.
@@ -120,6 +145,13 @@ pub struct Theme {
     /// pipe) instead of a drawn vertical line. Off by default so the GUI keeps
     /// its solid bar; a cell backend turns this on.
     pub quote_bar_as_text: bool,
+
+    /// Render a horizontal rule as a centered run of box-drawing glyphs around a
+    /// spaced bullet (`───── • ─────`) instead of a drawn line — the same
+    /// ornament `tdoc`'s terminal formatter emits. Off by default (the GUI draws
+    /// a full-width line); a cell backend, which cannot draw sub-cell rules,
+    /// turns this on.
+    pub horizontal_rule_as_text: bool,
 
     /// Color used for decorative rules drawn by the engine — heading underlines
     /// and code-block fences. Only consulted when `heading_underline` /
@@ -171,27 +203,33 @@ pub struct Theme {
     pub plain_text: FontSettings,
     pub quote_text: FontSettings,
     pub code_text: FontSettings,
+    /// Font for a definition list's terms. Bold by default: a term is a label for
+    /// the definition under it, and — unlike a list item — it has no marker of its
+    /// own, so weight is what sets it apart from ordinary text.
+    pub definition_term: FontSettings,
 }
 
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            background_color: 0xFFFFF5FF,               // Off-white background
-            selection_color: 0xB4D5FEFF,                // Light blue selection color
-            cursor_color: 0x000000FF,                   // Black cursor
-            quote_bar_color: 0xCCCCCCFF,                // Light gray quote bar
-            quote_bar_width: 4,                         // Width of the quote bar
-            table_border_color: 0xBBBBBBFF,             // Gray table grid lines
-            table_header_background: 0xEEEEE5FF,        // Subtle header row fill
-            link_color: 0x0000EEFF,                     // Standard blue link color
-            link_hover_background: 0xDDDDDDFF,          // Light gray hover background
-            link_hover_color: 0x0000AAFF,               // Darker blue link color
-            highlight_color: 0xFFFF00FF,                // Yellow highlight color
-            search_highlight_color: 0xFFE4B5FF,         // Light orange for search matches
+            background_color: 0xFFFFF5FF,        // Off-white background
+            selection_color: 0xB4D5FEFF,         // Light blue selection color
+            cursor_color: 0x000000FF,            // Black cursor
+            quote_bar_color: 0xCCCCCCFF,         // Light gray quote bar
+            quote_bar_width: 4,                  // Width of the quote bar
+            table_border_color: 0xBBBBBBFF,      // Gray table grid lines
+            table_header_background: 0xEEEEE5FF, // Subtle header row fill
+            horizontal_rule_color: 0xCCCCCCFF,   // Light gray thematic break
+            horizontal_rule_thickness: 1,
+            link_color: 0x0000EEFF,             // Standard blue link color
+            link_hover_background: 0xDDDDDDFF,  // Light gray hover background
+            link_hover_color: 0x0000AAFF,       // Darker blue link color
+            highlight_color: 0xFFFF00FF,        // Yellow highlight color
+            search_highlight_color: 0xFFE4B5FF, // Light orange for search matches
             search_current_highlight_color: 0xFFA500FF, // Orange for current match
-            reveal_tag_fg: 0x000000FF,                  // Black tag label
-            reveal_tag_bg: 0xDDDDD5FF,                  // Light gray tag fill
-            reveal_tag_border: 0x77776FFF,              // Gray tag outline
+            reveal_tag_fg: 0x000000FF,          // Black tag label
+            reveal_tag_bg: 0xDDDDD5FF,          // Light gray tag fill
+            reveal_tag_border: 0x77776FFF,      // Gray tag outline
             reveal_tag_text: false,
 
             padding_vertical: 10,
@@ -206,9 +244,17 @@ impl Default for Theme {
             list_item_spacing: 2,
             quote_spacing: 5,
             code_block_padding: 5,
+            // Added above and below the rule row. With the default 12px paragraph
+            // spacing this puts an even 18px of air on both sides of a rule that
+            // separates two paragraphs.
+            horizontal_rule_spacing: 6,
             quote_indent: 20,
             quote_bar_offset: 12,
             list_indent: 0,
+            // A definition sits one quote-indent's worth right of its term, so the
+            // two halves read as a pair without needing a marker between them.
+            definition_indent: 20,
+            definition_term_spacing: 2,
             table_cell_padding_h: 6,
             table_cell_padding_v: 3,
             text_decoration_lines: true,
@@ -217,6 +263,7 @@ impl Default for Theme {
             checkbox_text: false,
             heading_underline: false,
             quote_bar_as_text: false,
+            horizontal_rule_as_text: false,
             structural_color: 0x000000FF,
             code_block_fence: false,
             checkmark_color: 0x000000FF,
@@ -265,6 +312,13 @@ impl Default for Theme {
                 font_style: FontStyle::Regular,
                 font_size: 14,
                 font_color: 0x0064C8FF,
+                background_color: None,
+            },
+            definition_term: FontSettings {
+                font_type: FontType::Content,
+                font_style: FontStyle::Bold,
+                font_size: 14,
+                font_color: 0x000000FF,
                 background_color: None,
             },
         }

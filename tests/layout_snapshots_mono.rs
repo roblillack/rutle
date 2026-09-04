@@ -66,3 +66,18 @@ fn list_then_paragraph() {
 fn list_with_continuation_paragraph() {
     insta::assert_binary_snapshot!(".svg", common::list_with_continuation_paragraph(MODE));
 }
+
+#[test]
+fn horizontal_rule() {
+    insta::assert_binary_snapshot!(".svg", common::horizontal_rule(MODE));
+}
+
+#[test]
+fn horizontal_rule_as_text() {
+    insta::assert_binary_snapshot!(".svg", common::horizontal_rule_as_text(MODE));
+}
+
+#[test]
+fn definition_list() {
+    insta::assert_binary_snapshot!(".svg", common::definition_list(MODE));
+}

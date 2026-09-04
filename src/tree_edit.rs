@@ -7,7 +7,7 @@
 
 use tdoc::Document;
 use tdoc::inline::Span;
-use tdoc::paragraph::{ChecklistItem, Paragraph};
+use tdoc::paragraph::{ChecklistItem, DefinitionItem, Paragraph};
 
 use super::inline_convert::inline_to_spans;
 use super::structured_document::{Block, InlineContent};
@@ -44,6 +44,13 @@ fn node_at_mut<'a>(doc: &'a mut Document, path: &TreePath) -> Option<NodeMut<'a>
             (NodeMut::Check(item), PathSegment::ChecklistItem(c)) => {
                 NodeMut::Check(item.children.get_mut(*c)?)
             }
+            // A definition's paragraphs are ordinary blocks and resolve as nodes; a
+            // *term* is a bare `Vec<Span>`, not a node, so it never resolves here —
+            // its content is reached through `tree_walk::leaf_spans*` instead.
+            (
+                NodeMut::Para(Paragraph::DefinitionList { items }),
+                PathSegment::DefinitionPara { item, para },
+            ) => NodeMut::Para(items.get_mut(*item)?.definition.get_mut(*para)?),
             _ => return None,
         };
     }
@@ -80,6 +87,10 @@ fn node_at<'a>(doc: &'a Document, path: &TreePath) -> Option<NodeRef<'a>> {
             (NodeRef::Check(item), PathSegment::ChecklistItem(c)) => {
                 NodeRef::Check(item.children.get(*c)?)
             }
+            (
+                NodeRef::Para(Paragraph::DefinitionList { items }),
+                PathSegment::DefinitionPara { item, para },
+            ) => NodeRef::Para(items.get(*item)?.definition.get(*para)?),
             _ => return None,
         };
     }
@@ -162,6 +173,11 @@ pub fn split_leaf(doc: &mut Document, path: &TreePath, offset: usize) -> Option<
     let runs = tree_walk::leaf_spans(doc, path).map(|_| tree_walk::leaf_inline(doc, path))?;
     let (left, right) = split_runs(&runs, offset);
     tree_walk::set_leaf_inline(doc, path, &left);
+    // Whether the new leaf gets any of the text. It does not when Enter is pressed at the very
+    // end of the leaf, which is what tells "split this line" apart from "add one after it" —
+    // and so whether an item's body (subitems, continuation paragraphs) belongs with the new
+    // item or stays with the text it was written under.
+    let carries_text = right.iter().any(|c| c.text_len() > 0);
 
     let last = path.0.last()?.clone();
     let pp = parent_path(path);
@@ -187,9 +203,10 @@ pub fn split_leaf(doc: &mut Document, path: &TreePath, offset: usize) -> Option<
                 Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
             ) = node_at_mut(doc, &pp)?
             {
-                // The new entry takes the right half plus any continuation paragraphs of
-                // the original entry; its first paragraph keeps the split leaf's kind.
-                let continuation = if para < entries.get(entry)?.len() {
+                // The new entry takes the right half; the paragraphs below the split one
+                // follow the text into it, so a sublist stays under the line it belongs to.
+                // Its first paragraph keeps the split leaf's kind.
+                let continuation = if carries_text && para < entries.get(entry)?.len() {
                     entries[entry].split_off(para + 1)
                 } else {
                     Vec::new()
@@ -206,34 +223,105 @@ pub fn split_leaf(doc: &mut Document, path: &TreePath, offset: usize) -> Option<
                 None
             }
         }
+        // A checklist item's subitems live *inside* it rather than beside it, so they have to
+        // be handed over explicitly — they follow the text into the new item exactly as a list
+        // entry's continuation paragraphs do.
         PathSegment::ChecklistItem(c) => {
-            let new_item = ChecklistItem::new(false).with_content(inline_to_spans(&right));
+            let mut new_item = ChecklistItem::new(false).with_content(inline_to_spans(&right));
             match node_at_mut(doc, &pp)? {
                 NodeMut::Para(Paragraph::Checklist { items }) => {
+                    if carries_text {
+                        new_item.children = std::mem::take(&mut items.get_mut(c)?.children);
+                    }
                     items.insert(c + 1, new_item);
                 }
                 NodeMut::Check(item) => {
+                    if carries_text {
+                        new_item.children = std::mem::take(&mut item.children.get_mut(c)?.children);
+                    }
                     item.children.insert(c + 1, new_item);
                 }
                 _ => return None,
             }
             Some(pp.child(PathSegment::ChecklistItem(c + 1)))
         }
+        // A term splits into a further term of the same item, so Enter mid-term gives
+        // the two halves as two `<dt>`s sharing one definition — the way consecutive
+        // terms are authored in HTML and Markdown alike.
+        //
+        // The exception is Enter at the *end* of a term whose item has no definition
+        // yet: an item with terms but no definition has nowhere to type the definition,
+        // so that keystroke opens one and moves into it. (With a definition already
+        // there, the same keystroke adds a second term, which is how `<dt>`s are
+        // stacked.) This mirrors the empty-continuation rule in `same_kind_paragraph`,
+        // where Enter at the end of a heading drops you into body text.
+        PathSegment::DefinitionTerm { item, term } => {
+            let NodeMut::Para(Paragraph::DefinitionList { items }) = node_at_mut(doc, &pp)? else {
+                return None;
+            };
+            let it = items.get_mut(item)?;
+            if term >= it.terms.len() {
+                return None;
+            }
+            if !carries_text && it.definition.is_empty() {
+                it.definition.push(Paragraph::new_text());
+                return Some(pp.child(PathSegment::DefinitionPara { item, para: 0 }));
+            }
+            it.terms.insert(term + 1, inline_to_spans(&right));
+            Some(pp.child(PathSegment::DefinitionTerm {
+                item,
+                term: term + 1,
+            }))
+        }
+        // A definition's paragraphs split like a list's entries: the right half starts the
+        // *next item*, as its term, and any paragraphs after the split move into that new
+        // item's definition. So Enter in a definition moves on to the next term rather than
+        // stacking another paragraph inside the current definition — the same shape as Enter
+        // in a list item starting the next item. (Ctrl+P still adds a paragraph to the
+        // current definition; see `split_leaf_continuation`.)
+        PathSegment::DefinitionPara { item, para } => {
+            let NodeMut::Para(Paragraph::DefinitionList { items }) = node_at_mut(doc, &pp)? else {
+                return None;
+            };
+            let it = items.get_mut(item)?;
+            if para >= it.definition.len() {
+                return None;
+            }
+            // The paragraphs *after* the split one follow the right half into the new item.
+            let following = it.definition.split_off(para + 1);
+            items.insert(
+                item + 1,
+                DefinitionItem::new()
+                    .with_terms(vec![inline_to_spans(&right)])
+                    .with_definition(following),
+            );
+            Some(pp.child(PathSegment::DefinitionTerm {
+                item: item + 1,
+                term: 0,
+            }))
+        }
     }
 }
 
-/// Like [`split_leaf`], but inside a list item the right half becomes a *continuation
-/// paragraph* within the same entry (a new plain paragraph after the current one) rather
-/// than starting a new list item. Elsewhere — top level, quotes, checklists — it behaves
-/// exactly like `split_leaf` (a quote already splits into a sibling paragraph).
+/// Like [`split_leaf`], but inside a list item or a definition the right half becomes a
+/// *continuation paragraph* of the same item (a new plain paragraph after the current one)
+/// rather than starting the next item. Elsewhere — top level, quotes, checklists — it
+/// behaves exactly like `split_leaf` (a quote already splits into a sibling paragraph).
+///
+/// For a definition this is the only way to grow one past a single paragraph, since Enter
+/// there moves on to the next term.
 pub fn split_leaf_continuation(
     doc: &mut Document,
     path: &TreePath,
     offset: usize,
 ) -> Option<TreePath> {
-    let PathSegment::ListEntry { entry, para } = path.0.last()?.clone() else {
+    let last = path.0.last()?.clone();
+    if !matches!(
+        last,
+        PathSegment::ListEntry { .. } | PathSegment::DefinitionPara { .. }
+    ) {
         return split_leaf(doc, path, offset);
-    };
+    }
     // Reject tables / invalid leaves, then split the inline runs.
     tree_walk::leaf_spans(doc, path)?;
     let runs = tree_walk::leaf_inline(doc, path);
@@ -241,21 +329,36 @@ pub fn split_leaf_continuation(
     tree_walk::set_leaf_inline(doc, path, &left);
 
     let pp = parent_path(path);
-    if let NodeMut::Para(
-        Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
-    ) = node_at_mut(doc, &pp)?
-    {
-        let e = entries.get_mut(entry)?;
-        e.insert(
-            para + 1,
-            Paragraph::new_text().with_content(inline_to_spans(&right)),
-        );
-        Some(pp.child(PathSegment::ListEntry {
-            entry,
-            para: para + 1,
-        }))
-    } else {
-        None
+    match (last, node_at_mut(doc, &pp)?) {
+        (
+            PathSegment::ListEntry { entry, para },
+            NodeMut::Para(
+                Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
+            ),
+        ) => {
+            let e = entries.get_mut(entry)?;
+            e.insert(
+                para + 1,
+                Paragraph::new_text().with_content(inline_to_spans(&right)),
+            );
+            Some(pp.child(PathSegment::ListEntry {
+                entry,
+                para: para + 1,
+            }))
+        }
+        (
+            PathSegment::DefinitionPara { item, para },
+            NodeMut::Para(Paragraph::DefinitionList { items }),
+        ) => {
+            let it = items.get_mut(item)?;
+            let new = same_kind_paragraph(it.definition.get(para)?, &right);
+            it.definition.insert(para + 1, new);
+            Some(pp.child(PathSegment::DefinitionPara {
+                item,
+                para: para + 1,
+            }))
+        }
+        _ => None,
     }
 }
 
@@ -310,8 +413,95 @@ pub fn merge_with_previous(doc: &mut Document, path: &TreePath) -> Option<(TreeP
     block.normalize_content();
     tree_walk::set_leaf_inline(doc, &prev, &block.content);
 
+    // The text moved, so what hangs below it moves too: otherwise a subitem would be left
+    // under an item holding none of the text it belonged to — or, for a checklist, taken
+    // along when the emptied item goes.
+    move_item_body(doc, path, &prev);
+
     remove_node_at(doc, path);
     Some((prev, prev_len))
+}
+
+/// Move the body of the item at `from` onto the item at `to`, for a merge that is about to
+/// remove `from`: a checklist item's subitems become the absorbing item's, and a list entry's
+/// remaining paragraphs (continuation paragraphs, sublists) are inserted just after the
+/// paragraph the text merged into. Only within one kind of list, and only between two
+/// different items — anything else is left where it stands for [`remove_node_at`] to keep.
+fn move_item_body(doc: &mut Document, from: &TreePath, to: &TreePath) {
+    match (from.0.last(), to.0.last()) {
+        (Some(PathSegment::ChecklistItem(_)), Some(PathSegment::ChecklistItem(_))) => {
+            if from == to {
+                return;
+            }
+            let children = match node_at_mut(doc, from) {
+                Some(NodeMut::Check(item)) => std::mem::take(&mut item.children),
+                _ => return,
+            };
+            if children.is_empty() {
+                return;
+            }
+            match node_at_mut(doc, to) {
+                Some(NodeMut::Check(item)) => item.children.extend(children),
+                // Leave them where they were rather than dropping them.
+                _ => {
+                    if let Some(NodeMut::Check(item)) = node_at_mut(doc, from) {
+                        item.children = children;
+                    }
+                }
+            }
+        }
+        (
+            Some(PathSegment::ListEntry {
+                entry: from_e,
+                para: from_p,
+            }),
+            Some(PathSegment::ListEntry {
+                entry: to_e,
+                para: to_p,
+            }),
+        ) => {
+            let (from_e, from_p, to_e, to_p) = (*from_e, *from_p, *to_e, *to_p);
+            let list_path = parent_path(from);
+            // The same entry already holds its own body, and across two lists the indices
+            // would shift under us; the ordinary removal handles those.
+            if from_e == to_e || list_path != parent_path(to) {
+                return;
+            }
+            if let Some(NodeMut::Para(
+                Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
+            )) = node_at_mut(doc, &list_path)
+            {
+                if from_e >= entries.len() || to_e >= entries.len() {
+                    return;
+                }
+                if from_p + 1 >= entries[from_e].len() {
+                    return; // nothing below the text that merged away
+                }
+                let tail: Vec<Paragraph> = entries[from_e].split_off(from_p + 1);
+                let at = (to_p + 1).min(entries[to_e].len());
+                entries[to_e].splice(at..at, tail);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// After removing the node at `idx` from `vec`, join the definition lists that removal left
+/// touching. Two adjacent definition lists render exactly like one but serialize with a
+/// separator between them, so a list stays whole when the paragraph that had split it goes
+/// away. The later list is absorbed into the earlier one and its items are appended, so both
+/// the sibling indices at or below it and any path already resolved into the earlier list
+/// stay valid — which is what lets [`merge_with_previous`] call through here safely.
+fn join_definition_lists_at(vec: &mut Vec<Paragraph>, idx: usize) {
+    if idx == 0 || idx >= vec.len() {
+        return;
+    }
+    if matches!(vec[idx - 1], Paragraph::DefinitionList { .. })
+        && matches!(vec[idx], Paragraph::DefinitionList { .. })
+    {
+        let moved = vec.remove(idx);
+        append_definition_items(&mut vec[idx - 1], moved);
+    }
 }
 
 /// Remove the node at `path` from its parent container, pruning containers that become
@@ -325,6 +515,7 @@ pub fn remove_node_at(doc: &mut Document, path: &TreePath) {
         PathSegment::Paragraph(i) => {
             if i < doc.paragraphs.len() {
                 doc.paragraphs.remove(i);
+                join_definition_lists_at(&mut doc.paragraphs, i);
             }
         }
         PathSegment::QuoteChild(c) => {
@@ -332,6 +523,7 @@ pub fn remove_node_at(doc: &mut Document, path: &TreePath) {
             if let Some(NodeMut::Para(Paragraph::Quote { children })) = node_at_mut(doc, &pp) {
                 if c < children.len() {
                     children.remove(c);
+                    join_definition_lists_at(children, c);
                 }
                 empty = children.is_empty();
             }
@@ -359,17 +551,24 @@ pub fn remove_node_at(doc: &mut Document, path: &TreePath) {
                 remove_node_at(doc, &pp);
             }
         }
+        // A checklist item holds its subitems *inside* it, so removing one would take them
+        // along; they take its place instead, one level shallower — the item goes, its
+        // subitems stay in the document.
         PathSegment::ChecklistItem(c) => {
             let mut empty = false;
             match node_at_mut(doc, &pp) {
                 Some(NodeMut::Para(Paragraph::Checklist { items })) => {
                     if c < items.len() {
+                        let children = std::mem::take(&mut items[c].children);
                         items.remove(c);
+                        items.splice(c..c, children);
                     }
                     empty = items.is_empty();
                 }
                 Some(NodeMut::Check(item)) if c < item.children.len() => {
+                    let children = std::mem::take(&mut item.children[c].children);
                     item.children.remove(c);
+                    item.children.splice(c..c, children);
                 }
                 _ => {}
             }
@@ -377,7 +576,358 @@ pub fn remove_node_at(doc: &mut Document, path: &TreePath) {
                 remove_node_at(doc, &pp);
             }
         }
+        // Removing a term or a definition paragraph prunes upwards the same way a list
+        // does: an item with neither terms nor definition left is dropped, and a
+        // definition list with no items left goes with it.
+        PathSegment::DefinitionTerm { item, term } => {
+            remove_definition_part(doc, &pp, item, |it| {
+                if term < it.terms.len() {
+                    it.terms.remove(term);
+                }
+            });
+        }
+        PathSegment::DefinitionPara { item, para } => {
+            remove_definition_part(doc, &pp, item, |it| {
+                if para < it.definition.len() {
+                    it.definition.remove(para);
+                }
+            });
+        }
     }
+}
+
+/// Apply `remove` to `items[item]` of the definition list at `list_path`, then prune the
+/// item if it is left with nothing at all, and the list if it is left with no items.
+fn remove_definition_part(
+    doc: &mut Document,
+    list_path: &TreePath,
+    item: usize,
+    remove: impl FnOnce(&mut DefinitionItem),
+) {
+    let mut empty = false;
+    if let Some(NodeMut::Para(Paragraph::DefinitionList { items })) = node_at_mut(doc, list_path) {
+        if let Some(it) = items.get_mut(item) {
+            remove(it);
+            if it.terms.is_empty() && it.definition.is_empty() {
+                items.remove(item);
+            }
+        }
+        empty = items.is_empty();
+    }
+    if empty {
+        remove_node_at(doc, list_path);
+    }
+}
+
+/// The inline spans of a paragraph that can stand as a definition *term*, or `None` for one
+/// that cannot. A term is a bare `Vec<Span>`, so only a paragraph that owns inline content
+/// has a term form — the same test [`paragraphs_into_definition_list`] applies. A nested
+/// list, table or rule keeps its place as a definition paragraph instead.
+fn term_spans_of(p: &Paragraph) -> Option<Vec<Span>> {
+    match p {
+        Paragraph::Text { content }
+        | Paragraph::Header1 { content }
+        | Paragraph::Header2 { content }
+        | Paragraph::Header3 { content }
+        | Paragraph::CodeBlock { content } => Some(content.clone()),
+        _ => None,
+    }
+}
+
+/// Outdent a definition paragraph (Shift-Tab): it stops being part of its definition and
+/// becomes the *term* of a new item right below, taking the paragraphs that followed it in
+/// the old definition along as its own definition.
+///
+/// ```text
+///   Coffee            Coffee
+///   : hot        ->   : hot
+///   : black           Black
+///   : opaque          : opaque
+/// ```
+///
+/// Returns the new item's term path. `None` when the paragraph has no term form (a nested
+/// list, table or rule — see [`term_spans_of`]) or the path is not a definition paragraph.
+pub fn outdent_definition_para(doc: &mut Document, path: &TreePath) -> Option<TreePath> {
+    let PathSegment::DefinitionPara { item, para } = path.0.last()?.clone() else {
+        return None;
+    };
+    let pp = parent_path(path);
+    let NodeMut::Para(Paragraph::DefinitionList { items }) = node_at_mut(doc, &pp)? else {
+        return None;
+    };
+    let it = items.get_mut(item)?;
+    let spans = term_spans_of(it.definition.get(para)?)?;
+    it.definition.remove(para);
+    // Everything that followed it stays below it, now as the new item's definition.
+    let following = it.definition.split_off(para);
+    items.insert(
+        item + 1,
+        DefinitionItem::new()
+            .with_terms(vec![spans])
+            .with_definition(following),
+    );
+    Some(pp.child(PathSegment::DefinitionTerm {
+        item: item + 1,
+        term: 0,
+    }))
+}
+
+/// Indent a definition term (Tab): it stops heading its own item and becomes the last
+/// paragraph of the definition above it — the inverse of [`outdent_definition_para`].
+///
+/// If the term is its item's only one, the whole item is absorbed: its definition follows
+/// the term into the one above, and the empty item is dropped. If the item has further
+/// terms, only this one moves and the rest stay as an item of their own, so nothing is
+/// reordered. A term that is not preceded by another item (the first term of the first
+/// item) has nowhere to go and returns `None`.
+pub fn indent_definition_term(doc: &mut Document, path: &TreePath) -> Option<TreePath> {
+    let PathSegment::DefinitionTerm { item, term } = path.0.last()?.clone() else {
+        return None;
+    };
+    let pp = parent_path(path);
+    let NodeMut::Para(Paragraph::DefinitionList { items }) = node_at_mut(doc, &pp)? else {
+        return None;
+    };
+    if items.get(item)?.terms.len() <= term {
+        return None;
+    }
+
+    // A later term of an item first splits that item in two, so the terms before it keep
+    // their place above; the split half is then the leading term of its own item, which is
+    // the case handled below.
+    let (item, term) = if term > 0 {
+        let tail_terms = items[item].terms.split_off(term);
+        let definition = std::mem::take(&mut items[item].definition);
+        items.insert(
+            item + 1,
+            DefinitionItem::new()
+                .with_terms(tail_terms)
+                .with_definition(definition),
+        );
+        (item + 1, 0)
+    } else {
+        (item, term)
+    };
+    if item == 0 {
+        return None;
+    }
+
+    let spans = items[item].terms.remove(term);
+    let absorbed = if items[item].terms.is_empty() {
+        // Nothing is left to head the item, so its definition joins the term above it and
+        // the item goes away — exactly undoing `outdent_definition_para`.
+        let rest = std::mem::take(&mut items[item].definition);
+        items.remove(item);
+        rest
+    } else {
+        Vec::new()
+    };
+
+    let target = items.get_mut(item - 1)?;
+    let para = target.definition.len();
+    target
+        .definition
+        .push(Paragraph::new_text().with_content(spans));
+    target.definition.extend(absorbed);
+    Some(pp.child(PathSegment::DefinitionPara {
+        item: item - 1,
+        para,
+    }))
+}
+
+/// Leave a definition list from an empty leaf inside it (Enter on an empty term or an empty
+/// definition paragraph), the way Enter on an empty list item leaves a list: the empty leaf
+/// becomes a plain paragraph in the list's own container, and the list splits around it so
+/// whatever followed stays a definition list below. Returns the new paragraph's path.
+///
+/// `part` addresses the empty leaf within `items[item]` — a term or a definition paragraph.
+pub fn exit_definition_list(doc: &mut Document, path: &TreePath) -> Option<TreePath> {
+    #[derive(Clone, Copy)]
+    enum Part {
+        Term(usize),
+        Para(usize),
+    }
+    let (item, part) = match path.0.last()? {
+        PathSegment::DefinitionTerm { item, term } => (*item, Part::Term(*term)),
+        PathSegment::DefinitionPara { item, para } => (*item, Part::Para(*para)),
+        _ => return None,
+    };
+    let list_path = parent_path(path);
+
+    let mut before = match node_at_mut(doc, &list_path)? {
+        NodeMut::Para(Paragraph::DefinitionList { items }) => {
+            if item >= items.len() {
+                return None;
+            }
+            std::mem::take(items)
+        }
+        _ => return None,
+    };
+    let mut after = before.split_off(item + 1);
+    let mut cur = before.pop()?;
+
+    // Split the cursor's item around the empty leaf: what precedes it stays above the new
+    // paragraph, what follows it moves below. A tail with no term of its own becomes a
+    // term-less item, which is how a definition without a term is already represented.
+    let tail = match part {
+        Part::Term(t) => {
+            if t >= cur.terms.len() {
+                return None;
+            }
+            let mut tail_terms = cur.terms.split_off(t);
+            tail_terms.remove(0);
+            DefinitionItem::new()
+                .with_terms(tail_terms)
+                .with_definition(std::mem::take(&mut cur.definition))
+        }
+        Part::Para(p) => {
+            if p >= cur.definition.len() {
+                return None;
+            }
+            let mut tail_defs = cur.definition.split_off(p);
+            tail_defs.remove(0);
+            DefinitionItem::new().with_definition(tail_defs)
+        }
+    };
+    if !(cur.terms.is_empty() && cur.definition.is_empty()) {
+        before.push(cur);
+    }
+    if !(tail.terms.is_empty() && tail.definition.is_empty()) {
+        after.insert(0, tail);
+    }
+
+    let mut replacement: Vec<Paragraph> = Vec::new();
+    if !before.is_empty() {
+        replacement.push(Paragraph::DefinitionList { items: before });
+    }
+    let moved = replacement.len();
+    replacement.push(Paragraph::new_text());
+    if !after.is_empty() {
+        replacement.push(Paragraph::DefinitionList { items: after });
+    }
+
+    let base = container_splice(doc, &list_path, replacement)?;
+    Some(container_child_path(&list_path, base + moved))
+}
+
+/// Lift a definition term out of its list as a plain paragraph, splitting the list around it.
+/// Used when a term is retyped: it stops being a term, and the caller applies the new type to
+/// every paragraph this produced.
+///
+/// **The item's other halves keep their place.** Terms before the lifted one stay in a list
+/// above it; terms after it stay in a list below, keeping the definition they head. Only when
+/// no term is left to head the definition — the lifted term was the item's last — does the
+/// definition come out with it, so a one-term item yields the term and its definition as two
+/// plain paragraphs and nothing is ever orphaned above a term that no longer exists.
+///
+/// Returns the first lifted paragraph's path and how many were lifted.
+pub fn lift_definition_term(doc: &mut Document, path: &TreePath) -> Option<(TreePath, usize)> {
+    let PathSegment::DefinitionTerm { item, term } = path.0.last()?.clone() else {
+        return None;
+    };
+    let list_path = parent_path(path);
+    let mut before = take_definition_items(doc, &list_path, item)?;
+    let mut after = before.split_off(item + 1);
+    let mut cur = before.pop()?;
+    if term >= cur.terms.len() {
+        return None;
+    }
+
+    let mut trailing_terms = cur.terms.split_off(term);
+    let spans = trailing_terms.remove(0);
+    let leading_terms = std::mem::take(&mut cur.terms);
+    let mut lifted = vec![Paragraph::new_text().with_content(spans)];
+
+    if !leading_terms.is_empty() {
+        before.push(DefinitionItem::new().with_terms(leading_terms));
+    }
+    if trailing_terms.is_empty() {
+        // Nothing below it still heads the definition, so it follows the term out.
+        lifted.extend(cur.definition);
+    } else {
+        after.insert(
+            0,
+            DefinitionItem::new()
+                .with_terms(trailing_terms)
+                .with_definition(cur.definition),
+        );
+    }
+    splice_around_definition_list(doc, &list_path, before, lifted, after)
+}
+
+/// Lift a definition paragraph out of its list to just below it, taking the paragraphs that
+/// followed it in the same definition along so nothing is reordered. The item keeps its
+/// terms and, if that emptied its definition, a fresh empty one to type into; the list splits
+/// when items follow. Used when a *definition* is retyped: the content leaves the list but
+/// the term it defined stays a term.
+///
+/// Returns the lifted paragraph's path and how many paragraphs moved with it.
+pub fn lift_definition_para(doc: &mut Document, path: &TreePath) -> Option<(TreePath, usize)> {
+    let PathSegment::DefinitionPara { item, para } = path.0.last()?.clone() else {
+        return None;
+    };
+    let list_path = parent_path(path);
+    let mut before = take_definition_items(doc, &list_path, item)?;
+    let after = before.split_off(item + 1);
+    let mut cur = before.pop()?;
+    if para >= cur.definition.len() {
+        return None;
+    }
+    let lifted = cur.definition.split_off(para);
+
+    // A term with nothing left under it keeps an empty definition to type into. An item with
+    // no term to keep — a term-less item holding only this paragraph — simply goes away.
+    if !cur.terms.is_empty() {
+        if cur.definition.is_empty() {
+            cur.definition.push(Paragraph::new_text());
+        }
+        before.push(cur);
+    } else if !cur.definition.is_empty() {
+        before.push(cur);
+    }
+    splice_around_definition_list(doc, &list_path, before, lifted, after)
+}
+
+/// Take the items out of the definition list at `list_path`, checking `item` is in range.
+fn take_definition_items(
+    doc: &mut Document,
+    list_path: &TreePath,
+    item: usize,
+) -> Option<Vec<DefinitionItem>> {
+    match node_at_mut(doc, list_path)? {
+        NodeMut::Para(Paragraph::DefinitionList { items }) => {
+            if item >= items.len() {
+                return None;
+            }
+            Some(std::mem::take(items))
+        }
+        _ => None,
+    }
+}
+
+/// Replace the definition list at `list_path` with `lifted` sandwiched between the items
+/// that stay above and below it, each half kept as a list of its own (and dropped when
+/// empty). Returns the first lifted paragraph's path and how many were lifted.
+fn splice_around_definition_list(
+    doc: &mut Document,
+    list_path: &TreePath,
+    before: Vec<DefinitionItem>,
+    lifted: Vec<Paragraph>,
+    after: Vec<DefinitionItem>,
+) -> Option<(TreePath, usize)> {
+    let count = lifted.len();
+    let mut replacement: Vec<Paragraph> = Vec::new();
+    if !before.is_empty() {
+        replacement.push(Paragraph::DefinitionList { items: before });
+    }
+    let start = replacement.len();
+    replacement.extend(lifted);
+    if !after.is_empty() {
+        replacement.push(Paragraph::DefinitionList { items: after });
+    }
+
+    let base = container_splice(doc, list_path, replacement)?;
+    Some((container_child_path(list_path, base + start), count))
 }
 
 fn list_ordered(p: &Paragraph) -> Option<bool> {
@@ -429,8 +979,9 @@ impl ListKind {
     }
 }
 
-/// Immutably descend to the `Paragraph` at `path` (through quotes and lists). Returns
-/// `None` if the path leaves the paragraph tree (e.g. into a checklist item).
+/// Immutably descend to the `Paragraph` at `path` (through quotes, lists and definitions).
+/// Returns `None` if the path leaves the paragraph tree (e.g. into a checklist item or a
+/// definition's term, neither of which is a `Paragraph`).
 fn para_at<'a>(doc: &'a Document, path: &TreePath) -> Option<&'a Paragraph> {
     let mut segs = path.0.iter();
     let PathSegment::Paragraph(i) = segs.next()? else {
@@ -444,6 +995,9 @@ fn para_at<'a>(doc: &'a Document, path: &TreePath) -> Option<&'a Paragraph> {
                 Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
                 PathSegment::ListEntry { entry, para },
             ) => entries.get(*entry)?.get(*para)?,
+            (Paragraph::DefinitionList { items }, PathSegment::DefinitionPara { item, para }) => {
+                items.get(*item)?.definition.get(*para)?
+            }
             _ => return None,
         };
     }
@@ -481,18 +1035,20 @@ pub fn list_node_kind(p: &Paragraph) -> Option<ListKind> {
 /// Fold a run of top-level paragraphs into a list/checklist of `target` kind.
 ///
 /// Existing list/checklist nodes contribute their items (remapped to the target kind); a quote
-/// contributes its children, recursively, so quoted paragraphs become items of their own; every
-/// leaf paragraph becomes one item, flattened to plain text (dropping heading/code styling) —
-/// the same flattening a single-paragraph list toggle performs.
+/// contributes its children and a definition list its terms and definition paragraphs, both
+/// recursively, so what they hold becomes items of their own; every leaf paragraph becomes one
+/// item, flattened to plain text (dropping heading/code styling) — the same flattening a
+/// single-paragraph list toggle performs.
 ///
-/// The result is normally a single node, but a table has no item representation — a checklist
-/// item holds inline spans only, and a table inside a list entry does not render with its
-/// marker — so it stays as it is and splits the run into several nodes rather than being
-/// dropped. Callers therefore splice the returned paragraphs in; the vector is never empty.
+/// The result is normally a single node, but neither a table nor a horizontal rule has an item
+/// representation — a checklist item holds inline spans only, a table inside a list entry does
+/// not render with its marker, and a rule has no inline form at all — so such a block stays as
+/// it is and splits the run into several nodes rather than being dropped. Callers therefore
+/// splice the returned paragraphs in; the vector is never empty.
 pub fn paragraphs_into_lists(paragraphs: Vec<Paragraph>, target: ListKind) -> Vec<Paragraph> {
-    // A quote owns no inline content of its own, so flatten it to the paragraphs it holds
-    // instead of turning it into one empty item.
-    let paragraphs = dissolve_quotes(paragraphs);
+    // A quote and a definition list own no inline content of their own, so flatten them to the
+    // paragraphs they hold instead of turning them into one empty item.
+    let paragraphs = dissolve_itemless_containers(paragraphs);
     let ordered = target == ListKind::Ordered;
     let mut out: Vec<Paragraph> = Vec::new();
     // Items collected for the list currently being built, as entries (checklist items are
@@ -526,11 +1082,12 @@ pub fn paragraphs_into_lists(paragraphs: Vec<Paragraph>, target: ListKind) -> Ve
 
     for p in paragraphs {
         match (target, p) {
-            // A table cannot become an item of any kind: leave it standing between two lists
-            // instead of losing its rows.
-            (_, table @ Paragraph::Table { .. }) => {
+            // Neither a table nor a horizontal rule can become an item of any kind: leave it
+            // standing between two lists instead of losing the table's rows, or leaving an
+            // empty bullet where the rule was.
+            (_, block @ (Paragraph::Table { .. } | Paragraph::HorizontalRule)) => {
                 flush(&mut out, &mut entries, &mut items, target, ordered);
-                out.push(table);
+                out.push(block);
             }
             (ListKind::Checklist, p) => match p {
                 Paragraph::OrderedList { entries: es }
@@ -539,7 +1096,7 @@ pub fn paragraphs_into_lists(paragraphs: Vec<Paragraph>, target: ListKind) -> Ve
                 }
                 Paragraph::Checklist { items: its } => items.extend(its),
                 other => {
-                    items.push(ChecklistItem::new(false).with_content(other.content().to_vec()))
+                    items.push(ChecklistItem::new(false).with_content(paragraph_as_spans(&other)))
                 }
             },
             (_, p) => match p {
@@ -549,9 +1106,7 @@ pub fn paragraphs_into_lists(paragraphs: Vec<Paragraph>, target: ListKind) -> Ve
                     its.into_iter()
                         .map(|it| checklist_item_to_entry(it, ordered)),
                 ),
-                other => entries.push(vec![
-                    Paragraph::new_text().with_content(other.content().to_vec()),
-                ]),
+                other => entries.push(vec![delisted_paragraph(other)]),
             },
         }
     }
@@ -567,15 +1122,23 @@ pub fn paragraphs_into_lists(paragraphs: Vec<Paragraph>, target: ListKind) -> Ve
     out
 }
 
-/// Replace every quote in `paragraphs` with the paragraphs it holds, recursively. Used before a
-/// list/checklist conversion: a quote has no inline content of its own, so converting it as one
-/// paragraph would yield an empty item and drop everything inside it. Quotes nested inside list
-/// entries are left alone — only the run's own paragraphs are dissolved.
-fn dissolve_quotes(paragraphs: Vec<Paragraph>) -> Vec<Paragraph> {
+/// Replace every container that has no item form of its own — a quote, a definition list — with
+/// the paragraphs it holds, recursively. Used before a list/checklist conversion: neither owns
+/// inline content, so converting one as a single paragraph would yield an empty item and drop
+/// everything inside it. A definition list contributes one paragraph per term followed by its
+/// definition's paragraphs, exactly as [`definition_list_into_paragraphs`] lifts it out, so leaf
+/// order and count are preserved. Containers nested inside list entries are left alone — only
+/// the run's own paragraphs are dissolved.
+fn dissolve_itemless_containers(paragraphs: Vec<Paragraph>) -> Vec<Paragraph> {
     let mut out: Vec<Paragraph> = Vec::new();
     for p in paragraphs {
         match p {
-            Paragraph::Quote { children } => out.extend(dissolve_quotes(children)),
+            Paragraph::Quote { children } => out.extend(dissolve_itemless_containers(children)),
+            // A definition can hold a quote (or another definition list) of its own, so the
+            // lifted paragraphs go through the same pass again.
+            Paragraph::DefinitionList { items } => out.extend(dissolve_itemless_containers(
+                definition_list_into_paragraphs(items),
+            )),
             other => out.push(other),
         }
     }
@@ -613,12 +1176,51 @@ pub fn lists_into_paragraphs(paragraphs: Vec<Paragraph>) -> Vec<Paragraph> {
     out
 }
 
+/// Wrap a run of paragraphs into a single definition list: each paragraph becomes one
+/// item, mirroring how [`paragraphs_into_lists`] gives each paragraph its own list item.
+/// A paragraph that owns inline content becomes that item's *term*, with the definition
+/// left empty for the author to fill in (Enter at the end of a term opens it — see
+/// [`split_leaf`]). A paragraph that owns none — a nested list, table or rule — has no
+/// sensible term form, so it becomes a term-less item holding that paragraph as its
+/// definition rather than being flattened away. Either way one paragraph yields one
+/// leaf, so the leaf order and count are preserved.
+pub fn paragraphs_into_definition_list(paragraphs: Vec<Paragraph>) -> Paragraph {
+    let items = paragraphs
+        .into_iter()
+        .map(|p| match p {
+            Paragraph::Text { content }
+            | Paragraph::Header1 { content }
+            | Paragraph::Header2 { content }
+            | Paragraph::Header3 { content }
+            | Paragraph::CodeBlock { content } => DefinitionItem::new().with_terms(vec![content]),
+            other => DefinitionItem::new().with_definition(vec![other]),
+        })
+        .collect();
+    Paragraph::DefinitionList { items }
+}
+
+/// Expand definition-list items back into plain paragraphs: one text paragraph per term,
+/// followed by the definition's own paragraphs unchanged. The inverse of
+/// [`paragraphs_into_definition_list`]; preserves leaf order and count.
+pub fn definition_list_into_paragraphs(items: Vec<DefinitionItem>) -> Vec<Paragraph> {
+    let mut out = Vec::new();
+    for item in items {
+        for term in item.terms {
+            out.push(Paragraph::new_text().with_content(term));
+        }
+        out.extend(item.definition);
+    }
+    out
+}
+
 /// One paragraph as it looks after being lifted out of a list entry: a leaf loses its bullet and
 /// becomes plain text (dropping heading/code styling, as everywhere else), while a container — a
-/// quote, table or nested list — is kept whole. Flattening a container through `content()`, which
-/// is empty for one, would silently drop everything it holds.
+/// quote, table, nested list or definition list — is kept whole. Flattening a container through
+/// `content()`, which is empty for one, would silently drop everything it holds. A horizontal
+/// rule counts as a leaf but owns no inline content either, so it is kept as it is rather than
+/// flattened into an empty paragraph.
 pub(crate) fn delisted_paragraph(p: Paragraph) -> Paragraph {
-    if p.is_leaf() {
+    if p.is_leaf() && !matches!(p, Paragraph::HorizontalRule) {
         Paragraph::new_text().with_content(p.content().to_vec())
     } else {
         p
@@ -629,6 +1231,14 @@ pub(crate) fn delisted_paragraph(p: Paragraph) -> Paragraph {
 /// their own spans; a container owns none, so its descendants' text is joined instead — lossy in
 /// structure, but never silently empty.
 pub(crate) fn paragraph_as_spans(p: &Paragraph) -> Vec<Span> {
+    paragraphs_as_spans(std::slice::from_ref(p))
+}
+
+/// A whole run of paragraphs as the spans of *one* span-only sink: the same walk as
+/// [`paragraph_as_spans`], with a single space between neighbours so their text does not run
+/// together (`head` + `tail` → `head tail`, not `headtail`). Used when a multi-paragraph
+/// selection is wrapped in a single checklist item.
+pub(crate) fn paragraphs_as_spans(paragraphs: &[Paragraph]) -> Vec<Span> {
     fn push_text(out: &mut Vec<Span>, spans: &[Span]) {
         if spans.is_empty() {
             return;
@@ -661,11 +1271,19 @@ pub(crate) fn paragraph_as_spans(p: &Paragraph) -> Vec<Span> {
                     }
                 }
             }
+            Paragraph::DefinitionList { items } => {
+                for item in items {
+                    item.terms.iter().for_each(|t| push_text(out, t));
+                    item.definition.iter().for_each(|c| walk(out, c));
+                }
+            }
             leaf => push_text(out, leaf.content()),
         }
     }
     let mut out = Vec::new();
-    walk(&mut out, p);
+    for p in paragraphs {
+        walk(&mut out, p);
+    }
     out
 }
 
@@ -673,9 +1291,9 @@ pub(crate) fn paragraph_as_spans(p: &Paragraph) -> Vec<Span> {
 /// paragraph supplies the item text, and any continuation paragraphs / nested sublists
 /// become nested checklist children.
 fn entry_to_checklist_item(entry: Vec<Paragraph>) -> ChecklistItem {
-    // A quote as the entry's body has no inline content of its own; its paragraphs supply the
-    // item text and children instead of the item coming out empty.
-    let mut paras = dissolve_quotes(entry).into_iter().peekable();
+    // A quote or definition list as the entry's body has no inline content of its own; its
+    // paragraphs supply the item text and children instead of the item coming out empty.
+    let mut paras = dissolve_itemless_containers(entry).into_iter().peekable();
     // The entry's first paragraph supplies the item text — unless it is itself a list, which has
     // no text of its own and folds into the item's children below.
     let content = match paras.peek() {
@@ -895,13 +1513,20 @@ fn container_child_path(node_path: &TreePath, idx: usize) -> TreePath {
                 para: idx,
             })
         }
+        Some(PathSegment::DefinitionPara { item, .. }) => {
+            parent_path(node_path).child(PathSegment::DefinitionPara {
+                item: *item,
+                para: idx,
+            })
+        }
         _ => TreePath::root(idx),
     }
 }
 
 /// Replace the single node at `node_path` with `replacement` in its container: top-level
-/// paragraphs, a quote's children, or a list entry's paragraph vec (so a container nested
-/// inside a list item can be spliced too). Returns the base index of the replacement.
+/// paragraphs, a quote's children, a list entry's paragraph vec, or a definition's paragraph
+/// vec (so a container nested inside a list item or a definition can be spliced too). Returns
+/// the base index of the replacement.
 fn container_splice(
     doc: &mut Document,
     node_path: &TreePath,
@@ -936,6 +1561,19 @@ fn container_splice(
                         return None;
                     }
                     e.splice(para..=para, replacement);
+                    Some(para)
+                }
+                _ => None,
+            }
+        }
+        PathSegment::DefinitionPara { item, para } => {
+            match node_at_mut(doc, &parent_path(node_path))? {
+                NodeMut::Para(Paragraph::DefinitionList { items }) => {
+                    let def = &mut items.get_mut(item)?.definition;
+                    if para >= def.len() {
+                        return None;
+                    }
+                    def.splice(para..=para, replacement);
                     Some(para)
                 }
                 _ => None,
@@ -993,6 +1631,29 @@ pub fn move_sibling(doc: &mut Document, path: &TreePath, up: bool) -> Option<Tre
             items.swap(c, target);
             Some(parent.child(PathSegment::ChecklistItem(target)))
         }
+        // Terms reorder among the terms of their item, definition paragraphs among the
+        // paragraphs of theirs; neither crosses into the other, so the two halves of an
+        // item keep their shape.
+        PathSegment::DefinitionTerm { item, term } => {
+            let NodeMut::Para(Paragraph::DefinitionList { items }) = node_at_mut(doc, &parent)?
+            else {
+                return None;
+            };
+            let terms = &mut items.get_mut(item)?.terms;
+            let target = sibling_target(term, terms.len(), up)?;
+            terms.swap(term, target);
+            Some(parent.child(PathSegment::DefinitionTerm { item, term: target }))
+        }
+        PathSegment::DefinitionPara { item, para } => {
+            let NodeMut::Para(Paragraph::DefinitionList { items }) = node_at_mut(doc, &parent)?
+            else {
+                return None;
+            };
+            let definition = &mut items.get_mut(item)?.definition;
+            let target = sibling_target(para, definition.len(), up)?;
+            definition.swap(para, target);
+            Some(parent.child(PathSegment::DefinitionPara { item, para: target }))
+        }
     }
 }
 
@@ -1029,6 +1690,12 @@ pub fn move_block(doc: &mut Document, path: &TreePath, up: bool) -> Option<TreeP
             move_list_item(doc, path, up)
         }
         PathSegment::Paragraph(_) | PathSegment::QuoteChild(_) => move_plain_block(doc, path, up),
+        // Inside a definition list the move stays within the item: there is no
+        // "carry it out as a lone list" analogue for a term or a definition, so the
+        // edges of the item are simply where the move stops.
+        PathSegment::DefinitionTerm { .. } | PathSegment::DefinitionPara { .. } => {
+            move_sibling(doc, path, up)
+        }
     }
 }
 
@@ -1731,6 +2398,9 @@ pub fn dissolve_container(doc: &mut Document, container_path: &TreePath) -> Opti
             }
             out
         }
+        NodeMut::Para(Paragraph::DefinitionList { items }) => {
+            definition_list_into_paragraphs(std::mem::take(items))
+        }
         _ => return None,
     };
     container_splice(doc, container_path, paras)
@@ -2003,6 +2673,28 @@ fn sibling_slice<'a>(doc: &'a Document, child_path: &TreePath) -> Option<(&'a [P
     }
 }
 
+/// Fold the children `c0..=c1` of the container that holds `child_path` into list/checklist
+/// node(s) of `target` kind, in place — [`paragraphs_into_lists`] applied to a run that is not
+/// at the document top level, so a list toggle inside a quote builds the list inside that
+/// quote instead of having nothing to act on. Returns the index the new nodes start at, or
+/// `None` when the path names no such run (a list entry, a table cell, a definition term).
+pub fn children_into_lists(
+    doc: &mut Document,
+    child_path: &TreePath,
+    c0: usize,
+    c1: usize,
+    target: ListKind,
+) -> Option<usize> {
+    let (vec, _) = sibling_vec_mut(doc, child_path)?;
+    if c0 > c1 || c1 >= vec.len() {
+        return None;
+    }
+    let drained: Vec<Paragraph> = vec.drain(c0..=c1).collect();
+    let new_nodes = paragraphs_into_lists(drained, target);
+    vec.splice(c0..c0, new_nodes);
+    Some(c0)
+}
+
 fn with_last_index(path: &TreePath, idx: usize) -> TreePath {
     let mut segs = path.0.clone();
     if let Some(last) = segs.last_mut() {
@@ -2038,6 +2730,38 @@ pub fn merge_adjacent_lists(doc: &mut Document, list_path: &TreePath) -> TreePat
         cur -= 1;
     }
     with_last_index(list_path, cur)
+}
+
+/// Merge the definition list at `list_path` with any definition lists directly before or
+/// after it, the way [`merge_adjacent_lists`] joins same-kind lists. Splitting a list is how
+/// a term or a definition leaves it, so without this a leaf that leaves and comes back would
+/// leave the list permanently in pieces. Returns the merged list's path.
+pub fn merge_adjacent_definition_lists(doc: &mut Document, list_path: &TreePath) -> TreePath {
+    let Some((vec, idx)) = sibling_vec_mut(doc, list_path) else {
+        return list_path.clone();
+    };
+    if !matches!(vec.get(idx), Some(Paragraph::DefinitionList { .. })) {
+        return list_path.clone();
+    }
+    let mut cur = idx;
+    while cur + 1 < vec.len() && matches!(vec[cur + 1], Paragraph::DefinitionList { .. }) {
+        let next = vec.remove(cur + 1);
+        append_definition_items(&mut vec[cur], next);
+    }
+    while cur > 0 && matches!(vec[cur - 1], Paragraph::DefinitionList { .. }) {
+        let moved = vec.remove(cur);
+        append_definition_items(&mut vec[cur - 1], moved);
+        cur -= 1;
+    }
+    with_last_index(list_path, cur)
+}
+
+fn append_definition_items(dst: &mut Paragraph, src: Paragraph) {
+    if let (Paragraph::DefinitionList { items }, Paragraph::DefinitionList { items: from }) =
+        (dst, src)
+    {
+        items.extend(from);
+    }
 }
 
 /// Indent the list/checklist item at `path` beneath its previous sibling (nesting it in a
@@ -2231,11 +2955,245 @@ fn nest_first_item_into_preceding_quote(doc: &mut Document, path: &TreePath) -> 
 
 /// Indent the list/checklist item at `path`, or — for the first item of a top-level list
 /// that follows another list — merge it into that preceding list, or — for the first item of
-/// a list that follows a quote — nest it into that quote (keeping it a list item).
+/// a list that follows a quote or a definition list — nest it into that container (keeping it
+/// a list item).
 pub fn indent_list_item_or_merge(doc: &mut Document, path: &TreePath) -> Option<TreePath> {
     indent_list_item(doc, path)
         .or_else(|| merge_first_item_into_preceding_list(doc, path))
         .or_else(|| nest_first_item_into_preceding_quote(doc, path))
+        .or_else(|| nest_first_item_into_preceding_definition(doc, path))
+}
+
+/// Nest the first item of a list/checklist that directly follows a definition list into that
+/// list's last definition, as another paragraph of it — the item stays the kind of item it is,
+/// joining a list of that kind already ending the definition or starting one at its end. So a
+/// list typed under a definition is pulled into it with Tab, the way one typed under a quote is
+/// pulled into the quote. The inverse of Shift-Tab lifting it back out
+/// ([`exit_definition_list_item`], [`exit_definition_checklist_item`]).
+fn nest_first_item_into_preceding_definition(
+    doc: &mut Document,
+    path: &TreePath,
+) -> Option<TreePath> {
+    // The detached item, keeping the shape its kind of list holds it in.
+    enum Moved {
+        Entry(Vec<Paragraph>),
+        Item(ChecklistItem),
+    }
+    // Only the first item of a list/checklist qualifies (cursor anywhere in it).
+    let checkbox = match path.0.last()? {
+        PathSegment::ListEntry { entry: 0, .. } => false,
+        PathSegment::ChecklistItem(0) => true,
+        _ => return None,
+    };
+    let list_path = parent_path(path);
+    let (vec, idx) = sibling_slice(doc, &list_path)?;
+    if idx == 0 || !matches!(vec.get(idx - 1)?, Paragraph::DefinitionList { .. }) {
+        return None;
+    }
+    // Detach the first item, remembering a list's kind so the item stays the same kind.
+    let ordered = match node_at_mut(doc, &list_path)? {
+        NodeMut::Para(p) => list_ordered(p),
+        _ => return None,
+    };
+    let moved = match node_at_mut(doc, &list_path)? {
+        NodeMut::Para(Paragraph::Checklist { items }) if checkbox => {
+            if items.is_empty() {
+                return None;
+            }
+            Moved::Item(items.remove(0))
+        }
+        NodeMut::Para(
+            Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
+        ) if !checkbox => {
+            if entries.is_empty() {
+                return None;
+            }
+            Moved::Entry(entries.remove(0))
+        }
+        _ => return None,
+    };
+    let emptied = match node_at_mut(doc, &list_path)? {
+        NodeMut::Para(Paragraph::Checklist { items }) => items.is_empty(),
+        NodeMut::Para(
+            Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
+        ) => entries.is_empty(),
+        _ => false,
+    };
+    let (cvec, cidx) = sibling_vec_mut(doc, &list_path)?;
+    let prev = cidx - 1;
+    let (item, dpara, child) = match &mut cvec[prev] {
+        Paragraph::DefinitionList { items } => {
+            // The paragraph under a definition list belongs to the definition that ends it.
+            let item = items.len().checked_sub(1)?;
+            let def = &mut items[item].definition;
+            // An empty paragraph the definition is only holding open (what lifting its content
+            // out leaves behind) is the slot to fill, not something to keep above the list.
+            if matches!(def.last(), Some(Paragraph::Text { content }) if content.is_empty()) {
+                def.pop();
+            }
+            match moved {
+                // Reuse whatever ordered/unordered list already ends the definition — a bullet
+                // pulled in under a numbered list joins it, as indenting under an item does.
+                Moved::Entry(entry) if matches!(def.last(), Some(p) if list_ordered(p).is_some()) =>
+                {
+                    let di = def.len() - 1;
+                    match &mut def[di] {
+                        Paragraph::OrderedList { entries }
+                        | Paragraph::UnorderedList { entries } => {
+                            entries.push(entry);
+                            let e = entries.len() - 1;
+                            (item, di, PathSegment::ListEntry { entry: e, para: 0 })
+                        }
+                        _ => return None,
+                    }
+                }
+                Moved::Entry(entry) => {
+                    def.push(new_list(ordered?, vec![entry]));
+                    (
+                        item,
+                        def.len() - 1,
+                        PathSegment::ListEntry { entry: 0, para: 0 },
+                    )
+                }
+                // A checklist keeps its checkboxes, so it only joins another checklist.
+                Moved::Item(it) if matches!(def.last(), Some(Paragraph::Checklist { .. })) => {
+                    let di = def.len() - 1;
+                    match &mut def[di] {
+                        Paragraph::Checklist { items } => {
+                            items.push(it);
+                            (item, di, PathSegment::ChecklistItem(items.len() - 1))
+                        }
+                        _ => return None,
+                    }
+                }
+                Moved::Item(it) => {
+                    def.push(Paragraph::new_checklist().with_checklist_items(vec![it]));
+                    (item, def.len() - 1, PathSegment::ChecklistItem(0))
+                }
+            }
+        }
+        _ => return None,
+    };
+    if emptied {
+        cvec.remove(cidx); // `prev < cidx`, so the definition list's index is unaffected
+    }
+    Some(
+        with_last_index(&list_path, prev)
+            .child(PathSegment::DefinitionPara { item, para: dpara })
+            .child(child),
+    )
+}
+
+/// Lift the list item at `entry` out of the definition list whose definition holds its list,
+/// back to a list of its own just below that definition list — the inverse of Tab nesting a
+/// following list's first item into a definition. The entries below it come along so nothing
+/// is reordered, the definition list splits when items follow (as any definition paragraph
+/// leaving does), and the lifted list rejoins an adjacent same-kind list instead of leaving a
+/// seam where it came from.
+fn exit_definition_list_item(
+    doc: &mut Document,
+    list_path: &TreePath,
+    entry: usize,
+    para: usize,
+) -> Option<TreePath> {
+    let PathSegment::DefinitionPara { item, para: dpara } = list_path.0.last()?.clone() else {
+        return None;
+    };
+    let ordered = match node_at_mut(doc, list_path)? {
+        NodeMut::Para(p) => list_ordered(p)?,
+        _ => return None,
+    };
+    // Carve the item and the entries below it out into a list paragraph of their own inside
+    // the definition, so the ordinary definition-paragraph lift can take it from there.
+    let entries = match node_at_mut(doc, list_path)? {
+        NodeMut::Para(
+            Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries },
+        ) => {
+            if entry >= entries.len() {
+                return None;
+            }
+            std::mem::take(entries)
+        }
+        _ => return None,
+    };
+    let mut before = entries;
+    let moved = before.split_off(entry);
+    let mut replacement: Vec<Paragraph> = Vec::new();
+    if !before.is_empty() {
+        replacement.push(new_list(ordered, before));
+    }
+    let moved_at = dpara + replacement.len();
+    replacement.push(new_list(ordered, moved));
+    container_splice(doc, list_path, replacement)?;
+
+    let moved_path = parent_path(list_path).child(PathSegment::DefinitionPara {
+        item,
+        para: moved_at,
+    });
+    let (lifted, _) = lift_definition_para(doc, &moved_path)?;
+    let (merged, shift) = rejoin_lifted_list(doc, &lifted)?;
+    Some(merged.child(PathSegment::ListEntry { entry: shift, para }))
+}
+
+/// Lift the checklist item `c` out of the definition list whose definition holds its
+/// checklist — [`exit_definition_list_item`] for a checklist, keeping the checkboxes.
+fn exit_definition_checklist_item(
+    doc: &mut Document,
+    list_path: &TreePath,
+    c: usize,
+) -> Option<TreePath> {
+    let PathSegment::DefinitionPara { item, para: dpara } = list_path.0.last()?.clone() else {
+        return None;
+    };
+    let items = match node_at_mut(doc, list_path)? {
+        NodeMut::Para(Paragraph::Checklist { items }) => {
+            if c >= items.len() {
+                return None;
+            }
+            std::mem::take(items)
+        }
+        _ => return None,
+    };
+    let mut before = items;
+    let moved = before.split_off(c);
+    let mut replacement: Vec<Paragraph> = Vec::new();
+    if !before.is_empty() {
+        replacement.push(Paragraph::new_checklist().with_checklist_items(before));
+    }
+    let moved_at = dpara + replacement.len();
+    replacement.push(Paragraph::new_checklist().with_checklist_items(moved));
+    container_splice(doc, list_path, replacement)?;
+
+    let moved_path = parent_path(list_path).child(PathSegment::DefinitionPara {
+        item,
+        para: moved_at,
+    });
+    let (lifted, _) = lift_definition_para(doc, &moved_path)?;
+    let (merged, shift) = rejoin_lifted_list(doc, &lifted)?;
+    Some(merged.child(PathSegment::ChecklistItem(shift)))
+}
+
+/// Fold the list just lifted out of a definition back together with the same-kind lists it
+/// landed between — the list it came from is usually right there again, and adjacent same-kind
+/// lists are one list everywhere else. Returns the merged list's path and the index its own
+/// first item ended up at (a preceding list's items come before it).
+fn rejoin_lifted_list(doc: &mut Document, lifted: &TreePath) -> Option<(TreePath, usize)> {
+    let shift = match sibling_slice(doc, lifted) {
+        Some((vec, i)) if i > 0 && list_like_kind(&vec[i - 1]) == list_like_kind(vec.get(i)?) => {
+            list_item_count(&vec[i - 1])
+        }
+        _ => 0,
+    };
+    Some((merge_adjacent_lists(doc, lifted), shift))
+}
+
+/// How many entries/items a list-like paragraph holds (0 for anything else).
+fn list_item_count(p: &Paragraph) -> usize {
+    match p {
+        Paragraph::OrderedList { entries } | Paragraph::UnorderedList { entries } => entries.len(),
+        Paragraph::Checklist { items } => items.len(),
+        _ => 0,
+    }
 }
 
 pub fn indent_list_item(doc: &mut Document, path: &TreePath) -> Option<TreePath> {
@@ -2361,7 +3319,7 @@ pub fn outdent_list_item_delisting(doc: &mut Document, path: &TreePath) -> Optio
 fn outdent_list_item_inner(
     doc: &mut Document,
     path: &TreePath,
-    keep_list_in_quote: bool,
+    keep_bullet: bool,
 ) -> Option<TreePath> {
     let last = path.0.last()?.clone();
     let pp = parent_path(path);
@@ -2426,8 +3384,14 @@ fn outdent_list_item_inner(
             // list item (splitting the quote around it) — the inverse of Tab nesting a list
             // item into a preceding quote — unless we are delisting, in which case fall through
             // to drop it into the quote as a plain text child.
-            Some(PathSegment::QuoteChild(_)) if keep_list_in_quote => {
+            Some(PathSegment::QuoteChild(_)) if keep_bullet => {
                 exit_quote_list_item(doc, &pp, entry, para)
+            }
+            // Likewise a list inside a definition: the item leaves the definition list as a
+            // list of its own — the inverse of Tab pulling it in. Delisting instead drops it
+            // into the definition as a plain paragraph, through the fall-through below.
+            Some(PathSegment::DefinitionPara { .. }) if keep_bullet => {
+                exit_definition_list_item(doc, &pp, entry, para)
             }
             _ => exit_list_to_container(doc, &pp, entry, para),
         },
@@ -2465,6 +3429,11 @@ fn outdent_list_item_inner(
             Some(PathSegment::ListEntry { entry, para }) => {
                 let (oe, op) = (*entry, *para);
                 exit_nested_checklist_item(doc, &pp, oe, op, c)
+            }
+            // A checklist inside a definition: the item leaves the definition list keeping its
+            // checkbox — the inverse of Tab pulling it in.
+            Some(PathSegment::DefinitionPara { .. }) if keep_bullet => {
+                exit_definition_checklist_item(doc, &pp, c)
             }
             _ => exit_checklist_to_container(doc, &pp, c),
         },
@@ -2702,6 +3671,80 @@ mod tests {
         assert_eq!(doc.paragraphs.len(), 2);
         assert!(matches!(doc.paragraphs[0], Paragraph::Text { .. }));
         assert!(matches!(doc.paragraphs[1], Paragraph::Text { .. }));
+    }
+
+    #[test]
+    fn dissolve_bullet_list_keeps_a_horizontal_rule_entry() {
+        // A rule is a leaf with no inline content: flattening it through `content()` on the way
+        // out of the list would leave an empty paragraph where the rule was.
+        let mut doc = parse("x");
+        doc.paragraphs = vec![
+            Paragraph::new_unordered_list()
+                .with_entries(vec![vec![text("lead")], vec![Paragraph::HorizontalRule]]),
+        ];
+        assert_eq!(dissolve_container(&mut doc, &TreePath::root(0)), Some(0));
+        assert!(
+            matches!(doc.paragraphs[1], Paragraph::HorizontalRule),
+            "{:?}",
+            doc.paragraphs
+        );
+    }
+
+    #[test]
+    fn definition_list_into_a_bullet_list_yields_one_item_per_leaf() {
+        let dl = Paragraph::DefinitionList {
+            items: vec![
+                DefinitionItem::new()
+                    .with_terms(vec![vec![Span::new_text("Coffee")]])
+                    .with_definition(vec![text("Black hot drink")]),
+            ],
+        };
+        let out = paragraphs_into_lists(vec![dl], ListKind::Unordered);
+        let Some(Paragraph::UnorderedList { entries }) = out.first() else {
+            panic!("expected one list, got {out:?}");
+        };
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0][0].content()[0].text, "Coffee");
+        assert_eq!(entries[1][0].content()[0].text, "Black hot drink");
+    }
+
+    #[test]
+    fn definition_holding_a_quote_dissolves_all_the_way_down() {
+        // The pass recurses: a quote inside a definition contributes items of its own rather
+        // than arriving as an empty one.
+        let dl = Paragraph::DefinitionList {
+            items: vec![
+                DefinitionItem::new()
+                    .with_terms(vec![vec![Span::new_text("Term")]])
+                    .with_definition(vec![
+                        Paragraph::new_quote().with_children(vec![text("quoted")]),
+                    ]),
+            ],
+        };
+        let out = paragraphs_into_lists(vec![dl], ListKind::Unordered);
+        let Some(Paragraph::UnorderedList { entries }) = out.first() else {
+            panic!("expected one list, got {out:?}");
+        };
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1][0].content()[0].text, "quoted");
+    }
+
+    #[test]
+    fn paragraph_as_spans_reaches_terms_and_definitions() {
+        // The span-only sink (a checklist item): a definition list owns no inline content, so
+        // its terms and definitions have to be joined rather than coming out empty.
+        let dl = Paragraph::DefinitionList {
+            items: vec![
+                DefinitionItem::new()
+                    .with_terms(vec![vec![Span::new_text("Coffee")]])
+                    .with_definition(vec![text("Black hot drink")]),
+            ],
+        };
+        let joined: String = paragraph_as_spans(&dl)
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(joined, "Coffee Black hot drink");
     }
 
     #[test]
@@ -2973,6 +4016,15 @@ mod tests {
         let item = TreePath::root(1).child(PathSegment::ListEntry { entry: 0, para: 0 });
         remove_node_at(&mut doc, &item);
         assert_eq!(md(&doc).trim(), "Before\n\nAfter");
+    }
+
+    #[test]
+    fn removing_a_checklist_item_keeps_its_subitems() {
+        // Subitems live inside the item, so a plain removal would take them along.
+        let mut doc = parse("- [ ] a\n  - [ ] sub\n- [ ] b");
+        let item = TreePath::root(0).child(PathSegment::ChecklistItem(0));
+        remove_node_at(&mut doc, &item);
+        assert_eq!(md(&doc).trim(), "- [ ] sub\n- [ ] b");
     }
 
     #[test]

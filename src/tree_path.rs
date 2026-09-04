@@ -13,6 +13,10 @@
 //   - `ListEntry{entry, para}` — into the current list's `entries[entry][para]`.
 //   - `ChecklistItem(i)`  — into the current `Checklist`'s `items[i]`, or (when the
 //                           current node is itself a checklist item) its `children[i]`.
+//   - `DefinitionTerm{item, term}` — into the current `DefinitionList`'s
+//                           `items[item].terms[term]`.
+//   - `DefinitionPara{item, para}` — into the current `DefinitionList`'s
+//                           `items[item].definition[para]`.
 
 use std::cmp::Ordering;
 
@@ -26,19 +30,31 @@ pub enum PathSegment {
     ListEntry { entry: usize, para: usize },
     /// Index into a `Checklist`'s `items`, or a checklist item's `children`.
     ChecklistItem(usize),
+    /// Index into a `DefinitionList`'s `items[item]`, then the `term`-th term (`<dt>`)
+    /// of that item. A term owns inline content directly, so it is a leaf.
+    DefinitionTerm { item: usize, term: usize },
+    /// Index into a `DefinitionList`'s `items[item]`, then the `para`-th paragraph of
+    /// that item's definition (`<dd>`). The paragraph is a full block and may itself
+    /// be a container.
+    DefinitionPara { item: usize, para: usize },
 }
 
 impl PathSegment {
     /// Sibling ordering key used to compare two paths in document order. Two paths that
     /// share an identical prefix select children of the *same* container at the first
     /// divergence, so the diverging segments are always the same variant and these keys
-    /// are directly comparable.
-    fn order_key(&self) -> (usize, usize) {
+    /// are directly comparable — with one exception: a definition list's terms and its
+    /// definition paragraphs are siblings under the same item and use *different*
+    /// variants. The middle component is the tie-breaker that keeps an item's terms
+    /// ahead of its definition, matching the order they render in.
+    fn order_key(&self) -> (usize, usize, usize) {
         match *self {
-            PathSegment::Paragraph(i) => (i, 0),
-            PathSegment::QuoteChild(c) => (c, 0),
-            PathSegment::ListEntry { entry, para } => (entry, para),
-            PathSegment::ChecklistItem(i) => (i, 0),
+            PathSegment::Paragraph(i) => (i, 0, 0),
+            PathSegment::QuoteChild(c) => (c, 0, 0),
+            PathSegment::ListEntry { entry, para } => (entry, para, 0),
+            PathSegment::ChecklistItem(i) => (i, 0, 0),
+            PathSegment::DefinitionTerm { item, term } => (item, 0, term),
+            PathSegment::DefinitionPara { item, para } => (item, 1, para),
         }
     }
 }

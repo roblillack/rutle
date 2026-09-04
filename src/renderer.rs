@@ -63,6 +63,21 @@ struct TableLayout {
     row_y: Vec<i32>,
 }
 
+/// Geometry for painting a horizontal rule. A rule has no runs to draw from, so
+/// layout records its span here and `draw` paints it. Coordinates are in layout
+/// space (relative to the widget's content origin, before scroll translation).
+#[derive(Debug, Clone)]
+struct RuleLayout {
+    /// Left edge of the rule (the enclosing block's content column).
+    x: i32,
+    /// Width of the rule's content column.
+    width: i32,
+    /// Top of the row the rule was given.
+    y: i32,
+    /// Height of that row; the rule is centered within it.
+    height: i32,
+}
+
 /// Finalize the current visual line: record its char range and wrap flag, then
 /// move it into `lines`. Shared by the wrapping engine and `push_token_wrapped`.
 fn push_line(
@@ -582,13 +597,15 @@ pub struct ContentLineMetrics {
 }
 
 /// Classic-Pure (top, bottom) block margins, in line-height units, used when
-/// `Theme::classic_block_spacing` is on. Only headings carry margins; every
-/// other block relies on the base inter-block gap.
+/// `Theme::classic_block_spacing` is on. Only headings and horizontal rules carry
+/// margins; every other block relies on the base inter-block gap.
 fn classic_margins(block_type: &BlockType) -> (i32, i32) {
     match block_type {
         BlockType::Heading { level: 1 } => (3, 3),
         BlockType::Heading { level: 2 } => (3, 2),
         BlockType::Heading { .. } => (2, 1),
+        // Two blank rows either side, matching `tdoc`'s terminal formatter.
+        BlockType::HorizontalRule => (2, 2),
         _ => (0, 0),
     }
 }
@@ -684,6 +701,10 @@ pub struct Renderer {
     // Grid geometry for table blocks, parallel to layout_lines (cell text lives
     // in layout_lines; borders/header fills are drawn from this).
     table_layouts: Vec<TableLayout>,
+    // Geometry for horizontal-rule blocks. A rule has no runs, so its layout line
+    // is empty (it exists only to make the rule a cursor stop) and the rule itself
+    // is painted from this.
+    rule_layouts: Vec<RuleLayout>,
     // The leaves of the current layout frame, in document order. `block_index` on
     // layout lines/runs is an index into this (a transient projection of the
     // authoritative tdoc tree, rebuilt every layout — not a parallel document model).
@@ -741,6 +762,7 @@ impl Renderer {
             editor: Editor::new(),
             layout_lines: Vec::new(),
             table_layouts: Vec::new(),
+            rule_layouts: Vec::new(),
             layout_leaves: Vec::new(),
             layout_blocks: Vec::new(),
             layout_leaf_bars: Vec::new(),
@@ -929,6 +951,7 @@ impl Renderer {
 
         self.layout_lines.clear();
         self.table_layouts.clear();
+        self.rule_layouts.clear();
 
         let content_width =
             self.w - 2 * self.theme.padding_horizontal - self.theme.wrap_width_reduction;
@@ -969,6 +992,7 @@ impl Renderer {
                 block_idx,
                 leaves[block_idx].quote_depth,
                 leaves[block_idx].list_levels,
+                leaves[block_idx].definition_depth,
                 current_y,
                 content_width,
                 ctx,
@@ -1560,6 +1584,7 @@ impl Renderer {
 
         let mut quotes = 0i32;
         let mut lists = 0i32;
+        let mut defs = 0i32;
         let mut bars = Vec::with_capacity(info.quote_depth);
         for seg in info.path.segments() {
             match seg {
@@ -1568,12 +1593,16 @@ impl Renderer {
                         self.theme.padding_horizontal
                             + quotes * self.theme.quote_indent
                             + list_part(lists)
+                            + defs * self.theme.definition_indent
                             + self.theme.quote_bar_offset,
                     );
                     quotes += 1;
                 }
                 PathSegment::ListEntry { .. } | PathSegment::ChecklistItem(_) => lists += 1,
-                PathSegment::Paragraph(_) => {}
+                // A definition body indents its contents; a term does not (it heads
+                // the body rather than sitting inside it), matching `definition_depth`.
+                PathSegment::DefinitionPara { .. } => defs += 1,
+                PathSegment::Paragraph(_) | PathSegment::DefinitionTerm { .. } => {}
             }
         }
         bars
@@ -1609,8 +1638,8 @@ impl Renderer {
 
     /// Layout a single block. `blocks`/`leaves` are the full frame slices (for sibling
     /// scans such as ordered-list run detection); `block_idx` indexes them.
-    /// `quote_depth`/`list_levels` come from the leaf and drive indentation independently of
-    /// the (flat) block type.
+    /// `quote_depth`/`list_levels`/`definition_depth` come from the leaf and drive
+    /// indentation independently of the (flat) block type.
     #[allow(clippy::too_many_arguments)]
     fn layout_block(
         &mut self,
@@ -1620,6 +1649,7 @@ impl Renderer {
         block_idx: usize,
         quote_depth: usize,
         list_levels: usize,
+        definition_depth: usize,
         y: i32,
         width: i32,
         ctx: &mut dyn RenderContext,
@@ -1627,9 +1657,12 @@ impl Renderer {
         // Indentation is driven by the leaf's tree depths, not its (flat) block type: a
         // continuation paragraph, code block, or list item nested inside a quote keeps both
         // its quote indent and its list indent even though its `BlockType` records only one.
+        // A definition body indents the same way, so a heading or nested list inside a
+        // `<dd>` sits under its term just as a plain paragraph does.
         let quote_indent = quote_depth as i32 * self.theme.quote_indent;
-        let start_x = self.theme.padding_horizontal + quote_indent;
-        let width = width - quote_indent;
+        let definition_indent = definition_depth as i32 * self.theme.definition_indent;
+        let start_x = self.theme.padding_horizontal + quote_indent + definition_indent;
+        let width = width - quote_indent - definition_indent;
         let default_line_height = self.theme.line_height;
 
         // Content that lives inside a list but is not itself a marker line (continuation
@@ -2052,7 +2085,59 @@ impl Renderer {
                 current_y + self.list_interior_trailing(blocks, leaves, block_idx)
             }
             BlockType::Table { rows } => self.layout_table(block_idx, rows, y, start_x, width, ctx),
+            BlockType::HorizontalRule => {
+                self.layout_horizontal_rule(block_idx, y, interior_x, interior_width)
+            }
+            // A term lays out like a paragraph in the term font; its own indentation is
+            // already in `interior_x` (a term carries no definition indent of its own,
+            // and `definition_indent` sets the definition below it apart). The gap that
+            // follows is tight so the term stays visually attached to that definition.
+            BlockType::DefinitionTerm { .. } => {
+                self.layout_inline_block(
+                    block,
+                    block_idx,
+                    y,
+                    interior_x,
+                    interior_width,
+                    default_line_height,
+                    ctx,
+                ) + self.theme.definition_term_spacing
+            }
         }
+    }
+
+    /// Lay out a horizontal rule. The rule owns one row of `line_height`, painted
+    /// by `draw_horizontal_rules` from the [`RuleLayout`] recorded here; the
+    /// matching `LayoutLine` is deliberately empty — it exists so the rule is a
+    /// hit-testable cursor stop like any other block, not because there is text.
+    ///
+    /// `horizontal_rule_spacing` opens the same extra gap above and below. Above it
+    /// stacks onto whatever trailing space the previous block left; below it is
+    /// paired with `paragraph_spacing` so a rule between two paragraphs sits
+    /// symmetrically between them.
+    fn layout_horizontal_rule(&mut self, block_idx: usize, y: i32, x: i32, width: i32) -> i32 {
+        let pad = self.theme.horizontal_rule_spacing;
+        let height = self.theme.line_height;
+        let row_y = y + pad;
+
+        self.layout_lines.push(LayoutLine {
+            y: row_y,
+            height,
+            base_x: x,
+            block_index: block_idx,
+            char_start: 0,
+            char_end: 0,
+            visual_char_end: 0,
+            runs: Vec::new(),
+        });
+        self.rule_layouts.push(RuleLayout {
+            x,
+            width,
+            y: row_y,
+            height,
+        });
+
+        row_y + height + pad + self.theme.paragraph_spacing
     }
 
     /// Lay out a read-only table: compute column widths, wrap each cell, and
@@ -2409,6 +2494,7 @@ impl Renderer {
             },
             BlockType::BlockQuote => self.theme.quote_text,
             BlockType::CodeBlock { .. } => self.theme.code_text,
+            BlockType::DefinitionTerm { .. } => self.theme.definition_term,
             _ => self.theme.plain_text,
         };
 
@@ -2812,6 +2898,48 @@ impl Renderer {
         }
     }
 
+    /// Draw every horizontal rule: a line spanning the block's content column, or
+    /// — when `theme.horizontal_rule_as_text` is set — the centered
+    /// `───── • ─────` ornament `tdoc`'s terminal formatter uses. A rule's layout
+    /// line carries no runs, so this pass is the only thing that paints it.
+    fn draw_horizontal_rules(&self, ctx: &mut dyn RenderContext) {
+        let viewport_top = self.scroll_offset;
+        let viewport_bottom = self.scroll_offset + self.h;
+        let f = self.theme.plain_text;
+
+        for rule in &self.rule_layouts {
+            if rule.y + rule.height < viewport_top || rule.y > viewport_bottom {
+                continue;
+            }
+            ctx.set_color(self.theme.horizontal_rule_color);
+
+            if self.theme.horizontal_rule_as_text {
+                // Five box-drawing glyphs either side of a spaced bullet, centered
+                // in the content column — the same ornament tdoc prints.
+                const ORNAMENT: &str = "───── • ─────";
+                let width =
+                    ctx.text_width(ORNAMENT, f.font_type, FontStyle::Regular, f.font_size) as i32;
+                let x = rule.x + (rule.width - width).max(0) / 2;
+                ctx.set_font(f.font_type, FontStyle::Regular, f.font_size);
+                ctx.draw_text(
+                    ORNAMENT,
+                    self.x + x,
+                    self.y + rule.y - self.scroll_offset + f.font_size as i32,
+                );
+            } else {
+                // A thin bar centered in the rule's row.
+                let thickness = self.theme.horizontal_rule_thickness.max(1);
+                let top = rule.y + (rule.height - thickness).max(0) / 2;
+                ctx.draw_rect_filled(
+                    self.x + rule.x,
+                    self.y + top - self.scroll_offset,
+                    rule.width.max(0),
+                    thickness,
+                );
+            }
+        }
+    }
+
     fn draw_tables(&self, ctx: &mut dyn RenderContext) {
         let viewport_top = self.scroll_offset;
         let viewport_bottom = self.scroll_offset + self.h;
@@ -2935,6 +3063,10 @@ impl Renderer {
         // backend asks for them.
         self.draw_heading_underlines(ctx);
         self.draw_code_fences(ctx);
+
+        // Horizontal rules — contentless blocks with nothing in the run loop to
+        // paint them.
+        self.draw_horizontal_rules(ctx);
 
         // Vertical quote bars run behind the text so a quote's paragraphs, list
         // items and nested content read as one continuous rule.
@@ -3828,7 +3960,8 @@ mod tests {
     use crate::tree_walk;
     use tdoc::Document;
     use tdoc::paragraph::{
-        ChecklistItem, Paragraph, TableCell as TdocTableCell, TableRow as TdocTableRow,
+        ChecklistItem, DefinitionItem, Paragraph, TableCell as TdocTableCell,
+        TableRow as TdocTableRow,
     };
 
     /// Build a single tdoc paragraph from a transient `Block` (test convenience).
@@ -3873,6 +4006,10 @@ mod tests {
                     })
                     .collect(),
             },
+            BlockType::HorizontalRule => Paragraph::new_horizontal_rule(),
+            BlockType::DefinitionTerm { .. } => Paragraph::DefinitionList {
+                items: vec![DefinitionItem::new().with_terms(vec![spans])],
+            },
         }
     }
 
@@ -3892,6 +4029,8 @@ mod tests {
         /// Every filled rect drawn this pass, as `(x, y, w, h)` — lets tests
         /// observe the caret bar and its foot tick.
         rects: Vec<(i32, i32, i32, i32)>,
+        /// Every text run drawn this pass, as `(text, x, y)`.
+        texts: Vec<(String, i32, i32)>,
     }
 
     impl TestRenderContext {
@@ -3909,7 +4048,9 @@ mod tests {
 
         fn set_font(&mut self, _font: FontType, _style: FontStyle, _size: u8) {}
 
-        fn draw_text(&mut self, _text: &str, _x: i32, _y: i32) {}
+        fn draw_text(&mut self, text: &str, x: i32, y: i32) {
+            self.texts.push((text.to_string(), x, y));
+        }
 
         fn draw_rect_filled(&mut self, x: i32, y: i32, w: i32, h: i32) {
             self.rects.push((x, y, w, h));
@@ -4806,5 +4947,99 @@ mod tests {
             "expected a zero-length line with non-zero offset, got offsets {:?}",
             zero_len_offsets
         );
+    }
+
+    // ----- Horizontal rules ----------------------------------------------------------
+
+    /// `A` / rule / `B`, laid out in a 400x300 view with the default theme.
+    fn rule_display() -> Renderer {
+        make_display_with_blocks(vec![
+            Block::paragraph().with_plain_text("A"),
+            Block::new(BlockType::HorizontalRule),
+            Block::paragraph().with_plain_text("B"),
+        ])
+    }
+
+    #[test]
+    fn horizontal_rule_lays_out_as_one_empty_stop() {
+        let mut display = rule_display();
+        let mut ctx = TestRenderContext::new_with_focus();
+        display.layout(&mut ctx);
+
+        // Exactly one line for the rule, carrying no runs: it exists so the rule
+        // is a hit-testable caret stop, not because there is anything to paint.
+        let lines: Vec<&LayoutLine> = display
+            .layout_lines
+            .iter()
+            .filter(|l| l.block_index == 1)
+            .collect();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].runs.is_empty());
+        assert_eq!((lines[0].char_start, lines[0].char_end), (0, 0));
+
+        // The rule's geometry spans the content column and sits on that line.
+        assert_eq!(display.rule_layouts.len(), 1);
+        let rule = &display.rule_layouts[0];
+        assert_eq!(rule.x, display.theme.padding_horizontal);
+        assert_eq!(rule.width, 400 - 2 * display.theme.padding_horizontal);
+        assert_eq!(rule.y, lines[0].y);
+
+        // `horizontal_rule_spacing` opens the same gap on both sides: paired with
+        // the paragraph gap below, a rule between two paragraphs sits centered.
+        let above = rule.y - (display.layout_lines[0].y + display.layout_lines[0].height);
+        let below = display.layout_lines[2].y - (rule.y + rule.height);
+        assert_eq!(
+            above, below,
+            "rule must be evenly spaced between paragraphs"
+        );
+    }
+
+    #[test]
+    fn horizontal_rule_draws_a_line_across_the_content_column() {
+        let mut display = rule_display();
+        let mut ctx = TestRenderContext::new_with_focus();
+        display.draw(&mut ctx);
+
+        let expected_w = 400 - 2 * display.theme.padding_horizontal;
+        let thickness = display.theme.horizontal_rule_thickness;
+        assert!(
+            ctx.rects
+                .iter()
+                .any(|&(x, _, w, h)| x == display.theme.padding_horizontal
+                    && w == expected_w
+                    && h == thickness),
+            "expected a {expected_w}x{thickness} rule bar, drew {:?}",
+            ctx.rects
+        );
+        // Nothing was drawn as text in the default (pixel) mode.
+        assert!(!ctx.texts.iter().any(|(t, ..)| t.contains('─')));
+    }
+
+    #[test]
+    fn horizontal_rule_as_text_draws_a_centered_ornament() {
+        let mut display = rule_display();
+        display.theme.horizontal_rule_as_text = true;
+        display.layout_valid = false;
+
+        let mut ctx = TestRenderContext::new_with_focus();
+        display.draw(&mut ctx);
+
+        let (text, x, _) = ctx
+            .texts
+            .iter()
+            .find(|(t, ..)| t.contains('─'))
+            .expect("expected the text ornament");
+        assert_eq!(text, "───── • ─────");
+
+        // Centered in the content column. The test context measures 0.6 * size
+        // per character, so the 13-glyph ornament is 13 * 14 * 0.6 wide.
+        let ornament_w = (13.0 * 14.0 * 0.6) as i32;
+        let content_w = 400 - 2 * display.theme.padding_horizontal;
+        assert_eq!(
+            *x,
+            display.theme.padding_horizontal + (content_w - ornament_w) / 2
+        );
+        // The text form replaces the drawn bar rather than doubling up on it.
+        assert!(!ctx.rects.iter().any(|&(_, _, w, _)| w == content_w));
     }
 }

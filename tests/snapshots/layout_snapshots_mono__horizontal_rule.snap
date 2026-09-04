@@ -1,0 +1,6 @@
+---
+source: tests/layout_snapshots_mono.rs
+expression: "common::horizontal_rule(MODE)"
+extension: svg
+snapshot_kind: binary
+---
