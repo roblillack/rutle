@@ -10,273 +10,85 @@ While pre-1.0, the minor version is bumped for breaking changes.
 
 ## [Unreleased] - ReleaseDate
 
-### Added
-
-- Support for horizontal rules (thematic breaks), matching `tdoc`'s
-  `Paragraph::HorizontalRule` (tdoc#49). A rule is a **non-editable leaf** like a
-  table: the caret can rest on it, but there is nothing in it to type into.
-  - `BlockType::HorizontalRule` and `tree_walk::ParaKind::HorizontalRule`.
-    `tree_walk::leaf_spans` answers `None` for a rule — the marker the whole
-    engine uses for "not editable" — so splits, merges and inline edits skip it.
-  - `Editor::insert_horizontal_rule()` inserts a rule as a top-level block: a
-    top-level paragraph is split around it when the caret sits inside its text,
-    at a block edge the rule slots in above or below, and from inside a
-    list/quote it follows the whole top-level block. The caret lands in the
-    block after the rule (an empty paragraph is appended if there is none).
-  - Backspace and Delete remove a rule — on the rule itself, and from the edge
-    of the block just below or above it. Rules inside a selection are removed
-    with it, and copying across one keeps it in the clipboard document.
-  - `set_block_type(BlockType::HorizontalRule)` is a deliberate no-op: a rule has
-    no inline form, so converting a paragraph into one would drop its text.
-  - Layout gives the rule one contentless row — so it is a hit-testable caret
-    stop — and paints a line across the block's content column, or the centered
-    `───── • ─────` ornament `tdoc`'s terminal formatter uses when
-    `Theme::horizontal_rule_as_text` is on.
-  - New theme knobs: `horizontal_rule_color`, `horizontal_rule_thickness`,
-    `horizontal_rule_spacing` and `horizontal_rule_as_text`. Under
-    `classic_block_spacing`, a rule carries (2, 2) line margins, matching tdoc.
-- Support for definition lists, matching `tdoc`'s `Paragraph::DefinitionList`.
-  Unlike a table or a rule, a definition list is **fully editable**: both halves
-  of an item — its terms (`<dt>`) and the paragraphs of its definition (`<dd>`)
-  — are ordinary leaves that the caret, typing, styling and selection reach the
-  same way they reach any other text.
-  - New path segments `PathSegment::DefinitionTerm { item, term }` and
-    `PathSegment::DefinitionPara { item, para }`. They are siblings under one
-    item but distinct variants, so `TreePath` ordering gained a tie-break that
-    keeps an item's terms ahead of its definition.
-  - `BlockType::DefinitionTerm { depth }` and
-    `tree_walk::ParaKind::DefinitionTerm` for terms. A definition's *body* has no
-    block type of its own: its paragraphs keep their intrinsic type (paragraph,
-    heading, nested list, …) and indent from the new
-    `tree_walk::LeafInfo::definition_depth`, exactly as continuation paragraphs
-    inside a list item stay `Paragraph` and indent from their list depth.
-  - Enter walks the list one half at a time, so a glossary is written straight
-    through: in a term it splits into two terms of the same item, but at the
-    *end* of a term whose item has no definition yet it opens that definition
-    and moves in; in a definition it starts the **next item**, taking the right
-    half as that item's term and the paragraphs below it as its definition —
-    the same shape as Enter in a list item starting the next item. Enter on an
-    empty term or definition *leaves* the list, splitting it around the new
-    paragraph, exactly as Enter on an empty list item leaves a list. So
-    term → Enter → definition → Enter → term → … → Enter twice ends the list.
-  - **Tab pulls a list under a definition into it.** A list typed below a
-    definition list is a list of its own; Tab on its first item moves that item
-    into the definition that ends the list above, where it stays the kind of item
-    it is — bullet, numbered or checkbox, with its checked state — joining a list
-    of that kind already ending that definition, so a whole list can be pulled in
-    an item at a time. Shift-Tab is the inverse: the item leaves the definition
-    list as a list of its own again (splitting the list when items follow, as any
-    definition paragraph leaving does) and rejoins the list it came from rather
-    than leaving a seam. This mirrors Tab nesting a list item into a preceding
-    quote. `toggle_list` / `toggle_checklist` on such an item still means "no
-    longer a list" and delists it where it stands, into a paragraph of the
-    definition.
-  - `insert_continuation` (Ctrl+P in Pure) keeps its meaning inside a
-    definition: another paragraph of the *same* definition. With Enter now
-    moving on to the next term, this and Tab are the ways to grow one.
-  - **Tab / Shift-Tab switch a line between the two halves.** `Editor::outdent`
-    — a new counterpart to `Editor::indent` — turns a definition paragraph into
-    the next item's term, taking the paragraphs that followed it in the old
-    definition along as its own definition. Tab on a term does the inverse: the
-    term becomes the last paragraph of the definition above it, and if it was
-    its item's only term that item's definition follows it there and the empty
-    item is dropped. The two are exact inverses, so a line can be moved between
-    the halves and back. A term of a multi-term item moves alone, leaving the
-    others in place, and the list's very first term has nothing above it to join.
-    `cursor_can_indent` / `cursor_can_unnest` report both, so a frontend's
-    indent/outdent affordances light up without extra work.
-  - Backspace merges across the term/definition boundary and prunes an item left
-    with nothing, then the list left with no items.
-  - `set_block_type(BlockType::DefinitionTerm { .. })` toggles: outside a
-    definition list it wraps the selected top-level paragraphs into one, a term
-    per paragraph; inside one it dissolves the list back into plain paragraphs.
-    Both directions preserve leaf order and count.
-  - `set_block_type` with any *other* target lifts the leaf out of the list first
-    and applies the type to what that leaves behind — a term and a definition are
-    the two halves of an item, not blocks that can become a heading where they
-    stand. Everything around the converted leaf keeps its place:
-    - A **term** (`tree_edit::lift_definition_term`) leaves on its own. Terms
-      before it stay in a list above; terms after it stay in a list below, keeping
-      the definition they head. Only when no term is left to head the definition —
-      the converted term was the item's last — does the definition come out with
-      it, so a one-term item yields the term and its definition as two plain
-      paragraphs and nothing is ever orphaned above a term that no longer exists.
-    - A **definition** (`tree_edit::lift_definition_para`) takes only its own
-      content out, to just below the list, keeping the term a term with an empty
-      definition to type into. The paragraphs that followed it inside the
-      definition come along keeping their own types.
-
-    Because the lift feeds the ordinary block-type path, container targets (quote,
-    list, checklist) work through it unchanged, and the caret stays in the same
-    text.
-  - **Definition lists split and rejoin automatically.** A leaf leaves its list by
-    splitting it, so the halves are put back together whenever the paragraph
-    between them stops separating them:
-    `tree_edit::merge_adjacent_definition_lists` runs when a paragraph is turned
-    into a definition list (matching how the list toggles already merge with an
-    adjacent same-kind list), and `remove_node_at` rejoins the lists a deleted
-    paragraph leaves touching. Two adjacent lists render exactly like one but
-    serialize with a separator between them, so without this a term that left the
-    list and came back would leave a permanent seam in the saved file.
-  - A lone-text definition deliberately does **not** collapse onto its container
-    the way a single-text quote or list item does, so retyping a one-paragraph
-    definition affects that paragraph alone rather than the whole list.
-  - Layout draws terms in the new `Theme::definition_term` font (bold by
-    default — a term has no marker, so weight is what sets it apart) and indents
-    each definition by `Theme::definition_indent`, including across paragraph
-    breaks and nested definition lists. `Theme::definition_term_spacing` keeps a
-    term tight against the definition it heads.
-
 ### Changed
 
-- **Breaking:** `BlockType` gained `HorizontalRule` and `DefinitionTerm`
-  variants, and `PathSegment` gained `DefinitionTerm`/`DefinitionPara`, so
-  exhaustive matches over either in frontends need new arms.
-- **Breaking:** `Theme` gained `definition_indent`, `definition_term_spacing` and
-  `definition_term`; `tree_walk::LeafInfo` gained `definition_depth`. Frontends
-  that construct either struct literally (rather than via `..Default::default()`)
-  need the new fields.
-- `Editor::outdent` is the new entry point for Shift-Tab, replacing direct calls
-  to `outdent_list_item`. It routes a definition paragraph to the definition-list
-  move and everything else to `outdent_list_item` unchanged, mirroring how
-  `indent` already routed list items and adjacent-container nesting.
-- The `tdoc` dependency is now `0.12`, which carries both horizontal rules and
-  definition lists. This replaces the temporary git pin.
-- Reveal-codes tags are now *drawn* as WordPerfect-style code boxes — an
-  outlined, filled box whose pointed end faces the text the style applies to
-  (right where it opens, left where it closes) — instead of being simulated with
-  the bracket text `[Bold>` / `<Bold]`. The shape comes from the new
-  `RenderContext::draw_reveal_tag`, which has a default implementation built
-  from the existing fill/line primitives, so a pixel backend gets the boxes
-  without doing anything; a backend with a polygon primitive can override it for
-  an antialiased shape. Tag runs are laid out wider than their label to make
-  room for the box's padding and point, and the caret steps over that full
-  width. A tag rests on its line's text baseline — the *block's* font size, not
-  the tag's — so tags in a heading sit on the words they mark instead of
-  floating at the top of the taller line. (#11)
-- New theme fields: `reveal_tag_border` (the box outline) and `reveal_tag_text`.
-  **A character-cell backend must set `reveal_tag_text = true`**, which keeps
-  the old bracketed-text tags — a box can't be drawn in a character grid.
-  `reveal_tag_bg` also lightened to `0xDDDDD5FF` to suit a filled, outlined box.
-  (#11)
-- `tree_edit::paragraphs_into_list` is now `tree_edit::paragraphs_into_lists` and
-  returns `Vec<Paragraph>`: a run can convert into more than one node when it
-  holds a block that cannot become an item (a table). (#13)
+- **Breaking:** the `tdoc` dependency is now `0.12` and the two block kinds it
+  introduces are supported. `BlockType` gained `HorizontalRule` and
+  `DefinitionTerm { depth }`, `PathSegment` gained `DefinitionTerm` and
+  `DefinitionPara`, `Theme` gained `horizontal_rule_color`,
+  `horizontal_rule_thickness`, `horizontal_rule_spacing`,
+  `horizontal_rule_as_text`, `definition_indent`, `definition_term_spacing` and
+  `definition_term`, and `tree_walk::LeafInfo` gained `definition_depth`.
+  Frontends need new match arms for the variants and, when constructing `Theme`
+  or `LeafInfo` literally, the new fields. (#12)
+  - **Horizontal rules** are non-editable leaves like tables: the caret can rest
+    on one, Backspace and Delete remove it, and `set_block_type` to a rule is a
+    no-op. `Editor::insert_horizontal_rule()` inserts one after the caret's
+    top-level block, splitting a paragraph around it when the caret is inside
+    its text. A rule is drawn as a line across the content column, or as
+    `tdoc`'s `───── • ─────` text ornament when `horizontal_rule_as_text` is
+    set.
+  - **Definition lists** are fully editable: terms and definition paragraphs are
+    ordinary leaves. Enter moves through the list one half at a time (at the end
+    of a term it opens the definition, in a definition it starts the next item)
+    and leaves the list from an empty term or definition. Tab and Shift-Tab move
+    a line between the two halves, or pull a list typed below the definition
+    list into its last definition and back out; `insert_continuation` adds
+    another paragraph to the same definition.
+    `set_block_type(BlockType::DefinitionTerm { .. })` wraps the selected
+    paragraphs into a definition list, one term each, or dissolves one back into
+    paragraphs; any other block type lifts the term or definition out of the
+    list before applying. Terms render in the `definition_term` font (bold by
+    default) and definitions indent by `definition_indent`.
+- `Editor::outdent` is the new Shift-Tab entry point, replacing direct calls to
+  `outdent_list_item`, which it still routes list items to. (#12)
+- Reveal-codes tags are now drawn as WordPerfect-style code boxes instead of the
+  bracket text `[Bold>` / `<Bold]`. `RenderContext::draw_reveal_tag` has a
+  default implementation built from the fill/line primitives, so a pixel backend
+  gets the boxes for free and can override it for an antialiased shape. Tags are
+  laid out wider than their label and rest on the block's text baseline. New
+  theme fields `reveal_tag_border` and `reveal_tag_text`; **a character-cell
+  backend must set `reveal_tag_text = true`** to keep the text tags.
+  `reveal_tag_bg` lightened to `0xDDDDD5FF`. (#11)
+- `tree_edit::paragraphs_into_list` is now `paragraphs_into_lists` and returns
+  `Vec<Paragraph>`, since a run holding a table converts into more than one
+  node. (#13)
 
 ### Fixed
 
-- A list/checklist item whose content starts with a hard break (or is otherwise
-  empty on its first visual line) now lays out all of its remaining lines. The
-  marker-merge path bailed out to a marker-only line whenever the item's first
-  visual line had no runs, dropping every following line from the layout — so a
-  pasted text paragraph carrying hard breaks, converted to a list, rendered as a
-  single empty bullet even though the document was intact. (#13)
-
-- Converting a range of paragraphs into a list (`toggle_list` /
-  `toggle_ordered_list` / `toggle_checklist`) or into a quote (`toggle_quote`) no
-  longer drops the content of the container blocks it covers. Every non-list
-  paragraph was flattened through `Paragraph::content()`, which is empty for a
-  quote or a table, so those blocks turned into empty items and everything inside
-  them was lost — selecting a document whose text sat in a trailing quote and
-  hitting "List Item" left the first paragraph plus a single empty bullet. Quotes
-  now contribute their paragraphs (recursively) as items of their own; a table,
-  which has no item representation, stays where it is and splits the list instead
-  of collapsing; and a quote/table/list becomes a quote child verbatim when
-  quoting a range. The reverse direction (delisting, `dissolve_container`) keeps a
-  container that is a list entry's body intact as well. (#13)
-
-- Converting a range of paragraphs into a list or a quote no longer drops a
-  definition list or a horizontal rule — the two block kinds #13 could not know
-  about. A definition list owns no inline content, so, like a quote, it now
-  contributes its terms and definition paragraphs as items of their own
-  (recursively, so a quote inside a definition comes along) instead of collapsing
-  into one empty item; for a checklist, whose items are spans only,
-  `tree_edit::paragraph_as_spans` joins their text rather than coming back empty.
-  A horizontal rule is a *leaf* with no inline content, which `content()`
-  flattening turned into an empty paragraph — it now behaves like a table,
-  staying where it is and splitting the list around it, and it survives being
-  quoted or lifted out of a list entry intact.
-
-- Wrapping a multi-paragraph selection in a single checklist item
-  (`Editor::wrap_selection`) no longer runs the blocks' text together:
-  `head`/`middle`/`tail` became `headmiddletail`. The separating space lived
-  inside `paragraph_as_spans`, which the caller invoked once per paragraph, so it
-  never applied between them; the new `tree_edit::paragraphs_as_spans` walks the
-  whole run into one sink instead.
-
-- Quoting or wrapping a selection that *ends* inside a container is no longer
-  silently ignored. `toggle_quote`, `Editor::wrap_selection` and the definition-list
-  toggle each required both ends of the selection to address a bare top-level
-  paragraph, so a Select All on a document ending in a list, quote or definition
-  list did nothing at all. They now take the whole top-level blocks the selection
-  covers — the range the list toggles have used since #13 — and track the caret by
-  its leaf ordinal within that range, so it stays on the line it was on instead of
-  jumping to the first one. `set_block_type(BlockType::DefinitionTerm { .. })` with
-  a multi-block selection goes to the same toggle rather than the cursor-only
-  collapsed-container path, which would have lifted just one item out of its list.
-
-- `toggle_quote` now toggles over a *range*, like the list toggles: a selection
-  spanning several top-level blocks that are all quotes unquotes every one of
-  them, and a partly-quoted range becomes a single quote (the quotes already
-  there go in as children verbatim). The cursor's own block used to decide for
-  the whole range, so a selection ending inside a quote unquoted that one and
-  left the rest untouched. The result is left selected, so a second press undoes
-  it. Toggling off also works from a caret *below* the quote child — inside a
-  list or definition within the quote — where "Quote" previously wrapped the
-  whole quote in a second one.
-- A list toggle no longer does nothing when the caret sits below the top level.
-  `toggle_list` / `toggle_ordered_list` / `toggle_checklist` needed a top-level
-  paragraph to convert, so a caret in a quote's paragraph or a definition list
-  was ignored:
-  - In a quote, the list is now built *inside* that quote, around the children
-    the selection covers (`tree_edit::children_into_lists`), and merges with an
-    adjacent same-kind list there — so a quote's paragraphs can be bulleted one
-    at a time into a single list. Toggling off delists back to quote paragraphs
-    as before.
-  - On a definition list's term or definition, the toggle routes to the same lift
-    `set_block_type(BlockType::ListItem { .. })` uses, so the two agree: a term
-    takes its whole item out of the list, a definition takes its own content out
-    below it, and the new bullet is what that leaves behind.
-
-- Lifting a list item out of a list that sits inside a definition no longer
-  dropped it. `tree_edit::container_splice` — the splice every "leaf leaves its
-  container" move ends in — knew the document top level, a quote's children and a
-  list entry's paragraphs, but not a definition's, so it bailed out *after* the
-  entries had been taken and the item was gone. It now understands a definition's
-  paragraph vec (and `para_at`, the read-side walk, descends into one too, so the
-  list toggles see a list nested in a definition at all).
-
-- Tab / Shift-Tab over a selection that covers an item *and* its subitems no
-  longer flattens the nesting. Every item in the selection was shifted on its
-  own, so a subitem moved one level out at the same time as its parent — and the
-  two steps are not the same step: the parent left its container while the
-  subitem only lost a level, landing the two side by side. An item inside another
-  item the selection covers now rides along with it, so the whole selected
-  subtree moves one level and keeps the shape the author built. Shift-Tab on a
-  selected checklist inside a definition is where this showed: the subitems came
-  out level with their parents.
-
-- Merging one list item into another no longer loses what hung below it, and
-  **a checklist item's subitems are no longer deleted with it**. A checklist item
-  holds its subitems inside itself, so `tree_edit::remove_node_at` took them
-  along when the item went — Delete on an empty item, which merges the next item
-  into it, dropped that item's whole subtree. Removing an item now leaves its
-  subitems in its place, one level shallower, and a merge moves the merged item's
-  body onto the item that absorbed its text (`move_item_body`): subitems become
-  the absorbing item's, and a list entry's continuation paragraphs and sublists
-  are inserted just after the paragraph they merged into, instead of standing
-  under an item with none of their text left.
-
-- Enter inside a list item now keeps the item's body with its text. A checklist
-  item's subitems live inside the item, so they stayed with the half that kept
-  the item struct: pressing Enter at the start of an item — where all of the text
-  moves to the new item below — left the subitems hanging under the empty item
-  above, sandwiched between an empty line and their own text. They now follow the
-  text, as a list entry's continuation paragraphs and sublists already did.
-  The other end of that rule is new for both kinds: when the new item gets *none*
-  of the text (Enter at the very end of a line) it is a fresh sibling rather than
-  the item's continuation, so it no longer takes the body along — a sublist stays
-  under the line it belongs to instead of moving to the empty item below it.
+- A list item whose first visual line is empty (e.g. its content starts with a
+  hard break) now lays out all of its lines instead of a single empty bullet.
+  (#13)
+- Converting a range into a list or quote no longer drops the content of the
+  quotes and tables it covers: a quote's paragraphs become items of their own,
+  a table stays where it is and splits the list, and quoting a range keeps
+  nested blocks verbatim. Delisting keeps a container inside a list entry intact
+  as well. (#13)
+- `toggle_quote`, `Editor::wrap_selection` and the definition-list toggle no
+  longer do nothing when the selection ends inside a list, quote or definition
+  list (e.g. after Select All on a document ending in a list). They act on the
+  top-level blocks the selection covers and keep the caret on its line. (#12)
+- `toggle_quote` now toggles the whole selected range, like the list toggles: an
+  all-quote selection unquotes every block, a mixed range becomes one quote, and
+  the result stays selected. Toggling off also works from a caret inside a list
+  or definition within the quote, which used to wrap it in a second quote. (#12)
+- The list toggles no longer do nothing when the caret is below the top level:
+  in a quote the list is built inside that quote; on a definition list's term or
+  definition the leaf is lifted out of the list first, as `set_block_type` does.
+  (#12)
+- Wrapping a multi-paragraph selection in one checklist item
+  (`Editor::wrap_selection`) keeps a space between the paragraphs' text instead
+  of running them together. (#12)
+- Tab and Shift-Tab over a selection that covers an item and its subitems move
+  the subtree as a whole instead of flattening it. (#12)
+- Removing a checklist item no longer deletes its subitems, and merging one list
+  item into another (Backspace or Delete at an item boundary) keeps the merged
+  item's subitems and continuation paragraphs with the text they belong to.
+  (#12)
+- Enter inside a list item keeps the item's subitems and continuation paragraphs
+  with their text: at the start of an item they follow the text into the new
+  item; at the end of the item's text the new item is an empty sibling and the
+  body stays above it. (#12)
 
 ## [0.5.0] - 2026-07-08
 
