@@ -17,7 +17,7 @@ While pre-1.0, the minor version is bumped for breaking changes.
   marker-merge path bailed out to a marker-only line whenever the item's first
   visual line had no runs, dropping every following line from the layout — so a
   pasted text paragraph carrying hard breaks, converted to a list, rendered as a
-  single empty bullet even though the document was intact.
+  single empty bullet even though the document was intact. (#13)
 
 - Converting a range of paragraphs into a list (`toggle_list` /
   `toggle_ordered_list` / `toggle_checklist`) or into a quote (`toggle_quote`) no
@@ -30,13 +30,13 @@ While pre-1.0, the minor version is bumped for breaking changes.
   which has no item representation, stays where it is and splits the list instead
   of collapsing; and a quote/table/list becomes a quote child verbatim when
   quoting a range. The reverse direction (delisting, `dissolve_container`) keeps a
-  container that is a list entry's body intact as well.
+  container that is a list entry's body intact as well. (#13)
 
 ### Changed
 
 - `tree_edit::paragraphs_into_list` is now `tree_edit::paragraphs_into_lists` and
   returns `Vec<Paragraph>`: a run can convert into more than one node when it
-  holds a block that cannot become an item (a table).
+  holds a block that cannot become an item (a table). (#13)
 
 ## [0.5.0] - 2026-07-08
 
