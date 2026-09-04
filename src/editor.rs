@@ -1998,6 +1998,14 @@ impl Editor {
         {
             return self.set_leaf_block_type_over_selection(i0, i1, block_type);
         }
+        // A definition list is built out of whole top-level blocks, so a selection spanning
+        // more than one goes straight to the toggle — the collapsed-container path below acts
+        // on the cursor's block alone and would lift just that one out of its container.
+        if matches!(block_type, BlockType::DefinitionTerm { .. })
+            && self.selected_top_level_range().is_some_and(|(s, e)| s < e)
+        {
+            return self.toggle_definition_list();
+        }
         let path = self.cursor.path.clone();
         // Retyping a leaf of a definition list takes it out of the list first: a term's whole
         // item stops being one, a definition's content moves below the list. See
@@ -2184,6 +2192,9 @@ impl Editor {
                 } else if !self.delist_cursor_item() {
                     return Ok(());
                 }
+                // The lift re-shaped the blocks the selection named; this path converts the
+                // cursor's block alone, so drop it rather than let the toggle read stale paths.
+                self.selection = None;
                 self.toggle_definition_list()
             }
             BlockType::Table { .. } | BlockType::HorizontalRule => Ok(()),
@@ -2407,19 +2418,15 @@ impl Editor {
     /// Convert the selected top-level paragraph(s) into one quote, flattening each leaf to plain
     /// text (dropping heading/code type) — mirrors how lists convert. Containers (lists, tables,
     /// nested quotes) become quote children as they are, since a quote can hold any paragraph.
-    /// Top-level only.
+    /// The quote takes in whole top-level blocks: the selection's ends may sit at any depth (a
+    /// Select All ends inside a trailing list), and the blocks they fall in are what is wrapped.
     fn convert_selection_to_quote(&mut self) -> EditResult {
-        let (start, end) = self.selection_or_cursor_range();
-        let (Some(s), Some(e)) = (top_index(&start.path), top_index(&end.path)) else {
+        let Some((s, e)) = self.selected_top_level_range() else {
             return Ok(());
         };
-        if s > e || e >= self.tdoc.paragraphs.len() {
-            return Ok(());
-        }
-        let cursor_rel = self
-            .cursor_top_index()
-            .map(|ci| ci.saturating_sub(s))
-            .unwrap_or(0);
+        // Quoting keeps every leaf of the range, in document order, so the caret's ordinal
+        // within it names the same leaf afterwards — the way the list conversion tracks it.
+        let cursor_leaf = self.cursor_leaf_of_range(s, e);
         let offset = self.cursor.offset;
         let drained: Vec<Paragraph> = self.tdoc.paragraphs.drain(s..=e).collect();
         let children: Vec<Paragraph> = drained
@@ -2429,10 +2436,7 @@ impl Editor {
         self.tdoc
             .paragraphs
             .insert(s, Paragraph::new_quote().with_children(children));
-        self.cursor = DocumentPosition::at(
-            TreePath::root(s).child(PathSegment::QuoteChild(cursor_rel)),
-            offset,
-        );
+        self.cursor = DocumentPosition::at(self.leaf_landing(s, cursor_leaf), offset);
         self.normalize_cursor();
         self.trigger_paragraph_change();
         Ok(())
@@ -2440,55 +2444,37 @@ impl Editor {
 
     /// Wrap the selected top-level range in a single new container of `kind` as one unit,
     /// preserving inner paragraph types (the "wrap inside…" action). A multi-paragraph
-    /// selection becomes one quote / one list item / one checklist item. Top-level only.
+    /// selection becomes one quote / one list item / one checklist item. Whole top-level blocks
+    /// go in, so the selection's ends may sit at any depth (inside a list item, a definition, …).
     pub fn wrap_selection(&mut self, kind: tree_edit::ContainerKind) -> EditResult {
-        let (start, end) = self.selection_or_cursor_range();
-        let (Some(s), Some(e)) = (top_index(&start.path), top_index(&end.path)) else {
+        let Some((s, e)) = self.selected_top_level_range() else {
             return Ok(());
         };
-        if s > e || e >= self.tdoc.paragraphs.len() {
-            return Ok(());
-        }
-        let cursor_rel = self
-            .cursor_top_index()
-            .map(|ci| ci.saturating_sub(s))
-            .unwrap_or(0);
+        let cursor_leaf = self.cursor_leaf_of_range(s, e);
         let offset = self.cursor.offset;
         let drained: Vec<Paragraph> = self.tdoc.paragraphs.drain(s..=e).collect();
-        let (node, leaf_seg) = match kind {
-            tree_edit::ContainerKind::Quote => (
-                Paragraph::new_quote().with_children(drained),
-                PathSegment::QuoteChild(cursor_rel),
-            ),
-            tree_edit::ContainerKind::Ordered => (
-                Paragraph::new_ordered_list().with_entries(vec![drained]),
-                PathSegment::ListEntry {
-                    entry: 0,
-                    para: cursor_rel,
-                },
-            ),
-            tree_edit::ContainerKind::Unordered => (
-                Paragraph::new_unordered_list().with_entries(vec![drained]),
-                PathSegment::ListEntry {
-                    entry: 0,
-                    para: cursor_rel,
-                },
-            ),
+        let node = match kind {
+            tree_edit::ContainerKind::Quote => Paragraph::new_quote().with_children(drained),
+            tree_edit::ContainerKind::Ordered => {
+                Paragraph::new_ordered_list().with_entries(vec![drained])
+            }
+            tree_edit::ContainerKind::Unordered => {
+                Paragraph::new_unordered_list().with_entries(vec![drained])
+            }
             tree_edit::ContainerKind::Checklist => {
                 // Checklist items are span-only: join the paragraphs' text into one item —
                 // descending into containers so nothing is dropped on the way in, and keeping a
                 // space between blocks so their text does not run together.
                 let content = tree_edit::paragraphs_as_spans(&drained);
-                (
-                    Paragraph::new_checklist().with_checklist_items(vec![
-                        ChecklistItem::new(false).with_content(content),
-                    ]),
-                    PathSegment::ChecklistItem(0),
-                )
+                Paragraph::new_checklist()
+                    .with_checklist_items(vec![ChecklistItem::new(false).with_content(content)])
             }
         };
         self.tdoc.paragraphs.insert(s, node);
-        self.cursor = DocumentPosition::at(TreePath::root(s).child(leaf_seg), offset);
+        // The paragraphs go in as they are, so their leaves keep their order and the caret's
+        // ordinal finds it again. A checklist item is the exception — it merges the whole run
+        // into one leaf, which `leaf_landing` falls back to.
+        self.cursor = DocumentPosition::at(self.leaf_landing(s, cursor_leaf), offset);
         self.normalize_cursor();
         self.trigger_paragraph_change();
         Ok(())
@@ -2912,17 +2898,12 @@ impl Editor {
             return Ok(());
         }
 
-        let (start, end) = self.selection_or_cursor_range();
-        let (Some(s), Some(e)) = (top_index(&start.path), top_index(&end.path)) else {
+        let Some((s, e)) = self.selected_top_level_range() else {
             return Ok(());
         };
-        if s > e || e >= self.tdoc.paragraphs.len() {
-            return Ok(());
-        }
-        let cursor_rel = self
-            .cursor_top_index()
-            .map(|ci| ci.saturating_sub(s))
-            .unwrap_or(0);
+        // One paragraph yields one leaf — a term, or the definition holding a block that has
+        // no term form — so the caret's ordinal within the range names the same leaf after.
+        let cursor_leaf = self.cursor_leaf_of_range(s, e);
         let offset = self.cursor.offset;
         let drained: Vec<Paragraph> = self.tdoc.paragraphs.drain(s..=e).collect();
         self.tdoc
@@ -2931,37 +2912,65 @@ impl Editor {
 
         // A definition list next to the new one joins it, so a term that left the list (which
         // splits it) and is turned back into one puts the pieces together again rather than
-        // leaving a seam. Count what the lists above contribute before merging: the new items
+        // leaving a seam. Count what the lists above contribute before merging: the new leaves
         // shift down by exactly that many.
-        let items_above: usize = self.tdoc.paragraphs[..s]
-            .iter()
-            .rev()
-            .take_while(|p| matches!(p, Paragraph::DefinitionList { .. }))
-            .map(|p| p.definition_items().len())
-            .sum();
+        let mut leaves_above = 0;
+        let mut above = s;
+        while above > 0
+            && matches!(
+                self.tdoc.paragraphs[above - 1],
+                Paragraph::DefinitionList { .. }
+            )
+        {
+            above -= 1;
+            leaves_above += leaves_of_range(&self.tdoc, above, above).len();
+        }
         let list_path =
             tree_edit::merge_adjacent_definition_lists(&mut self.tdoc, &TreePath::root(s));
 
-        // Each source paragraph became one item, so the cursor's item index is unchanged
-        // apart from that shift. It lands on that item's term, or — for a paragraph that had
-        // no term form — on its definition's first paragraph.
-        let cursor_rel = items_above + cursor_rel;
-        let term = list_path.child(PathSegment::DefinitionTerm {
-            item: cursor_rel,
-            term: 0,
-        });
-        let landing = if tree_walk::leaf_spans(&self.tdoc, &term).is_some() {
-            term
-        } else {
-            list_path.child(PathSegment::DefinitionPara {
-                item: cursor_rel,
-                para: 0,
-            })
+        let landing = match top_para_index(&list_path) {
+            Some(i) => self.leaf_landing(i, leaves_above + cursor_leaf),
+            None => list_path,
         };
         self.cursor = DocumentPosition::at(landing, offset);
         self.normalize_cursor();
         self.trigger_paragraph_change();
         Ok(())
+    }
+
+    /// The inclusive range of top-level paragraph indices the selection — or, with none, the
+    /// cursor — covers, clamped to the document. `None` when the range is empty or the
+    /// positions do not address a top-level paragraph at all. Used by the conversions that
+    /// wrap whole top-level blocks (quote, definition list, `wrap_selection`): the endpoints
+    /// may sit at any depth, so a selection *ending* inside a list item or a definition still
+    /// names the blocks it covers rather than nothing at all.
+    fn selected_top_level_range(&self) -> Option<(usize, usize)> {
+        let (start, end) = self.selection_or_cursor_range();
+        let s = top_para_index(&start.path)?;
+        let e = top_para_index(&end.path)?;
+        (s <= e && e < self.tdoc.paragraphs.len()).then_some((s, e))
+    }
+
+    /// The caret's ordinal among the leaves of the top-level range `s..=e`, or 0 when it sits
+    /// outside them. A conversion that keeps the leaves in document order can hand this back to
+    /// [`Self::leaf_landing`] to put the caret on the same leaf afterwards.
+    fn cursor_leaf_of_range(&self, s: usize, e: usize) -> usize {
+        leaves_of_range(&self.tdoc, s, e)
+            .iter()
+            .position(|p| *p == self.cursor.path)
+            .unwrap_or(0)
+    }
+
+    /// The path of the `nth` leaf of the top-level block at `s` — the landing spot for a caret
+    /// tracked by [`Self::cursor_leaf_of_range`]. Falls back to the block's last leaf when the
+    /// conversion produced fewer (a checklist item merges a whole run into one).
+    fn leaf_landing(&self, s: usize, nth: usize) -> TreePath {
+        let leaves = leaves_of_range(&self.tdoc, s, s);
+        leaves
+            .get(nth)
+            .or_else(|| leaves.last())
+            .cloned()
+            .unwrap_or_else(|| TreePath::root(s))
     }
 
     /// The inclusive range of top-level paragraph indices the current selection covers, or
@@ -4139,6 +4148,78 @@ mod tests {
             .wrap_selection(tree_edit::ContainerKind::Checklist)
             .unwrap();
         assert_eq!(md(&editor), "- [ ] head Coffee Black hot drink tail");
+    }
+
+    #[test]
+    fn quote_over_a_selection_ending_inside_a_list_wraps_both_blocks() {
+        // Select All leaves the focus inside the trailing list, not on a top-level paragraph.
+        // The blocks the selection *covers* are what gets quoted, so this is not a no-op.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("head\n\n- one\n- two"));
+        editor.select_all();
+        editor.toggle_quote().unwrap();
+        assert_eq!(md(&editor), "> head\n> \n> - one\n> - two");
+        // The caret keeps its leaf, now one level deeper inside the quote.
+        assert_eq!(editor.leaf_plain_text(&editor.cursor().path), "two");
+    }
+
+    #[test]
+    fn quote_over_a_selection_ending_inside_a_definition_list_wraps_both_blocks() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("head\n\nCoffee\n: Black hot drink"));
+        editor.select_all();
+        editor.toggle_quote().unwrap();
+        assert_eq!(md(&editor), "> head\n> \n> Coffee\n> : Black hot drink");
+        assert_eq!(
+            editor.leaf_plain_text(&editor.cursor().path),
+            "Black hot drink"
+        );
+    }
+
+    #[test]
+    fn wrap_selection_bullet_over_a_selection_ending_inside_a_definition_list() {
+        // `wrap_selection` holds the whole range as one item, so both blocks go in as they are.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("head\n\nCoffee\n: Black hot drink"));
+        editor.select_all();
+        editor
+            .wrap_selection(tree_edit::ContainerKind::Unordered)
+            .unwrap();
+        assert_eq!(md(&editor), "- head\n  \n  Coffee\n  : Black hot drink");
+        if let Paragraph::UnorderedList { entries } = &editor.document().paragraphs[0] {
+            assert_eq!(entries.len(), 1, "one item holding both blocks");
+            assert_eq!(entries[0].len(), 2);
+        } else {
+            panic!("expected a list");
+        }
+    }
+
+    #[test]
+    fn wrap_selection_checklist_over_a_selection_ending_inside_a_list() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("head\n\n- one\n- two"));
+        editor.select_all();
+        editor
+            .wrap_selection(tree_edit::ContainerKind::Checklist)
+            .unwrap();
+        assert_eq!(md(&editor), "- [ ] head one two");
+    }
+
+    #[test]
+    fn definition_list_over_a_selection_ending_inside_a_list() {
+        // A block with no term form (here the list) becomes a term-less item's definition, so
+        // the range converts whole and the caret stays on the line it was on.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("head\n\n- one\n- two"));
+        editor.select_all();
+        editor
+            .set_block_type(BlockType::DefinitionTerm { depth: 0 })
+            .unwrap();
+        let items = editor.document().paragraphs[0].definition_items();
+        assert_eq!(items.len(), 2, "{:?}", editor.document().paragraphs);
+        assert_eq!(items[0].terms.len(), 1, "the paragraph became a term");
+        assert!(items[1].terms.is_empty(), "the list has no term form");
+        assert_eq!(editor.leaf_plain_text(&editor.cursor().path), "two");
     }
 
     #[test]

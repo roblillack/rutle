@@ -192,6 +192,17 @@ While pre-1.0, the minor version is bumped for breaking changes.
   never applied between them; the new `tree_edit::paragraphs_as_spans` walks the
   whole run into one sink instead.
 
+- Quoting or wrapping a selection that *ends* inside a container is no longer
+  silently ignored. `toggle_quote`, `Editor::wrap_selection` and the definition-list
+  toggle each required both ends of the selection to address a bare top-level
+  paragraph, so a Select All on a document ending in a list, quote or definition
+  list did nothing at all. They now take the whole top-level blocks the selection
+  covers — the range the list toggles have used since #13 — and track the caret by
+  its leaf ordinal within that range, so it stays on the line it was on instead of
+  jumping to the first one. `set_block_type(BlockType::DefinitionTerm { .. })` with
+  a multi-block selection goes to the same toggle rather than the cursor-only
+  collapsed-container path, which would have lifted just one item out of its list.
+
 ## [0.5.0] - 2026-07-08
 
 ### Changed
