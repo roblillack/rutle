@@ -10,6 +10,15 @@ While pre-1.0, the minor version is bumped for breaking changes.
 
 ## [Unreleased] - ReleaseDate
 
+### Fixed
+
+- Double-clicking a word containing a non-ASCII letter ("unterstützen", "café")
+  no longer panics: `Editor::select_word_at`'s forward scan advanced the byte
+  offset by the *first* character's UTF-8 length instead of the current one, so
+  it stepped into the middle of a multi-byte character. Clicking the first
+  character of a word now also selects the whole word instead of just that
+  character.
+
 ## [0.6.0] - 2026-09-04
 
 ### Changed
