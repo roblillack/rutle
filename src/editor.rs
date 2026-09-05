@@ -756,38 +756,31 @@ impl Editor {
             return;
         }
 
+        // Both scans step one character at a time, moving the byte offset by that
+        // character's own UTF-8 length — the same idiom as word-wise motion. Any
+        // shortcut that assumes one byte per character walks into the middle of a
+        // multi-byte letter (the "ü" in "unterstützen") and panics on the next slice.
         let mut start = pos.offset;
-        let mut end = pos.offset;
-
         while start > 0 {
-            let ch = text[..start].chars().next_back().unwrap();
-            if ch.is_whitespace() || ch.is_ascii_punctuation() {
+            let (prev, ch) = text[..start].char_indices().next_back().unwrap();
+            if is_word_break(ch) {
                 break;
             }
-            start = text[..start]
-                .char_indices()
-                .next_back()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
+            start = prev;
         }
 
-        for (_, ch) in text[end..].char_indices() {
-            if ch.is_whitespace() || ch.is_ascii_punctuation() {
+        let mut end = pos.offset;
+        while end < text.len() {
+            let ch = text[end..].chars().next().unwrap();
+            if is_word_break(ch) {
                 break;
             }
-            end = text[..end]
-                .chars()
-                .next()
-                .map(|c| end + c.len_utf8())
-                .unwrap_or(end);
+            end += ch.len_utf8();
         }
 
         if start == end {
-            end = text[end..]
-                .chars()
-                .next()
-                .map(|c| end + c.len_utf8())
-                .unwrap_or(end);
+            // Clicked on a separator itself: select just that character.
+            end += text[end..].chars().next().map_or(0, char::len_utf8);
         }
 
         let start_pos = DocumentPosition::at(pos.path.clone(), start);
@@ -1488,7 +1481,7 @@ impl Editor {
         }
         while i < text.len() {
             let ch = text[i..].chars().next().unwrap();
-            if ch.is_whitespace() || ch.is_ascii_punctuation() {
+            if is_word_break(ch) {
                 i += ch.len_utf8();
             } else {
                 break;
@@ -1496,7 +1489,7 @@ impl Editor {
         }
         while i < text.len() {
             let ch = text[i..].chars().next().unwrap();
-            if !(ch.is_whitespace() || ch.is_ascii_punctuation()) {
+            if !is_word_break(ch) {
                 i += ch.len_utf8();
             } else {
                 break;
@@ -1517,7 +1510,7 @@ impl Editor {
         }
         while i > 0 {
             let (prev_i, ch) = text[..i].char_indices().next_back().unwrap();
-            if ch.is_whitespace() || ch.is_ascii_punctuation() {
+            if is_word_break(ch) {
                 i = prev_i;
             } else {
                 break;
@@ -1525,7 +1518,7 @@ impl Editor {
         }
         while i > 0 {
             let (prev_i, ch) = text[..i].char_indices().next_back().unwrap();
-            if !(ch.is_whitespace() || ch.is_ascii_punctuation()) {
+            if !is_word_break(ch) {
                 i = prev_i;
             } else {
                 break;
@@ -3568,6 +3561,15 @@ impl Editor {
 }
 
 /// Build a header paragraph of the given level (1-3) carrying `spans`.
+/// Does this character separate words? Whitespace and punctuation do; every letter
+/// or digit of any script — `a`, `ü`, `ß`, `й` — is word material.
+///
+/// Shared by word-wise motion and double-click word selection so the two can't
+/// disagree about where a word ends.
+fn is_word_break(ch: char) -> bool {
+    ch.is_whitespace() || ch.is_ascii_punctuation()
+}
+
 fn make_header(level: u8, spans: Vec<Span>) -> Paragraph {
     match level {
         1 => Paragraph::new_header1(),
@@ -4096,6 +4098,64 @@ mod tests {
         editor.set_cursor(DocumentPosition::at(TreePath::root(0), 0));
         editor.move_word_right();
         assert_eq!(editor.cursor().offset, 5); // end of "alpha" (word-right stops after the word)
+    }
+
+    /// Selected substring of the leaf a word selection landed in.
+    fn selected_text(editor: &Editor) -> String {
+        let (start, end) = editor.selection().expect("a selection");
+        assert_eq!(start.path, end.path, "selection spans leaves");
+        editor.leaf_plain_text(&start.path)[start.offset..end.offset].to_string()
+    }
+
+    #[test]
+    fn select_word_at_takes_the_whole_word_around_every_click_point() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("alpha beta gamma"));
+        // "beta" occupies bytes 6..10; every offset inside it selects the word,
+        // including its first one.
+        for offset in 6..10 {
+            editor.select_word_at(DocumentPosition::at(TreePath::root(0), offset));
+            assert_eq!(selected_text(&editor), "beta", "clicked at {offset}");
+        }
+    }
+
+    #[test]
+    fn select_word_at_handles_multibyte_letters() {
+        // Regression: the forward scan used to advance by the *first* character's
+        // byte length, so a word containing "ü" left the offset mid-character and
+        // panicked on the next slice.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("wir unterstützen das"));
+        // "unterstützen" is bytes 4..17 — 12 characters, 13 bytes.
+        for offset in [4, 6, 11, 13, 16] {
+            editor.select_word_at(DocumentPosition::at(TreePath::root(0), offset));
+            assert_eq!(
+                selected_text(&editor),
+                "unterstützen",
+                "clicked at {offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn select_word_at_between_two_separators_takes_that_character_only() {
+        // Separators on both sides leave nothing to grow into, so the click takes
+        // the single character it landed on.
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("alpha \u{a0} beta"));
+        editor.select_word_at(DocumentPosition::at(TreePath::root(0), 6));
+        assert_eq!(selected_text(&editor), "\u{a0}");
+    }
+
+    #[test]
+    fn word_navigation_crosses_multibyte_letters() {
+        let mut editor = Editor::new();
+        editor.set_document(markdown_to_document("wir unterstützen das"));
+        editor.set_cursor(DocumentPosition::at(TreePath::root(0), 4));
+        editor.move_word_right();
+        assert_eq!(editor.cursor().offset, 17); // end of "unterstützen"
+        editor.move_word_left();
+        assert_eq!(editor.cursor().offset, 4);
     }
 
     #[test]
