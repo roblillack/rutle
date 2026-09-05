@@ -10,6 +10,8 @@ While pre-1.0, the minor version is bumped for breaking changes.
 
 ## [Unreleased] - ReleaseDate
 
+## [0.6.1] - 2026-09-05
+
 ### Fixed
 
 - Double-clicking a word containing a non-ASCII letter ("unterstützen", "café")
@@ -406,7 +408,8 @@ across multiple tools.
   metric regimes, plus layout/edit performance benchmarks.
 
 <!-- next-url -->
-[Unreleased]: https://github.com/roblillack/rutle/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/roblillack/rutle/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/roblillack/rutle/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/roblillack/rutle/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/roblillack/rutle/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/roblillack/rutle/compare/v0.4.0...v0.4.1
