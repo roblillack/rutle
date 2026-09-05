@@ -17,7 +17,7 @@ While pre-1.0, the minor version is bumped for breaking changes.
   offset by the *first* character's UTF-8 length instead of the current one, so
   it stepped into the middle of a multi-byte character. Clicking the first
   character of a word now also selects the whole word instead of just that
-  character.
+  character. (#14)
 
 ## [0.6.0] - 2026-09-04
 
